@@ -434,6 +434,57 @@ pub async fn patch_json<T: DeserializeOwned>(
     send_request::<T>(&socket_path, req).await
 }
 
+/// One server-sent event: the block's `event:` name, when it names one, and
+/// its `data:` lines, joined with `\n`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    /// The `event:` field.
+    pub event: Option<String>,
+    /// The `data:` field.
+    pub data: String,
+}
+
+/// `POST <path>` with a JSON body, read as a stream of server-sent events.
+///
+/// For an endpoint that holds the connection open and reports as it goes, the
+/// way Super STT's `/transcribe` sends each preview and then the result. A
+/// daemon that refuses the request answers with its error envelope, not a
+/// stream, so a non-2xx is returned as that error like every other call.
+/// Failures after the stream has started arrive as `Err` items. Blocks with
+/// neither an event name nor data, which is what a keepalive comment is, are
+/// skipped. Dropping the stream closes the connection.
+///
+/// # Errors
+/// Returns [`HttpError::InvalidSession`] on `401`; [`HttpError::Other`] on
+/// connection, HTTP, or body encoding failure, or any other non-2xx.
+pub async fn post_json_events(
+    socket_path: std::path::PathBuf,
+    token: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> HttpResult<impl futures_util::Stream<Item = HttpResult<SseEvent>> + Send + 'static> {
+    let req = build_post_json(path, body, Some(token))?;
+    let response = open(&socket_path, req, Some(REQUEST_TIMEOUT)).await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = collect_body(response).await?;
+        return Err(error_for_status(status, &body));
+    }
+    Ok(super::sse::block_stream(
+        response.into_body(),
+        |block| {
+            let fields = super::sse::parse_fields(block);
+            (fields.event.is_some() || !fields.data.is_empty()).then(|| {
+                Ok(SseEvent {
+                    event: fields.event.map(str::to_owned),
+                    data: fields.data,
+                })
+            })
+        },
+        |message| Err(HttpError::Other(message)),
+    ))
+}
+
 /// `DELETE <path>` deserialized into `T`.
 ///
 /// # Errors

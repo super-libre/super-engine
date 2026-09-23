@@ -163,3 +163,59 @@ async fn successful_uninstall_still_parses() {
     assert!(!resp.was_active);
     let _ = std::fs::remove_file(&socket);
 }
+
+/// A streaming endpoint's events arrive in order, and a keepalive comment
+/// between them is not one.
+#[tokio::test]
+async fn a_post_reads_back_its_events() {
+    use futures_util::StreamExt;
+    use transport::SseEvent;
+
+    let socket = socket_path("events");
+    serve_once(
+        &socket,
+        "200 OK",
+        ": keepalive\n\nevent: preview\ndata: {\"text\":\"hel\"}\n\n\
+         event: done\ndata: {\"transcription\":\"hello\"}\n\n",
+    );
+
+    let stream = transport::post_json_events(socket.clone(), "token", "/x", &serde_json::json!({}))
+        .await
+        .expect("a 200 opens the stream");
+    let events: Vec<SseEvent> = stream.map(|e| e.expect("no body error")).collect().await;
+
+    assert_eq!(
+        events,
+        [
+            SseEvent {
+                event: Some("preview".into()),
+                data: r#"{"text":"hel"}"#.into(),
+            },
+            SseEvent {
+                event: Some("done".into()),
+                data: r#"{"transcription":"hello"}"#.into(),
+            },
+        ]
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// A refused streaming request is the daemon's error, typed like any other
+/// call's, rather than a stream that ends without an event.
+#[tokio::test]
+async fn a_refused_post_is_an_error_not_an_empty_stream() {
+    let socket = socket_path("events-refused");
+    serve_once(
+        &socket,
+        "403 Forbidden",
+        r#"{"status":"error","message":"scope_denied"}"#,
+    );
+
+    let Err(err) =
+        transport::post_json_events(socket.clone(), "token", "/x", &serde_json::json!({})).await
+    else {
+        panic!("a 403 must not open a stream");
+    };
+    assert!(err.is_scope_denied(), "{err}");
+    let _ = std::fs::remove_file(&socket);
+}

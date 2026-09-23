@@ -28,7 +28,8 @@ pub use v1::health::{ping, status};
 /// [`HttpError::InvalidSession`].
 pub mod transport {
     pub use super::internal::transport::{
-        delete_json, get_json, patch_json, post_bytes, post_json, post_json_no_timeout,
+        SseEvent, delete_json, get_json, patch_json, post_bytes, post_json, post_json_events,
+        post_json_no_timeout,
     };
 
     /// The single non-2xx-to-[`HttpError`] mapping, exported so the daemon's
