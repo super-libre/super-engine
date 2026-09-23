@@ -333,14 +333,14 @@ impl Keyring {
 #[cfg(test)]
 mod tests {
     use super::Keyring;
-    use super_engine_protocol::{SUPER_STT, SUPER_TTS};
+    use super_engine_protocol::test_product::{OTHER, TEST};
 
     /// Round-trips a backend secret through the in-memory store. Uses a unique
     /// account so it cannot collide with other tests sharing the process-global
     /// store.
     #[test]
     fn set_then_has_then_delete_roundtrips() {
-        let keyring = Keyring::in_memory(&SUPER_STT);
+        let keyring = Keyring::in_memory(&TEST);
         let (src, name) = ("github.com/acme/phase-a", "roundtrip_api_key");
         let _ = keyring.delete_backend_secret(src, name); // clean slate
         assert!(!keyring.has_backend_secret(src, name).unwrap());
@@ -353,24 +353,23 @@ mod tests {
 
     #[test]
     fn sessions_blob_roundtrips() {
-        let keyring = Keyring::in_memory(&SUPER_TTS);
+        let keyring = Keyring::in_memory(&OTHER);
         let blob = r#"{"version":3,"sessions":{}}"#;
         keyring.set_sessions_blob(blob).unwrap();
         assert_eq!(keyring.get_sessions_blob().unwrap().as_deref(), Some(blob));
     }
 
-    /// The accounts are the ones each product shipped with. A change here
-    /// strands every installed daemon's sessions under an account it no longer
-    /// reads, and every client faces a fresh consent popup.
+    /// Each product keeps its sessions under its own account, named after
+    /// its short name.
     #[test]
-    fn the_sessions_account_is_the_one_each_product_shipped() {
+    fn the_sessions_account_is_the_products_own() {
         assert_eq!(
-            Keyring::in_memory(&SUPER_STT).sessions_account(),
-            "stt-sessions"
+            Keyring::in_memory(&TEST).sessions_account(),
+            "test-sessions"
         );
         assert_eq!(
-            Keyring::in_memory(&SUPER_TTS).sessions_account(),
-            "tts-sessions"
+            Keyring::in_memory(&OTHER).sessions_account(),
+            "other-sessions"
         );
     }
 }

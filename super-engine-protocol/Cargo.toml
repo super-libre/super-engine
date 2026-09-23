@@ -21,6 +21,8 @@
 [features]
     # Derive `utoipa::ToSchema` on the wire types the daemons document.
     openapi = ["dep:utoipa"]
+    # Two made-up products, for tests in the crates built on this one.
+    test-product = []
 
 [lints]
     workspace = true

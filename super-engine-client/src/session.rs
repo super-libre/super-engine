@@ -370,7 +370,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super_engine_protocol::{SUPER_STT, SUPER_TTS};
+    use super_engine_protocol::test_product::{OTHER, TEST};
 
     /// A record as `save` would write it: minted for exactly these scopes and
     /// granted all of them.
@@ -388,12 +388,12 @@ mod tests {
     /// through to `auth_request`.
     #[tokio::test]
     async fn obtain_returns_from_cache_without_network() {
-        let app_id = AppId::new(&SUPER_STT, "test-cache-hit");
+        let app_id = AppId::new(&TEST, "test-cache-hit");
         // Manually pre-populate the cache.
-        cache_set(app_id, stored("TOK-from-cache", &["transcribe"]));
+        cache_set(app_id, stored("TOK-from-cache", &["test"]));
 
-        let bogus_socket = PathBuf::from("/nonexistent/super-stt/socket");
-        let result = obtain(bogus_socket, app_id, "Test", &["transcribe"]).await;
+        let bogus_socket = PathBuf::from("/nonexistent/super-test/socket");
+        let result = obtain(bogus_socket, app_id, "Test", &["test"]).await;
 
         // Cleanup before asserting (in case the assert panics, the
         // global cache stays clean for sibling tests).
@@ -411,18 +411,18 @@ mod tests {
     /// is the necessary-and-sufficient ingredient.
     #[test]
     fn cache_set_get_clear_round_trip() {
-        let app_id = AppId::new(&SUPER_STT, "test-cache-roundtrip");
+        let app_id = AppId::new(&TEST, "test-cache-roundtrip");
         cache_clear(app_id);
         assert!(cache_get(app_id).is_none(), "fresh slot must be empty");
 
-        cache_set(app_id, stored("TOK-a", &["transcribe"]));
+        cache_set(app_id, stored("TOK-a", &["test"]));
         assert_eq!(
             cache_get(app_id).map(|s| s.token),
             Some("TOK-a".to_string())
         );
 
         // Replace.
-        cache_set(app_id, stored("TOK-b", &["transcribe"]));
+        cache_set(app_id, stored("TOK-b", &["test"]));
         assert_eq!(
             cache_get(app_id).map(|s| s.token),
             Some("TOK-b".to_string())
@@ -438,11 +438,11 @@ mod tests {
     /// would ever replace it.
     #[test]
     fn a_token_minted_for_fewer_scopes_is_not_reused() {
-        let token = stored("TOK", &["settings", "speak"]);
+        let token = stored("TOK", &["settings", "test"]);
         assert!(token.covers(&["settings"]));
-        assert!(token.covers(&["settings", "speak"]));
-        assert!(!token.covers(&["settings", "voices"]));
-        assert!(!token.covers(&["voices"]));
+        assert!(token.covers(&["settings", "test"]));
+        assert!(!token.covers(&["settings", "test_events"]));
+        assert!(!token.covers(&["test_events"]));
     }
 
     /// Coverage is decided by what was *asked for*, not by what came back. A
@@ -452,10 +452,10 @@ mod tests {
     fn a_declined_scope_does_not_re_ask_on_every_call() {
         let declined = Stored {
             token: "TOK".to_string(),
-            requested: vec!["settings".to_string(), "voices".to_string()],
+            requested: vec!["settings".to_string(), "test_events".to_string()],
             granted: vec!["settings".to_string()],
         };
-        assert!(declined.covers(&["settings", "voices"]));
+        assert!(declined.covers(&["settings", "test_events"]));
     }
 
     /// An entry written before this record existed is a bare token. It covers
@@ -475,35 +475,35 @@ mod tests {
     /// What `save` writes, `parse` reads back.
     #[test]
     fn a_stored_record_round_trips_through_its_json() {
-        let original = stored("TOK", &["settings", "voices"]);
+        let original = stored("TOK", &["settings", "test_events"]);
         let raw = serde_json::to_string(&original).expect("a record must encode");
         let parsed = Stored::parse(&raw);
         assert_eq!(parsed.token, "TOK");
-        assert!(parsed.covers(&["settings", "voices"]));
+        assert!(parsed.covers(&["settings", "test_events"]));
     }
 
     /// One app talking to both daemons holds a token for each: the product is
     /// part of the key, so caching one never hands it to the other.
     #[test]
     fn one_app_keeps_a_token_per_product() {
-        let stt = AppId::new(&SUPER_STT, "test-two-products");
-        let tts = AppId::new(&SUPER_TTS, "test-two-products");
-        cache_set(stt, stored("TOK-stt", &["transcribe"]));
-        cache_set(tts, stored("TOK-tts", &["speak"]));
+        let test = AppId::new(&TEST, "test-two-products");
+        let other = AppId::new(&OTHER, "test-two-products");
+        cache_set(test, stored("TOK-test", &["test"]));
+        cache_set(other, stored("TOK-other", &["other"]));
 
-        let (from_stt, from_tts) = (
-            cache_get(stt).map(|s| s.token),
-            cache_get(tts).map(|s| s.token),
+        let (from_test, from_other) = (
+            cache_get(test).map(|s| s.token),
+            cache_get(other).map(|s| s.token),
         );
-        cache_clear(stt);
-        let after_clear = cache_get(tts).map(|s| s.token);
-        cache_clear(tts);
+        cache_clear(test);
+        let after_clear = cache_get(other).map(|s| s.token);
+        cache_clear(other);
 
-        assert_eq!(from_stt.as_deref(), Some("TOK-stt"));
-        assert_eq!(from_tts.as_deref(), Some("TOK-tts"));
+        assert_eq!(from_test.as_deref(), Some("TOK-test"));
+        assert_eq!(from_other.as_deref(), Some("TOK-other"));
         assert_eq!(
             after_clear.as_deref(),
-            Some("TOK-tts"),
+            Some("TOK-other"),
             "forgetting one product's token must leave the other's"
         );
     }

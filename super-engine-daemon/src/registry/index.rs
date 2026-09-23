@@ -298,7 +298,7 @@ mod tests {
             min_client: min_client.into(),
             backends: vec![],
         };
-        let product = &super_engine_protocol::SUPER_STT;
+        let product = &super_engine_protocol::test_product::TEST;
         warn_if_client_too_old(&mk("9999.0.0"), product, "0.2.0"); // the warn branch
         warn_if_client_too_old(&mk("0.1.0"), product, "0.2.0"); // the quiet branch
         assert!(matches!(

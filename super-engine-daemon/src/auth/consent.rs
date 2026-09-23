@@ -610,14 +610,14 @@ mod tests {
             ConsentDialog, MAX_DISPLAY_NAME, consent_dialog_text, sanitize_display_name,
         };
 
-        /// A dialog for Super STT that describes `status` the way its table
-        /// does.
+        /// A dialog for the test product that describes `status` the way a
+        /// product's table does.
         fn dialog() -> ConsentDialog {
             fn describe(_: &[String]) -> Vec<&'static str> {
-                vec!["Read which speech-to-text model and device are currently active"]
+                vec!["Read which model and device are currently active"]
             }
             ConsentDialog {
-                product: &super_engine_protocol::SUPER_STT,
+                product: &super_engine_protocol::test_product::TEST,
                 describe_scopes: describe,
             }
         }
@@ -629,10 +629,10 @@ mod tests {
         /// caller's binary.
         #[test]
         fn a_newline_cannot_forge_a_second_line() {
-            let forged = sanitize_display_name("Evil\nExecutable:  /usr/local/bin/super-stt-app");
+            let forged = sanitize_display_name("Evil\nExecutable:  /usr/local/bin/super-test-app");
             assert!(!forged.contains('\n'), "{forged:?} still spans two lines");
             assert_eq!(
-                forged, "Evil Executable: /usr/local/bin/super-stt-app",
+                forged, "Evil Executable: /usr/local/bin/super-test-app",
                 "the text should survive, visibly, on one line"
             );
         }
@@ -676,7 +676,7 @@ mod tests {
             };
             let text = consent_dialog_text(
                 &dialog(),
-                "Evil\nExecutable:  /usr/local/bin/super-stt-app",
+                "Evil\nExecutable:  /usr/local/bin/super-test-app",
                 &["status".to_string()],
                 &identity,
             );
@@ -691,7 +691,7 @@ mod tests {
             // And the scope's description is present, from the product's
             // table.
             assert!(
-                text.contains("Read which speech-to-text model and device are currently active"),
+                text.contains("Read which model and device are currently active"),
                 "{text}"
             );
         }
@@ -706,7 +706,7 @@ mod tests {
             };
             let text = consent_dialog_text(&dialog(), "  ", &["status".to_string()], &identity);
             assert!(
-                text.starts_with("An application wants access to Super STT."),
+                text.starts_with("An application wants access to Super Test."),
                 "{text}"
             );
         }
@@ -763,10 +763,10 @@ mod tests {
     /// verification, fail-closed on every non-verifiable branch.
     mod official_client {
         use super::super::is_official_client_in as in_dir;
-        use super_engine_protocol::{SUPER_STT, SUPER_TTS};
+        use super_engine_protocol::test_product::{OTHER, TEST};
 
         fn is_official_client_in(daemon_dir: &Path, exe_path: &Path) -> bool {
-            in_dir(&SUPER_STT, daemon_dir, exe_path)
+            in_dir(&TEST, daemon_dir, exe_path)
         }
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
@@ -781,14 +781,14 @@ mod tests {
         #[test]
         fn official_name_co_located_is_trusted() {
             let dir = tempfile::tempdir().unwrap();
-            let app = write_executable(dir.path(), "super-stt-app", 0o755);
+            let app = write_executable(dir.path(), "super-test-app", 0o755);
             assert!(is_official_client_in(dir.path(), &app));
         }
 
         #[test]
         fn unlisted_name_co_located_is_rejected() {
             let dir = tempfile::tempdir().unwrap();
-            let other = write_executable(dir.path(), "super-stt-extra", 0o755);
+            let other = write_executable(dir.path(), "super-test-extra", 0o755);
             assert!(
                 !is_official_client_in(dir.path(), &other),
                 "co-location alone must not confer trust"
@@ -799,7 +799,7 @@ mod tests {
         fn official_name_in_foreign_dir_is_rejected() {
             let daemon_dir = tempfile::tempdir().unwrap();
             let foreign = tempfile::tempdir().unwrap();
-            let app = write_executable(foreign.path(), "super-stt-app", 0o755);
+            let app = write_executable(foreign.path(), "super-test-app", 0o755);
             assert!(
                 !is_official_client_in(daemon_dir.path(), &app),
                 "an official name outside the daemon dir must not be trusted"
@@ -809,7 +809,7 @@ mod tests {
         #[test]
         fn world_writable_official_binary_is_rejected() {
             let dir = tempfile::tempdir().unwrap();
-            let app = write_executable(dir.path(), "super-stt-cli", 0o757);
+            let app = write_executable(dir.path(), "super-test-cli", 0o757);
             assert!(
                 !is_official_client_in(dir.path(), &app),
                 "a world-writable binary could be swapped by anyone"
@@ -820,7 +820,7 @@ mod tests {
         fn missing_exe_is_rejected() {
             let dir = tempfile::tempdir().unwrap();
             assert!(
-                !is_official_client_in(dir.path(), &dir.path().join("super-stt-app")),
+                !is_official_client_in(dir.path(), &dir.path().join("super-test-app")),
                 "a nonexistent (e.g. replaced-on-disk) exe must fail closed"
             );
         }
@@ -829,8 +829,8 @@ mod tests {
         fn symlink_resolving_outside_daemon_dir_is_rejected() {
             let daemon_dir = tempfile::tempdir().unwrap();
             let foreign = tempfile::tempdir().unwrap();
-            let target = write_executable(foreign.path(), "super-stt-cli", 0o755);
-            let link = daemon_dir.path().join("super-stt-cli");
+            let target = write_executable(foreign.path(), "super-test-cli", 0o755);
+            let link = daemon_dir.path().join("super-test-cli");
             std::os::unix::fs::symlink(&target, &link).unwrap();
             assert!(
                 !is_official_client_in(daemon_dir.path(), &link),
@@ -838,18 +838,18 @@ mod tests {
             );
         }
 
-        /// Each daemon trusts its own clients and no other product's: a
-        /// Super TTS daemon must not wave through `super-stt-app` just because
-        /// it was installed in the same directory.
+        /// Each daemon trusts its own clients and no other product's: one
+        /// product's daemon must not wave through another's `-app` just
+        /// because it was installed in the same directory.
         #[test]
         fn another_products_client_is_not_official() {
             let dir = tempfile::tempdir().unwrap();
-            let stt_app = write_executable(dir.path(), "super-stt-app", 0o755);
-            let tts_app = write_executable(dir.path(), "super-tts-app", 0o755);
-            assert!(in_dir(&SUPER_TTS, dir.path(), &tts_app));
+            let test_app = write_executable(dir.path(), "super-test-app", 0o755);
+            let other_app = write_executable(dir.path(), "super-other-app", 0o755);
+            assert!(in_dir(&OTHER, dir.path(), &other_app));
             assert!(
-                !in_dir(&SUPER_TTS, dir.path(), &stt_app),
-                "a Super STT client must face Super TTS's consent dialog"
+                !in_dir(&OTHER, dir.path(), &test_app),
+                "one product's client must face the other's consent dialog"
             );
         }
     }

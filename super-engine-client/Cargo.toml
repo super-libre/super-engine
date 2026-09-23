@@ -32,5 +32,12 @@
         ]
     }
 
+[dev-dependencies]
+    # The made-up products the tests talk to.
+    super-engine-protocol = {
+        path = "../super-engine-protocol",
+        features = ["test-product"]
+    }
+
 [lints]
     workspace = true

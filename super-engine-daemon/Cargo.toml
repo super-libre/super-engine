@@ -70,6 +70,11 @@
 [dev-dependencies]
     bytes = "1"
     mockito = "1.7.2"
+    # The made-up products the tests run as.
+    super-engine-protocol = {
+        path = "../super-engine-protocol",
+        features = ["test-product"]
+    }
     # The product the registry tests parse manifests and indexes for.
     super-engine-spec = { path = "../super-engine-spec", features = ["test-product"] }
     tempfile = "3.27.0"

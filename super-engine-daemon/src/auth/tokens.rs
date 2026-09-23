@@ -259,7 +259,7 @@ pub struct TokenStore {
 #[cfg(test)]
 impl Default for TokenStore {
     fn default() -> Self {
-        Self::empty(Keyring::in_memory(&super_engine_protocol::SUPER_STT))
+        Self::empty(Keyring::in_memory(&super_engine_protocol::test_product::TEST))
     }
 }
 
@@ -648,7 +648,7 @@ mod tests {
     fn mint_then_validate_roundtrips() {
         let store = TokenStore::default();
         let scopes = vec!["transcribe".to_string(), "status".to_string()];
-        let exe = PeerIdentity::native("/usr/bin/super-stt-cli");
+        let exe = PeerIdentity::native("/usr/bin/super-test-cli");
 
         let (token, expires_at) = store.mint("Super STT CLI", &scopes, &exe);
         assert_eq!(token.len(), 64, "token is 32 random bytes hex-encoded");
@@ -805,13 +805,13 @@ mod schema_tests {
     #[test]
     fn a_v2_sandboxed_grant_keeps_its_app_id() {
         let loaded =
-            parse_sessions_blob(&v2_blob("/app/bin/super-stt-app", Some("org.example.App")))
+            parse_sessions_blob(&v2_blob("/app/bin/super-test-app", Some("org.example.App")))
                 .expect("a v2 blob is readable");
         let meta = loaded.sessions.get("tok").expect("the session survives");
         assert_eq!(
             meta.grantee,
             PeerIdentity::Native {
-                exe_path: "/app/bin/super-stt-app".into(),
+                exe_path: "/app/bin/super-test-app".into(),
                 flatpak_app_id: Some("org.example.App".to_string()),
             }
         );

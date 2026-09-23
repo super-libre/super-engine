@@ -130,8 +130,8 @@ impl Auth {
 
 #[cfg(test)]
 impl Auth {
-    /// Super STT's auth state with no sessions, admitting `allowed_origins`
-    /// over TCP.
+    /// The test product's auth state with no sessions, admitting
+    /// `allowed_origins` over TCP.
     pub(crate) fn for_tests(allowed_origins: &[&str]) -> Self {
         fn describe(_: &[String]) -> Vec<&'static str> {
             Vec::new()
@@ -139,10 +139,10 @@ impl Auth {
         Self::with_tokens(
             AuthConfig {
                 dialog: ConsentDialog {
-                    product: &super_engine_protocol::SUPER_STT,
+                    product: &super_engine_protocol::test_product::TEST,
                     describe_scopes: describe,
                 },
-                keyring: Keyring::in_memory(&super_engine_protocol::SUPER_STT),
+                keyring: Keyring::in_memory(&super_engine_protocol::test_product::TEST),
                 resource_manager: Arc::new(ResourceManager::new()),
                 allowed_origins: allowed_origins.iter().map(ToString::to_string).collect(),
             },

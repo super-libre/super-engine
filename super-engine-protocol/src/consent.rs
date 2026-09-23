@@ -47,17 +47,17 @@ pub const DISMISSED: &str = "dismissed";
 
 #[cfg(test)]
 mod tests {
-    use crate::{SUPER_STT, SUPER_TTS};
+    use crate::test_product::{OTHER, TEST};
 
     /// The variable names are the product's own, so two daemons' helpers can
     /// never read each other's requests out of a shared environment.
     #[test]
     fn each_product_names_its_own_variables() {
-        assert_eq!(SUPER_STT.env(super::APP_NAME), "SUPER_STT_AUTH_APP_NAME");
-        assert_eq!(SUPER_TTS.env(super::APP_NAME), "SUPER_TTS_AUTH_APP_NAME");
+        assert_eq!(TEST.env(super::APP_NAME), "SUPER_TEST_AUTH_APP_NAME");
+        assert_eq!(OTHER.env(super::APP_NAME), "SUPER_OTHER_AUTH_APP_NAME");
         assert_eq!(
-            SUPER_STT.env(super::AUTO_APPROVE_AFTER_MS),
-            "SUPER_STT_AUTH_AUTO_APPROVE_AFTER_MS"
+            TEST.env(super::AUTO_APPROVE_AFTER_MS),
+            "SUPER_TEST_AUTH_AUTO_APPROVE_AFTER_MS"
         );
     }
 }

@@ -672,7 +672,7 @@ fn distinct_sources_are_never_duplicates() {
 
 #[test]
 fn the_default_backends_dir_is_under_the_products_data_dir() {
-    let product = &super_engine_protocol::SUPER_STT;
+    let product = &super_engine_protocol::test_product::TEST;
     assert_eq!(
         default_backends_dir(product),
         super_engine_protocol::paths::data_dir(product).join("backends")

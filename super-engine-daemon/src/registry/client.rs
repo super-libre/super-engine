@@ -262,7 +262,7 @@ mod tests {
     use tempfile::tempdir;
 
     const DAEMON: Daemon = Daemon {
-        product: &super_engine_protocol::SUPER_STT,
+        product: &super_engine_protocol::test_product::TEST,
         version: "0.2.0",
         user_agent: "super-engine-daemon-tests",
     };

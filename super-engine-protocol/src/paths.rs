@@ -87,7 +87,8 @@ fn home_join(suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{cache_dir, config_dir, data_dir};
-    use crate::product::{ProductSpec, SUPER_STT, SUPER_TTS};
+    use crate::product::ProductSpec;
+    use crate::test_product::{OTHER, TEST};
 
     /// Every base has to be redirectable by its XDG variable, on every
     /// platform, and has to land somewhere absolute under the user's own tree
@@ -105,7 +106,7 @@ mod tests {
     /// each other.
     #[test]
     fn every_base_dir_honors_its_xdg_override() {
-        let root = std::env::temp_dir().join("super-stt-paths-test");
+        let root = std::env::temp_dir().join("super-engine-paths-test");
         for (var, dir) in [
             (
                 "XDG_CONFIG_HOME",
@@ -118,13 +119,13 @@ mod tests {
                 std::env::set_var(var, &root);
             }
             assert_eq!(
-                dir(&SUPER_STT),
-                root.join("super-stt"),
+                dir(&TEST),
+                root.join("super-test"),
                 "{var} did not redirect its base directory"
             );
             assert_eq!(
-                dir(&SUPER_TTS),
-                root.join("super-tts"),
+                dir(&OTHER),
+                root.join("super-other"),
                 "{var} put both products in one directory"
             );
 
@@ -134,8 +135,8 @@ mod tests {
                 std::env::set_var(var, "relative/path");
             }
             assert_ne!(
-                dir(&SUPER_STT),
-                std::path::PathBuf::from("relative/path").join("super-stt"),
+                dir(&TEST),
+                std::path::PathBuf::from("relative/path").join("super-test"),
                 "{var} accepted a relative path"
             );
 
@@ -144,7 +145,7 @@ mod tests {
             unsafe {
                 std::env::remove_var(var);
             }
-            let default = dir(&SUPER_STT);
+            let default = dir(&TEST);
             assert!(
                 default.is_absolute(),
                 "{var} unset: {} is not absolute",
@@ -152,7 +153,7 @@ mod tests {
             );
             assert_eq!(
                 default.file_name().and_then(|n| n.to_str()),
-                Some("super-stt")
+                Some("super-test")
             );
         }
     }

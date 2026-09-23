@@ -446,15 +446,15 @@ impl SelfUpdateChecker {
 mod tests {
     use super::*;
     use super_engine_forge::{Release, ReleaseAsset, ReleaseKind};
-    use super_engine_protocol::SUPER_STT;
     use super_engine_protocol::models::update_beta_optin::UpdateBetaOptIn;
+    use super_engine_protocol::test_product::{OTHER, TEST};
 
-    /// A Super STT daemon at 0.2.0: older than every release the mocks offer.
+    /// A test product daemon at 0.2.0: older than every release the mocks offer.
     fn checker() -> SelfUpdateChecker {
-        SelfUpdateChecker::new(&SUPER_STT, "0.2.0")
+        SelfUpdateChecker::new(&TEST, "0.2.0")
     }
 
-    /// Super STT's GitHub client against `base`.
+    /// The test product's GitHub client against `base`.
     fn github(base: String) -> super_engine_forge::Github {
         super_engine_forge::Github::new(base, None, "super-engine-daemon-tests")
     }
@@ -553,19 +553,19 @@ mod tests {
         let mut r = rel("v0.3.0", ReleaseKind::Published);
         r.assets = vec![
             ReleaseAsset {
-                name: "super-stt-x86_64-unknown-linux-gnu.tar.gz".into(),
+                name: "super-test-x86_64-unknown-linux-gnu.tar.gz".into(),
                 download_url: "https://dl/t".into(),
                 size: 1,
             },
             ReleaseAsset {
-                name: "super-stt-install-x86_64-unknown-linux-gnu".into(),
+                name: "super-test-install-x86_64-unknown-linux-gnu".into(),
                 download_url: "https://dl/i".into(),
                 size: 2,
             },
         ];
-        let asset = find_installer_asset(&SUPER_STT, &r, "x86_64-unknown-linux-gnu").unwrap();
+        let asset = find_installer_asset(&TEST, &r, "x86_64-unknown-linux-gnu").unwrap();
         assert_eq!(asset.download_url, "https://dl/i");
-        assert!(find_installer_asset(&SUPER_STT, &r, "aarch64-unknown-linux-gnu").is_none());
+        assert!(find_installer_asset(&TEST, &r, "aarch64-unknown-linux-gnu").is_none());
     }
 
     /// Two installer assets in the same release for different triples: the
@@ -578,24 +578,24 @@ mod tests {
         let mut r = rel("v0.3.0", ReleaseKind::Published);
         r.assets = vec![
             ReleaseAsset {
-                name: "super-stt-install-x86_64-unknown-linux-gnu".into(),
+                name: "super-test-install-x86_64-unknown-linux-gnu".into(),
                 download_url: "https://dl/x86".into(),
                 size: 1,
             },
             ReleaseAsset {
-                name: "super-stt-install-aarch64-unknown-linux-gnu".into(),
+                name: "super-test-install-aarch64-unknown-linux-gnu".into(),
                 download_url: "https://dl/aarch64".into(),
                 size: 2,
             },
         ];
         assert_eq!(
-            find_installer_asset(&SUPER_STT, &r, "aarch64-unknown-linux-gnu")
+            find_installer_asset(&TEST, &r, "aarch64-unknown-linux-gnu")
                 .unwrap()
                 .download_url,
             "https://dl/aarch64"
         );
         assert_eq!(
-            find_installer_asset(&SUPER_STT, &r, "x86_64-unknown-linux-gnu")
+            find_installer_asset(&TEST, &r, "x86_64-unknown-linux-gnu")
                 .unwrap()
                 .download_url,
             "https://dl/x86"
@@ -622,13 +622,13 @@ mod tests {
             .await;
         let mut r = rel("v0.3.0", ReleaseKind::Published);
         r.assets = vec![ReleaseAsset {
-            name: "super-stt-install-x86_64-unknown-linux-gnu".into(),
+            name: "super-test-install-x86_64-unknown-linux-gnu".into(),
             download_url: format!("{}/i", s.url()),
             size: 2,
         }];
         let gh = github(s.url());
         assert!(
-            resolve_installer_asset(&SUPER_STT, &gh, &r, "x86_64-unknown-linux-gnu")
+            resolve_installer_asset(&TEST, &gh, &r, "x86_64-unknown-linux-gnu")
                 .await
                 .is_none()
         );
@@ -645,7 +645,7 @@ mod tests {
         let mut r = rel("v0.3.0", ReleaseKind::Published);
         r.assets = vec![
             ReleaseAsset {
-                name: "super-stt-install-x86_64-unknown-linux-gnu".into(),
+                name: "super-test-install-x86_64-unknown-linux-gnu".into(),
                 download_url: "https://dl/i".into(),
                 size: 2,
             },
@@ -657,7 +657,7 @@ mod tests {
         ];
         let gh = github(s.url());
         assert!(
-            resolve_installer_asset(&SUPER_STT, &gh, &r, "x86_64-unknown-linux-gnu")
+            resolve_installer_asset(&TEST, &gh, &r, "x86_64-unknown-linux-gnu")
                 .await
                 .is_none()
         );
@@ -677,7 +677,7 @@ mod tests {
         let mut r = rel("v0.3.0", ReleaseKind::Published);
         r.assets = vec![
             ReleaseAsset {
-                name: "super-stt-install-x86_64-unknown-linux-gnu".into(),
+                name: "super-test-install-x86_64-unknown-linux-gnu".into(),
                 download_url: "https://dl/i".into(),
                 size: 2,
             },
@@ -689,7 +689,7 @@ mod tests {
         ];
         let gh = github(s.url());
         assert!(
-            resolve_installer_asset(&SUPER_STT, &gh, &r, "x86_64-unknown-linux-gnu")
+            resolve_installer_asset(&TEST, &gh, &r, "x86_64-unknown-linux-gnu")
                 .await
                 .is_none()
         );
@@ -705,7 +705,7 @@ mod tests {
         s.mock("GET", "/sums")
             .with_status(200)
             .with_body(format!(
-                "{target_digest}  super-stt-install-x86_64-unknown-linux-gnu\n\
+                "{target_digest}  super-test-install-x86_64-unknown-linux-gnu\n\
                  111111  some-other-file.tar.gz\n",
             ))
             .create_async()
@@ -713,7 +713,7 @@ mod tests {
         let mut r = rel("v0.3.0", ReleaseKind::Published);
         r.assets = vec![
             ReleaseAsset {
-                name: "super-stt-install-x86_64-unknown-linux-gnu".into(),
+                name: "super-test-install-x86_64-unknown-linux-gnu".into(),
                 download_url: "https://dl/i".into(),
                 size: 2,
             },
@@ -724,7 +724,7 @@ mod tests {
             },
         ];
         let gh = github(s.url());
-        let asset = resolve_installer_asset(&SUPER_STT, &gh, &r, "x86_64-unknown-linux-gnu")
+        let asset = resolve_installer_asset(&TEST, &gh, &r, "x86_64-unknown-linux-gnu")
             .await
             .unwrap();
         assert_eq!(asset.url, "https://dl/i");
@@ -742,13 +742,13 @@ mod tests {
         let mut s = mockito::Server::new_async().await;
         s.mock("GET", "/sums")
             .with_status(200)
-            .with_body("not-a-real-digest  super-stt-install-x86_64-unknown-linux-gnu\n")
+            .with_body("not-a-real-digest  super-test-install-x86_64-unknown-linux-gnu\n")
             .create_async()
             .await;
         let mut r = rel("v0.3.0", ReleaseKind::Published);
         r.assets = vec![
             ReleaseAsset {
-                name: "super-stt-install-x86_64-unknown-linux-gnu".into(),
+                name: "super-test-install-x86_64-unknown-linux-gnu".into(),
                 download_url: "https://dl/i".into(),
                 size: 2,
             },
@@ -760,7 +760,7 @@ mod tests {
         ];
         let gh = github(s.url());
         assert!(
-            resolve_installer_asset(&SUPER_STT, &gh, &r, "x86_64-unknown-linux-gnu")
+            resolve_installer_asset(&TEST, &gh, &r, "x86_64-unknown-linux-gnu")
                 .await
                 .is_none()
         );
@@ -770,11 +770,11 @@ mod tests {
     async fn run_check_success_and_failure_paths() {
         super_engine_forge::install_crypto_provider();
         let mut s = mockito::Server::new_async().await;
-        s.mock("GET", "/repos/jorge-menjivar/super-stt/releases?per_page=100")
+        s.mock("GET", "/repos/example/super-test/releases?per_page=100")
             .with_status(200)
             .with_body(
                 r#"[{"tag_name":"v99.0.0","prerelease":false,"assets":[
-            {"name":"super-stt-install-x86_64-unknown-linux-gnu","browser_download_url":"https://dl/i","size":5}]}]"#,
+            {"name":"super-test-install-x86_64-unknown-linux-gnu","browser_download_url":"https://dl/i","size":5}]}]"#,
             )
             .create_async()
             .await;
@@ -811,7 +811,7 @@ mod tests {
         // asset lookup matches on `target_triple()`, so a hardcoded triple
         // makes this pass only where it happens to agree with the host.
         let triple = target_triple().expect("this platform publishes an installer");
-        let asset_name = format!("super-stt-install-{triple}");
+        let asset_name = format!("super-test-install-{triple}");
         let mut s = mockito::Server::new_async().await;
         let sums_url = format!("{}/sums", s.url());
         s.mock("GET", "/sums")
@@ -819,18 +819,15 @@ mod tests {
             .with_body(format!("{digest}  {asset_name}\n"))
             .create_async()
             .await;
-        s.mock(
-            "GET",
-            "/repos/jorge-menjivar/super-stt/releases?per_page=100",
-        )
-        .with_status(200)
-        .with_body(format!(
-            r#"[{{"tag_name":"v100.0.0","prerelease":false,"assets":[
+        s.mock("GET", "/repos/example/super-test/releases?per_page=100")
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"tag_name":"v100.0.0","prerelease":false,"assets":[
                 {{"name":"{asset_name}","browser_download_url":"https://dl/i","size":42}},
                 {{"name":"SHA256SUMS","browser_download_url":"{sums_url}","size":10}}]}}]"#
-        ))
-        .create_async()
-        .await;
+            ))
+            .create_async()
+            .await;
         let gh = github(s.url());
         let checker = checker();
         let (st, did_check) = checker.run_check(&gh, UpdateBetaOptIn::Disabled).await;
@@ -856,14 +853,11 @@ mod tests {
     async fn run_check_clears_stale_candidate_when_channel_changes_on_failure() {
         super_engine_forge::install_crypto_provider();
         let mut s = mockito::Server::new_async().await;
-        s.mock(
-            "GET",
-            "/repos/jorge-menjivar/super-stt/releases?per_page=100",
-        )
-        .with_status(200)
-        .with_body(r#"[{"tag_name":"v0.3.0-beta.1","prerelease":true,"assets":[]}]"#)
-        .create_async()
-        .await;
+        s.mock("GET", "/repos/example/super-test/releases?per_page=100")
+            .with_status(200)
+            .with_body(r#"[{"tag_name":"v0.3.0-beta.1","prerelease":true,"assets":[]}]"#)
+            .create_async()
+            .await;
         let gh = github(s.url());
         let checker = checker();
 
@@ -904,10 +898,7 @@ mod tests {
         super_engine_forge::install_crypto_provider();
         let mut s = mockito::Server::new_async().await;
         let mock = s
-            .mock(
-                "GET",
-                "/repos/jorge-menjivar/super-stt/releases?per_page=100",
-            )
+            .mock("GET", "/repos/example/super-test/releases?per_page=100")
             .with_status(200)
             .with_body(r#"[{"tag_name":"v42.0.0","prerelease":false,"assets":[]}]"#)
             .expect(1)
@@ -974,10 +965,7 @@ mod tests {
         super_engine_forge::install_crypto_provider();
         let mut server = mockito::Server::new_async().await;
         server
-            .mock(
-                "GET",
-                "/repos/jorge-menjivar/super-stt/releases?per_page=100",
-            )
+            .mock("GET", "/repos/example/super-test/releases?per_page=100")
             .with_status(200)
             .with_body(r#"[{"tag_name":"v0.9.0","prerelease":false,"assets":[]}]"#)
             .create_async()
@@ -998,40 +986,40 @@ mod tests {
         );
     }
 
-    /// The releases and the installer are the product's own: a Super TTS
-    /// daemon checks Super TTS's repository and offers Super TTS's
-    /// installer, even with Super STT's installer in the same release.
+    /// The releases and the installer are the product's own: a daemon checks
+    /// its own product's repository and offers its own installer, even with
+    /// another product's installer in the same release.
     #[tokio::test]
     async fn a_product_checks_its_own_releases() {
         super_engine_forge::install_crypto_provider();
         let digest = "d".repeat(64);
         let triple = target_triple().expect("this platform publishes an installer");
-        let tts_installer = format!("super-tts-install-{triple}");
-        let stt_installer = format!("super-stt-install-{triple}");
+        let other_installer = format!("super-other-install-{triple}");
+        let test_installer = format!("super-test-install-{triple}");
         let mut s = mockito::Server::new_async().await;
         let sums_url = format!("{}/sums", s.url());
         s.mock("GET", "/sums")
             .with_status(200)
             .with_body(format!(
-                "{digest}  {tts_installer}\n{digest}  {stt_installer}\n"
+                "{digest}  {other_installer}\n{digest}  {test_installer}\n"
             ))
             .create_async()
             .await;
         let mock = s
             .mock(
                 "GET",
-                "/repos/jorge-menjivar/super-tts/releases?per_page=100",
+                "/repos/example/super-other/releases?per_page=100",
             )
             .with_status(200)
             .with_body(format!(
                 r#"[{{"tag_name":"v1.0.0","prerelease":false,"assets":[
-                    {{"name":"{stt_installer}","browser_download_url":"https://dl/stt","size":1}},
-                    {{"name":"{tts_installer}","browser_download_url":"https://dl/tts","size":2}},
+                    {{"name":"{test_installer}","browser_download_url":"https://dl/test","size":1}},
+                    {{"name":"{other_installer}","browser_download_url":"https://dl/other","size":2}},
                     {{"name":"SHA256SUMS","browser_download_url":"{sums_url}","size":10}}]}}]"#
             ))
             .create_async()
             .await;
-        let checker = SelfUpdateChecker::new(&super_engine_protocol::SUPER_TTS, "0.1.0");
+        let checker = SelfUpdateChecker::new(&OTHER, "0.1.0");
         let (st, _) = checker
             .run_check(&github(s.url()), UpdateBetaOptIn::Disabled)
             .await;
@@ -1039,9 +1027,9 @@ mod tests {
         assert_eq!(st.current_version, "0.1.0");
         let asset = st
             .installer_asset
-            .expect("Super TTS's installer is offered");
-        assert_eq!(asset.name, tts_installer);
-        assert_eq!(asset.url, "https://dl/tts");
+            .expect("the product's own installer is offered");
+        assert_eq!(asset.name, other_installer);
+        assert_eq!(asset.url, "https://dl/other");
     }
 
     /// Within one run the same version is announced once; a restart announces

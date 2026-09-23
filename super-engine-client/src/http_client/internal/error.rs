@@ -123,7 +123,7 @@ fn strip_log_decoration(s: &str) -> String {
 #[cfg(test)]
 mod user_message_tests {
     use super::HttpError;
-    use super_engine_protocol::{SUPER_STT, SUPER_TTS};
+    use super_engine_protocol::test_product::{OTHER, TEST};
 
     /// The auth messages name the daemon the error came from.
     #[test]
@@ -132,12 +132,12 @@ mod user_message_tests {
             reason: "user_denied".into(),
         };
         assert_eq!(
-            denied.user_message(&SUPER_STT),
-            "Super STT did not grant this app permission for that."
+            denied.user_message(&TEST),
+            "Super Test did not grant this app permission for that."
         );
         assert_eq!(
-            denied.user_message(&SUPER_TTS),
-            "Super TTS did not grant this app permission for that."
+            denied.user_message(&OTHER),
+            "Super Other did not grant this app permission for that."
         );
     }
 
@@ -150,7 +150,7 @@ mod user_message_tests {
                 .to_string(),
         );
         assert_eq!(
-            e.user_message(&SUPER_STT),
+            e.user_message(&TEST),
             "no published release at `github.com/o/b`. A fork does not inherit the \
              upstream's releases"
         );
@@ -171,7 +171,7 @@ mod user_message_tests {
             "Not Found",
         ] {
             assert_eq!(
-                HttpError::Other(raw.to_string()).user_message(&SUPER_STT),
+                HttpError::Other(raw.to_string()).user_message(&TEST),
                 raw,
                 "{raw}"
             );
@@ -182,8 +182,7 @@ mod user_message_tests {
     fn a_bare_token_with_no_message_is_kept() {
         // Nothing human to fall back on, so the token is better than "".
         assert_eq!(
-            HttpError::Other("registry_unavailable (HTTP 503)".to_string())
-                .user_message(&SUPER_STT),
+            HttpError::Other("registry_unavailable (HTTP 503)".to_string()).user_message(&TEST),
             "registry_unavailable"
         );
     }

@@ -161,10 +161,10 @@ fn obtain_error_routing_contract() {
 #[test]
 fn config_defaults_are_sane() {
     let cfg = WidgetSubscriptionConfig::new(
-        AppId::new(&super_engine_protocol::SUPER_STT, "test-app"),
+        AppId::new(&super_engine_protocol::test_product::TEST, "test-app"),
         "Test App",
-        &["recording_events"],
-        &["recording_state"],
+        &["test_events"],
+        &["test_started"],
     );
     // Idle timeout must be ≥ 2× the daemon's keepalive interval (30 s).
     assert!(cfg.idle_timeout >= Duration::from_mins(1));

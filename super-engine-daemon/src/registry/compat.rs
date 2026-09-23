@@ -668,7 +668,7 @@ mod tests {
 
     /// A daemon of the test product at 0.2.0.
     const DAEMON: Daemon = Daemon {
-        product: &super_engine_protocol::SUPER_STT,
+        product: &super_engine_protocol::test_product::TEST,
         version: "0.2.0",
         user_agent: "super-engine-daemon-tests",
     };
@@ -1327,17 +1327,17 @@ mod tests {
             .reason()
             .expect("still blocked without a stamp")
             .to_string();
-        assert!(reason.contains("newer Super STT"), "{reason}");
+        assert!(reason.contains("newer Super Test"), "{reason}");
         // The product is the daemon's, not a fixed one.
-        let tts = Daemon {
-            product: &super_engine_protocol::SUPER_TTS,
+        let other = Daemon {
+            product: &super_engine_protocol::test_product::OTHER,
             ..DAEMON
         };
-        let reason = super::select::<TestProduct>(&tts, &host_cpu(), &e)
+        let reason = super::select::<TestProduct>(&other, &host_cpu(), &e)
             .reason()
             .expect("still blocked")
             .to_string();
-        assert!(reason.contains("newer Super TTS"), "{reason}");
+        assert!(reason.contains("newer Super Other"), "{reason}");
     }
 
     /// A Mac offered both a Metal and a CPU build of the same backend must

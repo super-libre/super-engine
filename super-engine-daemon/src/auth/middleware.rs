@@ -658,7 +658,7 @@ mod peer_binding_tests {
     #[test]
     fn a_different_binary_presenting_the_token_is_rejected_and_revoked() {
         let store = TokenStore::default();
-        let approved = PeerIdentity::native("/usr/local/bin/super-stt-app");
+        let approved = PeerIdentity::native("/usr/local/bin/super-test-app");
         let (token, _) = store.mint("Test App", &["secrets".to_string()], &approved);
         let meta = store.validate(&token).expect("freshly minted token");
 
@@ -681,11 +681,11 @@ mod peer_binding_tests {
     fn two_flatpaks_sharing_an_exe_path_are_different_callers() {
         let store = TokenStore::default();
         let granted = PeerIdentity::Native {
-            exe_path: PathBuf::from("/app/bin/super-stt-app"),
+            exe_path: PathBuf::from("/app/bin/super-test-app"),
             flatpak_app_id: Some("ai.menjivar.SuperSTT".to_string()),
         };
         let impostor = PeerIdentity::Native {
-            exe_path: PathBuf::from("/app/bin/super-stt-app"),
+            exe_path: PathBuf::from("/app/bin/super-test-app"),
             flatpak_app_id: Some("org.example.Stranger".to_string()),
         };
         let (token, _) = store.mint("Test App", &["transcribe".to_string()], &granted);
@@ -704,9 +704,9 @@ mod peer_binding_tests {
     #[test]
     fn a_sandboxed_caller_never_matches_a_native_grant_at_the_same_path() {
         let store = TokenStore::default();
-        let native = PeerIdentity::native("/usr/local/bin/super-stt-app");
+        let native = PeerIdentity::native("/usr/local/bin/super-test-app");
         let sandboxed = PeerIdentity::Native {
-            exe_path: PathBuf::from("/usr/local/bin/super-stt-app"),
+            exe_path: PathBuf::from("/usr/local/bin/super-test-app"),
             flatpak_app_id: Some("org.example.Stranger".to_string()),
         };
         let (token, _) = store.mint("Test App", &["settings".to_string()], &native);
@@ -792,7 +792,7 @@ mod web_binding_tests {
     #[test]
     fn a_web_caller_never_satisfies_a_native_grant() {
         let store = TokenStore::default();
-        let native = PeerIdentity::native("/usr/local/bin/super-stt-app");
+        let native = PeerIdentity::native("/usr/local/bin/super-test-app");
         let (token, _) = store.mint("App", &["settings".to_string()], &native);
         let meta = store.validate(&token).expect("freshly minted token");
 

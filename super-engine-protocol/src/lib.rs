@@ -13,6 +13,8 @@ pub mod runtime;
 pub mod sandbox;
 pub mod scopes;
 pub mod serde_helpers;
+#[cfg(any(test, feature = "test-product"))]
+pub mod test_product;
 
 pub use audio::FrequencyData;
-pub use product::{ProductSpec, SUPER_STT, SUPER_TTS};
+pub use product::ProductSpec;

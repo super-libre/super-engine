@@ -182,13 +182,13 @@ pub fn get_http_socket_path(product: &ProductSpec) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::product::{SUPER_STT, SUPER_TTS};
+    use crate::test_product::{OTHER, TEST};
 
     /// A runtime dir this platform accepts, used as the "honored" case below.
     #[cfg(target_os = "linux")]
     const GOOD_RUNTIME_DIR: &str = "/run/user/1000";
     #[cfg(target_os = "macos")]
-    const GOOD_RUNTIME_DIR: &str = "/tmp/stt-test-runtime";
+    const GOOD_RUNTIME_DIR: &str = "/tmp/super-engine-test-runtime";
 
     #[test]
     fn secure_runtime_path_guards_runtime_dir() {
@@ -196,16 +196,16 @@ mod tests {
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", GOOD_RUNTIME_DIR);
         }
-        let path = secure_runtime_path(&SUPER_STT, "super-stt-http.sock");
-        assert!(path.to_string_lossy().contains("super-stt-http.sock"));
+        let path = secure_runtime_path(&TEST, "super-test-http.sock");
+        assert!(path.to_string_lossy().contains("super-test-http.sock"));
 
-        // Path traversal falls back to /tmp/stt/.
+        // Path traversal falls back to /tmp/test/.
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "../../../etc");
         }
         assert_eq!(
-            secure_runtime_path(&SUPER_STT, "super-stt-http.sock"),
-            std::path::PathBuf::from("/tmp/stt/super-stt-http.sock")
+            secure_runtime_path(&TEST, "super-test-http.sock"),
+            std::path::PathBuf::from("/tmp/test/super-test-http.sock")
         );
 
         // Directory outside the whitelist falls back.
@@ -213,8 +213,8 @@ mod tests {
             std::env::set_var("XDG_RUNTIME_DIR", "/etc/passwd");
         }
         assert_eq!(
-            secure_runtime_path(&SUPER_STT, "super-stt-http.sock"),
-            std::path::PathBuf::from("/tmp/stt/super-stt-http.sock")
+            secure_runtime_path(&TEST, "super-test-http.sock"),
+            std::path::PathBuf::from("/tmp/test/super-test-http.sock")
         );
 
         // Over-long dir falls back.
@@ -223,8 +223,8 @@ mod tests {
             std::env::set_var("XDG_RUNTIME_DIR", &long_path);
         }
         assert_eq!(
-            secure_runtime_path(&SUPER_STT, "super-stt-http.sock"),
-            std::path::PathBuf::from("/tmp/stt/super-stt-http.sock")
+            secure_runtime_path(&TEST, "super-test-http.sock"),
+            std::path::PathBuf::from("/tmp/test/super-test-http.sock")
         );
 
         // With no override at all, the platform default must still land
@@ -240,13 +240,13 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
-        let path = secure_runtime_path(&SUPER_STT, "super-stt-http.sock");
+        let path = secure_runtime_path(&TEST, "super-test-http.sock");
         let rendered = path.to_string_lossy().into_owned();
         assert!(
             is_allowed(&rendered),
             "default runtime path {rendered} is not under an allowed prefix"
         );
-        assert!(rendered.ends_with("stt/super-stt-http.sock"));
+        assert!(rendered.ends_with("test/super-test-http.sock"));
 
         // And it has to fit in `sun_path`. The default is the longest path
         // that is not caller-influenced, so if it does not fit, nothing will.
@@ -276,25 +276,25 @@ mod tests {
         // A non-empty override is returned verbatim so the daemon and its
         // clients — all resolving through this helper — agree on the path.
         unsafe {
-            std::env::set_var("SUPER_STT_HTTP_SOCKET", "/tmp/stt/custom-run.sock");
+            std::env::set_var("SUPER_TEST_HTTP_SOCKET", "/tmp/test/custom-run.sock");
         }
         assert_eq!(
-            get_http_socket_path(&SUPER_STT),
-            std::path::PathBuf::from("/tmp/stt/custom-run.sock")
+            get_http_socket_path(&TEST),
+            std::path::PathBuf::from("/tmp/test/custom-run.sock")
         );
 
         // Empty override is ignored — falls back to the runtime-dir path.
         unsafe {
-            std::env::set_var("SUPER_STT_HTTP_SOCKET", "");
+            std::env::set_var("SUPER_TEST_HTTP_SOCKET", "");
         }
         assert!(
-            get_http_socket_path(&SUPER_STT)
+            get_http_socket_path(&TEST)
                 .to_string_lossy()
-                .ends_with("super-stt-http.sock")
+                .ends_with("super-test-http.sock")
         );
 
         unsafe {
-            std::env::remove_var("SUPER_STT_HTTP_SOCKET");
+            std::env::remove_var("SUPER_TEST_HTTP_SOCKET");
         }
     }
 
@@ -302,17 +302,17 @@ mod tests {
     /// runtime directory under its own name.
     #[test]
     fn each_product_has_its_own_socket() {
-        let stt = secure_runtime_path(&SUPER_STT, &SUPER_STT.socket_file());
-        let tts = secure_runtime_path(&SUPER_TTS, &SUPER_TTS.socket_file());
+        let test = secure_runtime_path(&TEST, &TEST.socket_file());
+        let other = secure_runtime_path(&OTHER, &OTHER.socket_file());
         assert!(
-            stt.ends_with("stt/super-stt-http.sock"),
+            test.ends_with("test/super-test-http.sock"),
             "{}",
-            stt.display()
+            test.display()
         );
         assert!(
-            tts.ends_with("tts/super-tts-http.sock"),
+            other.ends_with("other/super-other-http.sock"),
             "{}",
-            tts.display()
+            other.display()
         );
     }
 }

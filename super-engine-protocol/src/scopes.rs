@@ -82,11 +82,11 @@ pub fn uncovered_topic<'t>(
 #[cfg(test)]
 mod tests {
     use super::{CORE_TOPICS, is_known_scope, known_scopes, required_scope_for_topic};
-    use crate::product::{PRODUCTS, SUPER_STT, SUPER_TTS};
+    use crate::test_product::{OTHER, TEST};
 
     #[test]
     fn known_scopes_are_recognized() {
-        for product in PRODUCTS {
+        for product in [&TEST, &OTHER] {
             for s in known_scopes(product) {
                 assert!(is_known_scope(product, s), "{s} should be a known scope");
             }
@@ -99,57 +99,48 @@ mod tests {
 
     #[test]
     fn old_personas_and_garbage_are_rejected() {
-        for s in ["client", "widget", "", "Settings", "transcribe ", "global"] {
-            assert!(
-                !is_known_scope(&SUPER_STT, s),
-                "{s:?} must not be a known scope"
-            );
+        for s in ["client", "widget", "", "Settings", "test ", "global"] {
+            assert!(!is_known_scope(&TEST, s), "{s:?} must not be a known scope");
         }
     }
 
-    /// Each product's scopes are its own: a Super TTS daemon has nothing a
-    /// `transcribe` token could be good for.
+    /// Each product's scopes are its own: a token for one product's scope is
+    /// good for nothing on another's daemon.
     #[test]
     fn a_product_scope_is_not_known_to_the_other_product() {
-        assert!(is_known_scope(&SUPER_STT, "transcribe"));
-        assert!(!is_known_scope(&SUPER_TTS, "transcribe"));
-        assert!(is_known_scope(&SUPER_TTS, "speak"));
-        assert!(!is_known_scope(&SUPER_STT, "speak"));
+        assert!(is_known_scope(&TEST, "test"));
+        assert!(!is_known_scope(&OTHER, "test"));
+        assert!(is_known_scope(&OTHER, "other"));
+        assert!(!is_known_scope(&TEST, "other"));
     }
 
-    /// Every topic, core or product, names a scope the product's daemon
-    /// understands, or no token could ever subscribe to it.
+    /// Every core topic names a core scope, so any product's daemon
+    /// understands it; otherwise no token could ever subscribe.
     #[test]
-    fn every_topic_needs_a_known_scope() {
-        for product in PRODUCTS {
-            for (topic, scope) in CORE_TOPICS.iter().chain(product.topics) {
-                assert!(
-                    is_known_scope(product, scope),
-                    "{}: {topic} needs {scope}, which is not a known scope",
-                    product.display_name
-                );
-            }
+    fn every_core_topic_needs_a_known_scope() {
+        for (topic, scope) in CORE_TOPICS {
+            assert!(
+                is_known_scope(&TEST, scope),
+                "{topic} needs {scope}, which is not a known scope"
+            );
         }
     }
 
     #[test]
     fn topics_resolve_to_their_scopes() {
         assert_eq!(
-            required_scope_for_topic(&SUPER_STT, "frequency_bands"),
+            required_scope_for_topic(&TEST, "frequency_bands"),
             Some("audio_visualization")
         );
         assert_eq!(
-            required_scope_for_topic(&SUPER_STT, "recording_state"),
-            Some("recording_events")
+            required_scope_for_topic(&TEST, "test_started"),
+            Some("test_events")
         );
         assert_eq!(
-            required_scope_for_topic(&SUPER_TTS, "speaking_state"),
-            Some("playback_events")
+            required_scope_for_topic(&OTHER, "other_started"),
+            Some("other_events")
         );
-        assert_eq!(
-            required_scope_for_topic(&SUPER_TTS, "recording_state"),
-            None
-        );
-        assert_eq!(required_scope_for_topic(&SUPER_STT, "nope"), None);
+        assert_eq!(required_scope_for_topic(&OTHER, "test_started"), None);
+        assert_eq!(required_scope_for_topic(&TEST, "nope"), None);
     }
 }
