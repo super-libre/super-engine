@@ -286,10 +286,10 @@ pub struct IndexModel<M> {
     pub provider: String,
     pub supported_devices: Vec<String>,
     /// The fields the product adds ([`Product::IndexModel`]).
-    ///
-    /// Inlined in the `OpenAPI` schema: a flattened field is otherwise emitted as
-    /// a reference to the product's type, which nothing registers in a
-    /// daemon's document, so the reference dangles.
+    //
+    // Inlined in the OpenAPI schema: a flattened field is otherwise emitted as
+    // a reference to the product's type, which nothing registers in a daemon's
+    // document, so the reference dangles.
     #[serde(flatten)]
     #[cfg_attr(feature = "openapi", schema(inline))]
     pub product: M,
