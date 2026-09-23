@@ -27,7 +27,9 @@ pub use v1::health::{ping, status};
 /// endpoints). Returns [`HttpError`] on transport/auth failure; `401` becomes
 /// [`HttpError::InvalidSession`].
 pub mod transport {
-    pub use super::internal::transport::{delete_json, get_json, post_json, post_json_no_timeout};
+    pub use super::internal::transport::{
+        delete_json, get_json, patch_json, post_bytes, post_json, post_json_no_timeout,
+    };
 
     /// The single non-2xx-to-[`HttpError`] mapping, exported so the daemon's
     /// envelope-contract test can assert that every error shape it emits is

@@ -58,6 +58,48 @@ pub(crate) fn build_post_json(
         .map_err(|e| format!("Failed to build request: {e}"))
 }
 
+pub(crate) fn build_post_bytes(
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    token: Option<&str>,
+) -> Result<Request<RequestBody>, String> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{HOST}{API_PREFIX}{path}"))
+        .header("host", HOST)
+        .header("content-type", content_type)
+        .header("content-length", body.len().to_string());
+    if let Some(t) = token {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    builder
+        .body(http_body_util::Either::Right(Full::new(Bytes::from(body))))
+        .map_err(|e| format!("Failed to build request: {e}"))
+}
+
+pub(crate) fn build_patch_json(
+    path: &str,
+    body: &serde_json::Value,
+    token: Option<&str>,
+) -> Result<Request<RequestBody>, String> {
+    let body_bytes = serde_json::to_vec(body).map_err(|e| format!("Failed to encode body: {e}"))?;
+    let mut builder = Request::builder()
+        .method(Method::PATCH)
+        .uri(format!("http://{HOST}{API_PREFIX}{path}"))
+        .header("host", HOST)
+        .header("content-type", "application/json")
+        .header("content-length", body_bytes.len().to_string());
+    if let Some(t) = token {
+        builder = builder.header("authorization", format!("Bearer {t}"));
+    }
+    builder
+        .body(http_body_util::Either::Right(Full::new(Bytes::from(
+            body_bytes,
+        ))))
+        .map_err(|e| format!("Failed to build request: {e}"))
+}
+
 pub(crate) fn build_delete(
     path: &str,
     token: Option<&str>,
@@ -354,6 +396,41 @@ pub async fn post_json<T: DeserializeOwned>(
     body: &serde_json::Value,
 ) -> HttpResult<T> {
     let req = build_post_json(path, body, Some(token))?;
+    send_request::<T>(&socket_path, req).await
+}
+
+/// `POST <path>` with a raw body of `content_type`, deserialized into `T`.
+///
+/// For payloads that are already bytes — a recording, an image — where base64
+/// inside a JSON envelope would cost a third of the size and a parser pass for
+/// nothing.
+///
+/// # Errors
+/// Returns [`HttpError::InvalidSession`] on `401`; [`HttpError::Other`] on
+/// connection, HTTP, or parse failure.
+pub async fn post_bytes<T: DeserializeOwned>(
+    socket_path: std::path::PathBuf,
+    token: &str,
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> HttpResult<T> {
+    let req = build_post_bytes(path, content_type, body, Some(token))?;
+    send_request::<T>(&socket_path, req).await
+}
+
+/// `PATCH <path>` with a JSON body, deserialized into `T`.
+///
+/// # Errors
+/// Returns [`HttpError::InvalidSession`] on `401`; [`HttpError::Other`] on
+/// connection, HTTP, body encoding, or parse failure.
+pub async fn patch_json<T: DeserializeOwned>(
+    socket_path: std::path::PathBuf,
+    token: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> HttpResult<T> {
+    let req = build_patch_json(path, body, Some(token))?;
     send_request::<T>(&socket_path, req).await
 }
 
