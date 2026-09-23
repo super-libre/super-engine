@@ -6,7 +6,8 @@
 //! and the record of which build is installed in a backend's directory
 //! ([`installed`]). Resolving a custom repo or a staged local directory into an
 //! index entry ([`custom_repo`], [`local_dir`]) and deciding which of a
-//! backend's files survive an update ([`carry_over`]) are here too.
+//! backend's files survive an update ([`carry_over`]) are here too, as is the
+//! install pipeline itself ([`install`]).
 
 pub mod carry_over;
 pub mod client;
@@ -14,6 +15,7 @@ pub mod compat;
 pub mod custom_repo;
 pub mod host;
 pub mod index;
+pub mod install;
 pub mod installed;
 pub mod local_dir;
 

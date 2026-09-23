@@ -16,6 +16,8 @@
     }
     # Frequency bands ride base64-encoded in their event.
     base64 = "0.22.1"
+    # Unpacking a subprocess backend's release tarball.
+    flate2 = "1.1.9"
     chrono.workspace = true
     futures-util.workspace = true
     # CUDA, ROCm and Vulkan detection, for picking the build a host can run.
@@ -42,6 +44,7 @@
     super-engine-forge = { path = "../super-engine-forge" }
     super-engine-protocol = { path = "../super-engine-protocol" }
     super-engine-spec = { path = "../super-engine-spec" }
+    tar = "0.4.46"
     thiserror.workspace = true
     tokio = {
         workspace = true,
