@@ -66,7 +66,7 @@ fn request_origin(headers: &HeaderMap) -> Option<&str> {
 /// `Access-Control-Request-Headers` would let a page name any header it liked
 /// and be told yes, which tells the reader of a preflight nothing about what
 /// the daemon actually accepts.
-const CORS_ALLOW_METHODS: &str = "GET, POST, DELETE, OPTIONS";
+const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type";
 /// How long a browser may cache the preflight result. Ten minutes: long enough
 /// that a click-heavy settings page is not preflighting every call, short
