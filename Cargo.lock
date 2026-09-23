@@ -2004,7 +2004,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "chrono",
+ "futures-util",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "keyring",

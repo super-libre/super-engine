@@ -15,6 +15,8 @@
         features = ["json", "tokio"]
     }
     chrono.workspace = true
+    # Reading out the body of a request refused before its handler.
+    http-body-util = "0.1"
     hyper = { version = "1", features = ["http1", "server"] }
     hyper-util = {
         version = "0.1",
@@ -47,6 +49,8 @@
     utoipa.workspace = true
 
 [dev-dependencies]
+    bytes = "1"
+    futures-util.workspace = true
     tempfile = "3.27.0"
     # `ServiceExt::oneshot`, to run a guard as a router would.
     tower = { version = "0.5", features = ["util"] }
