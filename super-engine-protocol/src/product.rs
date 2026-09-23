@@ -34,6 +34,9 @@ pub struct ProductSpec {
     /// `<host>/<owner>/<repo>`: what the daemon checks for updates and the
     /// installer downloads from.
     pub repo: &'static str,
+    /// The registry index the daemon lists and installs backends from, as
+    /// the product's indexer publishes it.
+    pub index_url: &'static str,
     /// The scopes this product adds to [`CORE_SCOPES`](crate::scopes::CORE_SCOPES).
     pub scopes: &'static [&'static str],
     /// The event topics this product adds to
@@ -87,6 +90,7 @@ pub static SUPER_STT: ProductSpec = ProductSpec {
     env_prefix: "SUPER_STT",
     tcp_port: 7300,
     repo: "github.com/jorge-menjivar/super-stt",
+    index_url: "https://jorge-menjivar.github.io/super-stt/index.json",
     scopes: &["transcribe", "recording_events", "global_transcriptions"],
     topics: &[
         ("recording_started", "recording_events"),
@@ -107,6 +111,7 @@ pub static SUPER_TTS: ProductSpec = ProductSpec {
     env_prefix: "SUPER_TTS",
     tcp_port: 7301,
     repo: "github.com/jorge-menjivar/super-tts",
+    index_url: "https://jorge-menjivar.github.io/super-tts/index.json",
     scopes: &["speak", "voices", "playback_events"],
     topics: &[
         ("speaking_state", "playback_events"),
@@ -150,6 +155,7 @@ mod tests {
                 assert_ne!(a.env_prefix, b.env_prefix);
                 assert_ne!(a.tcp_port, b.tcp_port);
                 assert_ne!(a.repo, b.repo);
+                assert_ne!(a.index_url, b.index_url);
             }
         }
     }
