@@ -177,7 +177,7 @@ Do not call this to find out whether a token you already hold is still good: tha
 `GET /auth/status`, which never prompts.
 
 Setting the product's `AUTO_APPROVE` variable to `1` in the daemon's environment \
-(`SUPER_STT_AUTO_APPROVE` for Super STT, `SUPER_TTS_AUTO_APPROVE` for Super TTS) skips \
+(`<PREFIX>_AUTO_APPROVE`, where `<PREFIX>` is the product's) skips \
 the popup entirely; it is honored only in debug builds, for tests and CI, so a stray \
 environment variable cannot defeat the consent gate in a shipped binary.",
     request_body = AuthRequestBody,

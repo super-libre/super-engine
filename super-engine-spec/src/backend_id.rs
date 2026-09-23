@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn accepts_reverse_dns_ids() {
-        assert!(is_valid("app.super-stt.voxtral"));
+        assert!(is_valid("app.super-test.voxtral"));
         assert!(is_valid("com.example.whisper"));
         assert!(is_valid("io.a.b.c.d"));
         assert!(is_valid("org.x.qwen3-asr"));
@@ -48,25 +48,25 @@ mod tests {
         assert!(!is_valid("voxtral"), "one segment");
         assert!(!is_valid("app.voxtral"), "two segments");
         assert!(!is_valid("app..voxtral"), "consecutive dots");
-        assert!(!is_valid(".app.super-stt.voxtral"), "leading dot");
-        assert!(!is_valid("app.super-stt.voxtral."), "trailing dot");
+        assert!(!is_valid(".app.super-test.voxtral"), "leading dot");
+        assert!(!is_valid("app.super-test.voxtral."), "trailing dot");
         assert!(
-            !is_valid("app.super-stt.3voxtral"),
+            !is_valid("app.super-test.3voxtral"),
             "segment starts with a digit"
         );
         assert!(
-            !is_valid("app.super-stt.voxtral-"),
+            !is_valid("app.super-test.voxtral-"),
             "segment ends with a hyphen"
         );
-        assert!(!is_valid("App.Super-STT.Voxtral"), "uppercase");
-        assert!(!is_valid("app.super_stt.voxtral"), "underscore");
-        assert!(!is_valid("app/super-stt/voxtral"), "path separator");
+        assert!(!is_valid("App.Super-Test.Voxtral"), "uppercase");
+        assert!(!is_valid("app.super_test.voxtral"), "underscore");
+        assert!(!is_valid("app/super-test/voxtral"), "path separator");
         assert!(!is_valid(".."), "parent dir");
     }
 
     #[test]
     fn rejects_an_over_length_id() {
-        let long = format!("app.super-stt.{}", "a".repeat(250));
+        let long = format!("app.super-test.{}", "a".repeat(250));
         assert!(!is_valid(&long));
     }
 
@@ -74,7 +74,11 @@ mod tests {
     /// must not rest on them alone.
     #[test]
     fn every_valid_id_is_a_safe_path_component() {
-        for id in ["app.super-stt.voxtral", "com.example.whisper", "io.a.b.c.d"] {
+        for id in [
+            "app.super-test.voxtral",
+            "com.example.whisper",
+            "io.a.b.c.d",
+        ] {
             assert!(crate::is_safe_component(id), "{id}");
         }
     }

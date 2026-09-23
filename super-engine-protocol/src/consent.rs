@@ -7,7 +7,7 @@
 //! the helper's stdout. The two binaries ship together but are built from
 //! different crates, so the names they agree on are written once, here.
 //!
-//! Each variable is the product's, e.g. `SUPER_STT_AUTH_APP_NAME` for
+//! Each variable is the product's, `<PREFIX>_AUTH_APP_NAME` for
 //! [`APP_NAME`]: `product.env(consent::APP_NAME)`.
 //!
 //! [`ProductSpec::consent_helper`]: crate::ProductSpec::consent_helper

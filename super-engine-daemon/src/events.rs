@@ -151,10 +151,10 @@ pub trait CoreEvents: Send + Sync {
 ///
 /// ```ignore
 /// super_engine_daemon::event_topics! {
-///     /// Whether speech is currently coming out of the speakers.
-///     SpeakingState {
-///         wire: "speaking_state", scope: "playback_events",
-///         field: speaking_state, payload: SpeakingStateEvent,
+///     /// Whether the product is busy right now.
+///     BusyState {
+///         wire: "busy_state", scope: "busy_events",
+///         field: busy_state, payload: BusyStateEvent,
 ///         capacity: super_engine_daemon::events::STATE_BUF_CAPACITY,
 ///     },
 /// }

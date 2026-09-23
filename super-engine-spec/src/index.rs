@@ -608,7 +608,7 @@ mod tests {
         let m = Manifest::parse(
             r#"
             [backend]
-            id = "app.super-stt.voxtral"
+            id = "app.super-test.voxtral"
             source = "github.com/x/y"
             name = "Y"
             version = "1.0.0"
@@ -633,7 +633,7 @@ mod tests {
         );
 
         assert_eq!(b.id, "y", "id stays the registry key, unaffected");
-        assert_eq!(b.backend_id.as_deref(), Some("app.super-stt.voxtral"));
+        assert_eq!(b.backend_id.as_deref(), Some("app.super-test.voxtral"));
     }
 
     /// The entry carries both the contract the manifest declares and the

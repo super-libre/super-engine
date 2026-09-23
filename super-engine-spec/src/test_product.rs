@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! A product for this crate's own tests.
 //!
-//! Modeled on Super STT's contract, because that one exercises every rule the
-//! crate enforces: two generations, fields the second one adds, a field it
+//! Its contract exercises every rule the crate enforces: two generations, fields the second one adds, a field it
 //! makes required, and product keys in both `[capabilities]` and
 //! `[[models]]`. Compiled only for tests (the `test-product` feature is how the
 //! integration tests reach it).

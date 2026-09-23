@@ -15,7 +15,7 @@
 //!
 //! - `name` — the model's wire name (e.g. `whisper-1`, `voxtral-mini`).
 //! - `source` — the repo id of the backend that serves the model, e.g.
-//!   `github.com/super-stt/openai`.
+//!   `github.com/example/openai`.
 
 use std::time::Duration;
 
@@ -34,7 +34,7 @@ pub struct ModelDefinition<M> {
     /// Wire-level model name.
     pub name: String,
     /// Repo id of the backend that serves this model (e.g.
-    /// `github.com/super-stt/openai`).
+    /// `github.com/example/openai`).
     pub source: String,
     /// Whether the model supports multiple languages.
     pub is_multilingual: bool,

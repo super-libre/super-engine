@@ -43,7 +43,7 @@ mod tests {
     #[test]
     fn accepts_plain_components() {
         assert!(is_safe_component("openai.wasm"));
-        assert!(is_safe_component("super-stt-backend-whisper"));
+        assert!(is_safe_component("super-test-backend-whisper"));
         assert!(is_safe_component("mistral"));
     }
 
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn relative_path_accepts_components_and_nested() {
-        assert!(is_safe_relative_path("super-stt-backend-voxtral"));
+        assert!(is_safe_relative_path("super-test-backend-voxtral"));
         assert!(is_safe_relative_path("bin/qwen3-asr"));
         assert!(is_safe_relative_path("bin/sub/exec"));
     }

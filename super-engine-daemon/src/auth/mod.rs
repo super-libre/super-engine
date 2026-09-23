@@ -28,7 +28,7 @@ use tokens::TokenStore;
 pub use identity::{PeerIdentity, resolve_peer_identity};
 pub use middleware::AuthContext;
 
-/// The product's variable (`SUPER_STT_AUTO_APPROVE`) that, set to `1`,
+/// The product's variable (`<PREFIX>_AUTO_APPROVE`) that, set to `1`,
 /// approves every `/auth/request` without showing the consent dialog. Honored
 /// only in debug builds, for tests and CI, so a stray variable cannot defeat
 /// the consent gate in a shipped binary.

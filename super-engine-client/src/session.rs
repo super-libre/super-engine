@@ -35,7 +35,7 @@ use tokio::sync::Mutex as AsyncMutex;
 /// token from the version before would otherwise present it forever — every
 /// call on the new route answered `403 scope_denied`, and nothing in the
 /// cascade below ever replacing it. That is not hypothetical; it is what
-/// happened when Super TTS's settings app added the cloned-voice library.
+/// happened when a settings app added a new library of its own.
 ///
 /// `requested` is what decides reuse, not `granted`: if the user was asked for
 /// a scope and declined it, asking again on the next call would raise a consent
@@ -80,9 +80,8 @@ pub struct AppId {
     /// The product whose daemon issues the token. Its keyring service
     /// ([`ProductSpec::session_keyring_service`]) is where the token is kept.
     pub product: &'static ProductSpec,
-    /// A stable string that uniquely identifies the app (e.g.
-    /// `"super-stt-cli"`, `"super-stt-app"`): the keyring "user" the token is
-    /// stored under.
+    /// A stable string that uniquely identifies the app (e.g. `"<slug>-cli"`,
+    /// `"<slug>-app"`): the keyring "user" the token is stored under.
     pub name: &'static str,
 }
 
@@ -139,7 +138,7 @@ fn cache_clear(app_id: AppId) {
     TOKEN_CACHE.lock().unwrap().remove(&app_id.key());
 }
 
-/// When `product`'s `<PREFIX>_KEYRING_MOCK` (`SUPER_STT_KEYRING_MOCK`) is set,
+/// When `product`'s `<PREFIX>_KEYRING_MOCK` is set,
 /// route all client-side keyring access (the session-token store this module
 /// manages) to an in-memory mock instead of the system secret service.
 ///

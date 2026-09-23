@@ -3,7 +3,7 @@
     version.workspace = true
     authors.workspace = true
     edition.workspace = true
-    description = "The parts of a Super STT or Super TTS daemon that do not depend on the product"
+    description = "The parts of a daemon that do not depend on the product"
     license.workspace = true
     repository.workspace = true
 

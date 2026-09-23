@@ -7,8 +7,8 @@ use serde::de::DeserializeOwned;
 
 /// All endpoints are served under the `/v1` URL prefix. The request
 /// builders below prepend this automatically, so call sites use bare
-/// paths like `/ping`, `/transcribe`, `/events` — the actual
-/// URL on the wire is `/v1/ping`, `/v1/transcribe`, etc.
+/// paths like `/ping`, `/events` — the actual URL on the wire is
+/// `/v1/ping`, `/v1/events`, etc.
 pub(crate) const API_PREFIX: &str = "/v1";
 
 /// The host every request names. HTTP/1.1 requires one, and over a Unix
@@ -447,7 +447,7 @@ pub struct SseEvent {
 /// `POST <path>` with a JSON body, read as a stream of server-sent events.
 ///
 /// For an endpoint that holds the connection open and reports as it goes, the
-/// way Super STT's `/transcribe` sends each preview and then the result. A
+/// way a streaming endpoint sends each partial result and then the final one. A
 /// daemon that refuses the request answers with its error envelope, not a
 /// stream, so a non-2xx is returned as that error like every other call.
 /// Failures after the stream has started arrive as `Err` items. Blocks with

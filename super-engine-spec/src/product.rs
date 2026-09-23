@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! What a product adds to the backend contract.
 //!
-//! Super STT and Super TTS load backends the same way: one manifest format,
-//! one registry, one set of transports. What differs is what a backend is
-//! *for* — the contract generations each product has published, and the
-//! fields a transcription model or a synthesis model declares on top of the
-//! shared ones. A product names those differences by implementing [`Product`],
+//! Every product loads backends the same way: one manifest format, one
+//! registry, one set of transports. What differs is what a backend is *for* —
+//! the contract generations each product has published, and the fields its
+//! models declare on top of the shared ones. A product names those differences by implementing [`Product`],
 //! and every type in this crate that carries them is generic over it.
 //!
 //! The product's fields are flattened into the tables they extend, so a

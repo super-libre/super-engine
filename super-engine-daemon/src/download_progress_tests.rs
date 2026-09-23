@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 use super::*;
 
-/// A product that provisions per pipeline stage, as Super STT does.
+/// A product that provisions per pipeline stage.
 #[derive(Clone, Debug, Serialize)]
 struct Stage {
     source: String,
@@ -330,7 +330,7 @@ async fn a_broadcast_publishes_the_snapshot_on_the_bus() {
 }
 
 /// The stages provision independently, so one slot per stage: a
-/// post-processor's download must not evict the transcription model's —
+/// second stage's download must not evict the first's —
 /// which is what left the evicted one's progress unreportable and its
 /// cancel with nothing to cancel.
 #[test]

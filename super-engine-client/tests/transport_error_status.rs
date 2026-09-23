@@ -190,7 +190,7 @@ async fn a_post_reads_back_its_events() {
         &socket,
         "200 OK",
         ": keepalive\n\nevent: preview\ndata: {\"text\":\"hel\"}\n\n\
-         event: done\ndata: {\"transcription\":\"hello\"}\n\n",
+         event: done\ndata: {\"result\":\"hello\"}\n\n",
     );
 
     let stream = open_events(socket.clone()).await;
@@ -205,7 +205,7 @@ async fn a_post_reads_back_its_events() {
             },
             SseEvent {
                 event: Some("done".into()),
-                data: r#"{"transcription":"hello"}"#.into(),
+                data: r#"{"result":"hello"}"#.into(),
             },
         ]
     );

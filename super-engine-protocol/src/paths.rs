@@ -3,7 +3,7 @@
 //!
 //! Replaces the byte-identical daemon↔applet `get_config_path` cores and the
 //! scattered `dirs`-miss fallbacks. Each helper returns the product's
-//! subdirectory of its base (`super-stt` for Super STT), applying the same fallback the call sites used
+//! subdirectory of its base (named by its slug), applying the same fallback the call sites used
 //! (so behavior is unchanged) — callers append their own filename. The
 //! validated runtime-socket path lives separately in
 //! [`crate::runtime`] (`get_http_socket_path` etc.).
@@ -32,7 +32,7 @@ use crate::product::ProductSpec;
 /// so it discovers fixture backends and cannot disturb the developer's own
 /// install. With the variables ignored, those tests do not merely fail — they
 /// run the daemon against the developer's real `~/Library/Application
-/// Support/super-stt`.
+/// Support/<slug>`.
 ///
 /// Absolute paths only. The XDG specification requires it, `dirs` enforces it
 /// on Linux, and a relative value would otherwise resolve against whatever

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Secure secret storage using the system keyring (e.g. GNOME Keyring, `KWallet`).
 //!
-//! Everything lives under the product's service name (`super-stt`,
-//! `super-tts`). Backend secrets are stored under per-backend accounts
+//! Everything lives under the product's service name, its slug. Backend
+//! secrets are stored under per-backend accounts
 //! `backend:<source>:<name>` (written by the settings app, read at model
 //! load), which keeps them out of config files entirely.
 //!
 //! The same service also holds the daemon's HTTP session map, under
-//! `<short name>-sessions` (`stt-sessions`, `tts-sessions`) — see
+//! `<short name>-sessions` — see
 //! [`TokenStore`](crate::auth::tokens::TokenStore) and
 //! [`Keyring::get_sessions_blob`].
 
@@ -42,7 +42,7 @@ impl KeyringError {
 }
 
 /// Keyring account for a backend secret: `backend:<source>:<name>`, where
-/// `source` is the backend's repo id (e.g. `github.com/super-stt/openai`).
+/// `source` is the backend's repo id (e.g. `github.com/example/openai`).
 /// This is the generic per-backend secret store the settings app writes to.
 #[must_use]
 fn backend_secret_account(source: &str, name: &str) -> String {
@@ -67,7 +67,7 @@ fn mock_store() -> &'static Mutex<HashMap<String, String>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Whether the product's `KEYRING_MOCK` variable (`SUPER_STT_KEYRING_MOCK`)
+/// Whether the product's `KEYRING_MOCK` variable (`<PREFIX>_KEYRING_MOCK`)
 /// requests the in-memory store. Honored only in debug builds (tests / CI); a
 /// release binary ignores the variable entirely, so a stray or injected one
 /// can't reroute every backend API key and the session store into a
@@ -111,8 +111,8 @@ impl Keyring {
         }
     }
 
-    /// The keyring account holding the daemon's HTTP session map, e.g.
-    /// `stt-sessions`. See [`TokenStore`](crate::auth::tokens::TokenStore) for
+    /// The keyring account holding the daemon's HTTP session map,
+    /// `<short name>-sessions`. See [`TokenStore`](crate::auth::tokens::TokenStore) for
     /// the schema. The map is a single secret rather than one entry per session
     /// because the `keyring` crate doesn't expose enumeration — keeping the
     /// whole map under one key turns bootstrap into a single `get_password`

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Canonical types for the backend contract Super STT and Super TTS share: a
+//! Canonical types for the backend contract every product shares: a
 //! backend's `backend.toml` manifest, the maintainer-facing `registry.toml`,
 //! and the `index.json` catalog built from them — and, in [`registry`], what
 //! a daemon's `/registry` endpoints serve from that catalog.

@@ -4,7 +4,7 @@
 //! product's `docs/protocol/endpoints/v1/update.md`.
 //!
 //! The releases are the product's ([`ProductSpec::repo`]), and so is the
-//! installer each carries (`super-stt-install-<triple>` for Super STT). The
+//! installer each carries (`<slug>-install-<triple>`). The
 //! version compared against is the daemon's own, which the daemon passes in:
 //! this crate's version is not the product's.
 
@@ -77,8 +77,8 @@ fn select_candidate(releases: &[Release], include_prereleases: bool) -> Option<&
         .map(|(_, r)| r)
 }
 
-/// The file name of `product`'s installer for `triple`, e.g.
-/// `super-stt-install-x86_64-unknown-linux-gnu`.
+/// The file name of `product`'s installer for `triple`,
+/// `<slug>-install-<triple>`.
 fn installer_name(product: &ProductSpec, triple: &str) -> String {
     format!("{}-install-{triple}", product.slug)
 }

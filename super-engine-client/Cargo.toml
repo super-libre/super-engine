@@ -3,7 +3,7 @@
     version.workspace = true
     authors.workspace = true
     edition.workspace = true
-    description = "A client of a Super STT or Super TTS daemon"
+    description = "A client of a daemon built on super-engine"
     license.workspace = true
     repository.workspace = true
 

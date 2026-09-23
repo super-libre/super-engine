@@ -143,7 +143,7 @@ pub async fn resolve<P: Product>(
 /// The declared `source` must be the repo the user pointed at
 /// (`<host>/<owner>/<repo>`) or namespaced under it. A `source` under a
 /// *different* repo is identity spoofing — e.g. a malicious repo claiming
-/// `source = github.com/jorge-menjivar/super-stt/openai` to overwrite the
+/// `source = github.com/example/official/openai` to overwrite the
 /// official backend and make the daemon resolve that source to the attacker's
 /// install. Mirrors the indexer's `manifest::validate`.
 fn ensure_source_matches_repo(source: &str, repo: &RepoRef) -> Result<(), ResolveError> {
@@ -254,9 +254,9 @@ mod tests {
     #[test]
     fn source_under_a_different_repo_is_rejected_as_spoof() {
         let repo = RepoRef::parse("github.com/a/b").unwrap();
-        // A repo at `a/b` claiming an identity owned by `jorge-menjivar/super-stt`.
-        let err = ensure_source_matches_repo("github.com/jorge-menjivar/super-stt/openai", &repo)
-            .unwrap_err();
+        // A repo at `a/b` claiming an identity owned by `example/official`.
+        let err =
+            ensure_source_matches_repo("github.com/example/official/openai", &repo).unwrap_err();
         assert!(matches!(err, ResolveError::SourceSpoof { .. }));
         // Prefix-only overlap must not pass (requires a `/` boundary).
         let err = ensure_source_matches_repo("github.com/a/bbb", &repo).unwrap_err();

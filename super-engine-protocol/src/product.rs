@@ -15,16 +15,16 @@
 /// A product's names.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProductSpec {
-    /// The name people see, e.g. `Super STT`.
+    /// The name people see.
     pub display_name: &'static str,
-    /// Names the product's directories and files, e.g. `super-stt`: the
-    /// directory under each XDG base, the `super-stt-http.sock` socket and the
-    /// `super-stt-session` keyring service.
+    /// Names the product's directories and files: the directory under each
+    /// XDG base, the `<slug>-http.sock` socket and the `<slug>-session`
+    /// keyring service.
     pub slug: &'static str,
-    /// The short name, e.g. `stt`: the runtime subdirectory the socket lives
-    /// in, and the host name every request carries (`stt.local`).
+    /// The short name: the runtime subdirectory the socket lives in, and the
+    /// host name every request carries (`<short name>.local`).
     pub short_name: &'static str,
-    /// Prefix of the product's environment variables, e.g. `SUPER_STT`.
+    /// Prefix of the product's environment variables.
     pub env_prefix: &'static str,
     /// The loopback TCP port the daemon serves browsers on. Ports 7300–7309
     /// are the block reserved for the Super family, one per daemon.
@@ -45,34 +45,35 @@ pub struct ProductSpec {
 }
 
 impl ProductSpec {
-    /// The product's environment variable `name`, e.g. `SUPER_STT_HTTP_SOCKET`
-    /// for `HTTP_SOCKET`.
+    /// The product's environment variable `name`: `<PREFIX>_HTTP_SOCKET` for
+    /// `HTTP_SOCKET`.
     #[must_use]
     pub fn env(&self, name: &str) -> String {
         format!("{}_{name}", self.env_prefix)
     }
 
-    /// The file name of the daemon's HTTP socket, e.g. `super-stt-http.sock`.
+    /// The file name of the daemon's HTTP socket, `<slug>-http.sock`.
     #[must_use]
     pub fn socket_file(&self) -> String {
         format!("{}-http.sock", self.slug)
     }
 
-    /// The keyring service clients store their session tokens under, e.g.
-    /// `super-stt-session`.
+    /// The keyring service clients store their session tokens under,
+    /// `<slug>-session`.
     #[must_use]
     pub fn session_keyring_service(&self) -> String {
         format!("{}-session", self.slug)
     }
 
-    /// The host name every request to the daemon carries, e.g. `stt.local`.
+    /// The host name every request to the daemon carries,
+    /// `<short name>.local`.
     #[must_use]
     pub fn http_host(&self) -> String {
         format!("{}.local", self.short_name)
     }
 
     /// The file name of the helper that shows the consent dialog on Linux,
-    /// e.g. `super-stt-consent`. The daemon runs it only from its own
+    /// `<slug>-consent`. The daemon runs it only from its own
     /// directory. [`consent`](crate::consent) is what the two say to each
     /// other.
     #[must_use]

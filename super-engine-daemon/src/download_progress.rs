@@ -8,9 +8,10 @@
 //! after one, or cancel it.
 //!
 //! Which load a tracker is for is the product's to say, through its
-//! [`Slot`]: Super STT provisions each pipeline stage independently and
-//! reports the stage and backend with every tick; Super TTS has one load at a
-//! time and reports nothing more (`()`).
+//! [`Slot`]: a product that provisions each pipeline stage independently
+//! keys a load by its stage and reports the stage and backend with every
+//! tick; a product with one load at a time uses `()` and reports nothing
+//! more.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -29,7 +30,8 @@ use crate::events::CoreEvents;
 /// reports them.
 ///
 /// Serialized into every `download_progress` payload beside the shared keys,
-/// so its fields are wire keys: Super STT's `source` and `stage`.
+/// so its fields are wire keys, such as a pipeline product's `source` and
+/// `stage`.
 pub trait Slot: Clone + Serialize + Send + Sync + 'static {
     /// What the [`DownloadStateManager`] keeps one load per.
     type Key: Copy + Eq + Hash + Send + Sync + 'static;
@@ -395,9 +397,8 @@ fn fixed_point(percentage: f32) -> u64 {
 
 /// The loads a daemon has in flight, one per [`Slot::Key`].
 ///
-/// Super STT's pipeline stages provision independently — a post-processor
-/// can be fetched while a transcription model is — and nothing serializes
-/// the two, so a single slot meant whichever load started second evicted the
+/// A pipeline's stages provision independently — the second stage's model
+/// can be fetched while the first's is — and nothing serializes the two, so a single slot meant whichever load started second evicted the
 /// other: its progress vanished from the stage reporting it, and its cancel
 /// had nothing left to cancel. Keyed by slot, each answers only for itself.
 pub struct DownloadStateManager<S: Slot> {

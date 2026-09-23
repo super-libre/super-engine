@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Secure path helpers: socket-path construction under the per-user runtime
-//! directory — `$XDG_RUNTIME_DIR/<short name>/` on Linux (`stt/` for Super
-//! STT), the Darwin per-user temp directory's `<short name>/` on macOS.
+//! directory — `$XDG_RUNTIME_DIR/<short name>/` on Linux, the Darwin
+//! per-user temp directory's `<short name>/` on macOS.
 
 use crate::product::ProductSpec;
 
@@ -159,14 +159,14 @@ fn is_allowed(path: &str) -> bool {
 }
 
 /// Get the path of the product's HTTP-protocol Unix socket
-/// (`super-stt-http.sock` for Super STT) — the daemon's sole client-facing
+/// (`<slug>-http.sock`) — the daemon's sole client-facing
 /// listener, which all clients connect to.
 ///
-/// A non-empty `<PREFIX>_HTTP_SOCKET` (`SUPER_STT_HTTP_SOCKET`) overrides the
+/// A non-empty `<PREFIX>_HTTP_SOCKET` overrides the
 /// path verbatim (tests use this to bind a unique socket per run without
 /// touching the runtime dir). Both the daemon and every client resolve their
 /// path through here, so the override applies uniformly — set it and both ends
-/// agree. When unset, the path is `<runtime dir>/stt/super-stt-http.sock` via
+/// agree. When unset, the path is `<runtime dir>/<short name>/<slug>-http.sock` via
 /// [`secure_runtime_path`], which applies the traversal / prefix / length
 /// guards.
 #[must_use]

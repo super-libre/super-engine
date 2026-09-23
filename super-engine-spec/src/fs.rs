@@ -46,7 +46,8 @@ mod tests {
 
     #[test]
     fn writes_and_overwrites_atomically() {
-        let dir = std::env::temp_dir().join(format!("stt-write-atomic-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("super-engine-write-atomic-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("index.json");
 

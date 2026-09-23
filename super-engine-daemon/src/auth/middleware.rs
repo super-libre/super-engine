@@ -477,7 +477,7 @@ mod tests {
         let cache = DenyCache::default();
         let key: ConsentKey = (
             PeerIdentity::native("/usr/bin/evil"),
-            vec!["settings".to_string(), "transcribe".to_string()],
+            vec!["settings".to_string(), "test".to_string()],
         );
         assert!(!cache.contains(&key), "a fresh cache denies nothing");
         cache.insert(key.clone());
@@ -688,7 +688,7 @@ mod peer_binding_tests {
             exe_path: PathBuf::from("/app/bin/super-test-app"),
             flatpak_app_id: Some("org.example.Stranger".to_string()),
         };
-        let (token, _) = store.mint("Test App", &["transcribe".to_string()], &granted);
+        let (token, _) = store.mint("Test App", &["test".to_string()], &granted);
         let meta = store.validate(&token).expect("freshly minted token");
 
         assert!(meta.matches(&granted), "the granted app still matches");
@@ -988,7 +988,7 @@ mod guard_tests {
     async fn a_product_scope_is_checked_by_name() {
         let auth = Auth::for_tests(&[]);
         let me = resolve_peer_identity(Some(&self_peer()), "guard_tests").expect("identifiable");
-        let (token, _) = auth.tokens().mint("Test", &["transcribe".to_string()], &me);
+        let (token, _) = auth.tokens().mint("Test", &["test".to_string()], &me);
         let router =
             Router::new()
                 .route("/", get(|| async { "reached" }))
@@ -998,7 +998,7 @@ mod guard_tests {
                      headers,
                      request,
                      next| async move {
-                        require_scope("transcribe", auth, headers, request, next).await
+                        require_scope("test", auth, headers, request, next).await
                     },
                 ));
         let (status, body) = call(router, self_peer(), get_with_token(&token)).await;

@@ -238,10 +238,10 @@ mod tests {
         let d2 = "2".repeat(64);
         let d3 = "3".repeat(64);
         let text =
-            format!("{d1}  super-stt-x.tar.gz\n{d2} *binary-mode-file\n{d3}  ./dotslash-file\n");
+            format!("{d1}  super-test-x.tar.gz\n{d2} *binary-mode-file\n{d3}  ./dotslash-file\n");
         let sums = parse_sha256sums(&text);
         assert_eq!(sums.len(), 3);
-        assert_eq!(sums[0], (d1, "super-stt-x.tar.gz".into()));
+        assert_eq!(sums[0], (d1, "super-test-x.tar.gz".into()));
         assert_eq!(sums[1].1, "binary-mode-file");
         assert_eq!(sums[2].1, "dotslash-file");
     }

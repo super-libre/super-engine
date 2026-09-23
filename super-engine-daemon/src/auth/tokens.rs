@@ -52,7 +52,7 @@ pub(crate) fn clear_keyring_failure_flag() {
     *KEYRING_LAST_FAILURE.lock().unwrap() = None;
 }
 
-/// The product's variable (`SUPER_STT_ALLOW_NO_KEYRING`) that, set to `1`,
+/// The product's variable (`<PREFIX>_ALLOW_NO_KEYRING`) that, set to `1`,
 /// lets the daemon start even if the system keyring is unavailable, falling
 /// back to an ephemeral in-memory session store that does not survive a
 /// restart. Intended for headless / CI hosts that have no secret service.
@@ -248,7 +248,7 @@ async fn persist_snapshot(snapshot: HashMap<String, TokenMeta>, keyring: Keyring
 
 /// Persistent store of issued session tokens. The in-memory `HashMap`
 /// is the hot lookup path; every mutation also writes the whole map
-/// back to the system keyring (`(super-stt, stt-sessions)` for Super STT) so a
+/// back to the system keyring (`(<slug>, <short name>-sessions)`) so a
 /// daemon restart re-hydrates the same set of valid tokens.
 #[derive(Clone)]
 pub struct TokenStore {
@@ -259,7 +259,9 @@ pub struct TokenStore {
 #[cfg(test)]
 impl Default for TokenStore {
     fn default() -> Self {
-        Self::empty(Keyring::in_memory(&super_engine_protocol::test_product::TEST))
+        Self::empty(Keyring::in_memory(
+            &super_engine_protocol::test_product::TEST,
+        ))
     }
 }
 
@@ -647,10 +649,10 @@ mod tests {
     #[test]
     fn mint_then_validate_roundtrips() {
         let store = TokenStore::default();
-        let scopes = vec!["transcribe".to_string(), "status".to_string()];
+        let scopes = vec!["test".to_string(), "status".to_string()];
         let exe = PeerIdentity::native("/usr/bin/super-test-cli");
 
-        let (token, expires_at) = store.mint("Super STT CLI", &scopes, &exe);
+        let (token, expires_at) = store.mint("Super Test CLI", &scopes, &exe);
         assert_eq!(token.len(), 64, "token is 32 random bytes hex-encoded");
         assert!(
             token.chars().all(|c| c.is_ascii_hexdigit()),
@@ -673,7 +675,7 @@ mod tests {
         );
 
         // A second mint yields a different token.
-        let (token2, _) = store.mint("Super STT CLI", &scopes, &exe);
+        let (token2, _) = store.mint("Super Test CLI", &scopes, &exe);
         assert_ne!(token, token2, "each mint produces a unique token");
     }
 

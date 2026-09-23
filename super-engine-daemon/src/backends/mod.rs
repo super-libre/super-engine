@@ -255,7 +255,7 @@ contract = "v1"
 description = "Test backend."
 
 [[models]]
-name = "voxtral-mini-transcribe-realtime-2602"
+name = "realtime-model"
 multilingual = true
 primary_language = "en"
 supported_languages = ["en"]

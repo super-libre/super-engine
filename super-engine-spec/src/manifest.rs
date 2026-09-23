@@ -391,8 +391,7 @@ impl fmt::Display for Accel {
 }
 
 /// One `[[secrets]]` declaration — an encrypted credential the backend reads
-/// as the product's secret request header (`x-stt-secret-<name>` for Super
-/// STT, `x-tts-secret-<name>` for Super TTS).
+/// as the product's secret request header (`x-<short name>-secret-<name>`).
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Secret {
@@ -412,8 +411,7 @@ pub struct Secret {
 }
 
 /// One `[[options]]` declaration — non-secret configuration the backend reads
-/// as the product's option request header (`x-stt-option-<name>` for Super
-/// STT, `x-tts-option-<name>` for Super TTS).
+/// as the product's option request header (`x-<short name>-option-<name>`).
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Opt {
@@ -1388,9 +1386,12 @@ mod tests {
 
     #[test]
     fn parses_a_manifest_declaring_a_backend_id() {
-        let t = VALID.replace("[backend]", "[backend]\n    id = \"app.super-stt.voxtral\"");
+        let t = VALID.replace(
+            "[backend]",
+            "[backend]\n    id = \"app.super-test.voxtral\"",
+        );
         let m = Manifest::parse(&t).expect("a manifest with a valid id parses");
-        assert_eq!(m.backend.id.as_deref(), Some("app.super-stt.voxtral"));
+        assert_eq!(m.backend.id.as_deref(), Some("app.super-test.voxtral"));
     }
 
     #[test]
@@ -1458,8 +1459,8 @@ mod tests {
     /// format stays lenient about that — the parser keeps whatever the manifest
     /// wrote, and the consumers enforce the rule: the indexer refuses to publish
     /// such a release, and the daemon drops the value and loads the backend
-    /// anyway (`super-stt-indexer::manifest::validate`,
-    /// `super_stt_daemon::stt_models::backends`).
+    /// anyway (the indexer's `manifest::validate`, and
+    /// `super_engine_daemon::backends::discover`).
     #[test]
     fn parse_keeps_a_base_url_default_for_consumers_to_judge() {
         let m = Manifest::parse(
@@ -1737,8 +1738,8 @@ mod tests {
     }
 
     /// With the manifest silent, no model gets simulated previews — local or
-    /// online. Every pass is a transcription the final repeats, and for an
-    /// online model a billed one, so the cost is the author's to turn on.
+    /// online. Every pass is work the final pass repeats, and for an online
+    /// model a billed one, so the cost is the author's to turn on.
     #[test]
     fn preview_support_is_not_forced_unless_declared() {
         let local = Manifest::parse(&manifest_with("v2", "")).expect("parses");

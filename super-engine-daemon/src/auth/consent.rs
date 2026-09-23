@@ -129,7 +129,7 @@ async fn read_consent_decision(stdout: tokio::process::ChildStdout) -> ConsentDe
 /// [`ConsentDecision::PopupFailed`]: distinct from a denial, because the user
 /// was never asked.
 ///
-/// Linux spawns the product's consent helper (`super-stt-consent`), installed
+/// Linux spawns the product's consent helper (`<slug>-consent`), installed
 /// beside the daemon; see `locate_consent_helper` for why it is only ever
 /// looked for there.
 #[cfg(target_os = "linux")]
@@ -439,7 +439,7 @@ pub async fn ask_user_for_consent(
 
 /// Basenames of the first-party client binaries that skip the consent
 /// popup when co-located with the daemon binary: the product's app, CLI and
-/// COSMIC applet (`super-stt-app`, `super-stt-cli`, `super-stt-cosmic-applet`).
+/// COSMIC applet (`<slug>-app`, `<slug>-cli`, `<slug>-cosmic-applet`).
 /// See [`is_official_client`] for the full trust check.
 fn official_client_names(product: &ProductSpec) -> [String; 3] {
     ["app", "cli", "cosmic-applet"].map(|client| format!("{}-{client}", product.slug))
@@ -465,13 +465,13 @@ pub fn is_official_client(product: &ProductSpec, identity: &PeerIdentity) -> boo
         // A web peer is never first-party. The whole check below is about a
         // binary on this filesystem, and a page has none — there is nothing
         // to canonicalize and no ownership to verify, so the only safe answer
-        // is the consent popup. A site calling itself `super-stt-app` must not
+        // is the consent popup. A site calling itself `<slug>-app` must not
         // get within reach of the short-circuit.
         return false;
     };
     // A sandboxed peer is never first-party, whatever its path says. The
     // check below canonicalizes the path against *our* filesystem, and a
-    // sandbox is free to put its own binary at /usr/local/bin/super-stt-app;
+    // sandbox is free to put its own binary at /usr/local/bin/<slug>-app;
     // that path would then resolve to the real host binary, pass every test
     // here, and auto-approve a stranger with no popup at all.
     if flatpak_app_id.is_some() {
@@ -743,12 +743,8 @@ mod tests {
 
     #[test]
     fn normalize_sorts_and_dedups() {
-        let got = normalize_scopes(&[
-            "transcribe".to_string(),
-            "status".to_string(),
-            "transcribe".to_string(),
-        ]);
-        assert_eq!(got, vec!["status".to_string(), "transcribe".to_string()]);
+        let got = normalize_scopes(&["test".to_string(), "status".to_string(), "test".to_string()]);
+        assert_eq!(got, vec!["status".to_string(), "test".to_string()]);
     }
 
     #[test]

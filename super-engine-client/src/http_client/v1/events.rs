@@ -147,10 +147,10 @@ mod tests {
     #[test]
     fn comment_alongside_event_does_not_demote_to_keepalive() {
         // Real events take precedence over a comment in the same block.
-        let block = ": comment first\nevent: recording_state\ndata: {\"is_recording\":true}";
+        let block = ": comment first\nevent: test_started\ndata: {\"started\":true}";
         let evt = parse_widget_sse_block(block).expect("event yields despite comment");
-        assert_eq!(evt.name, "recording_state");
-        assert_eq!(evt.payload["is_recording"], true);
+        assert_eq!(evt.name, "test_started");
+        assert_eq!(evt.payload["started"], true);
     }
 
     #[test]

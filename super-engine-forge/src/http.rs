@@ -8,7 +8,7 @@
 //! ad-hoc builders that variously used `expect`/`unwrap`/`unwrap_or_default`, no
 //! user-agent, and — in the indexer — no timeout at all.
 //!
-//! The user-agent is the product's, version-stamped (`super-stt/0.2.4`), and
+//! The user-agent is the product's, version-stamped (`<slug>/<version>`), and
 //! is sent on every request so forge/CDN logs and rate-limiters can attribute
 //! traffic to the product and release that made it.
 //!

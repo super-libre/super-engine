@@ -7,7 +7,7 @@ use hyper::body::Incoming;
 /// Frame an SSE response body into blocks and map each block — plus any
 /// body-read / non-UTF-8 error — to the caller's event type `T`. The loop
 /// skeleton (accumulate frames, split on the blank-line boundary, decode,
-/// dispatch) is identical for the `/transcribe` and `/events` client streams;
+/// dispatch) is identical for a streaming endpoint and the `/events` stream;
 /// callers supply only the per-block parser and the error constructor.
 pub(crate) fn block_stream<T, P, E>(
     body: Incoming,

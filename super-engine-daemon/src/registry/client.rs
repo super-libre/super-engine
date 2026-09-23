@@ -17,7 +17,7 @@ use crate::registry::index::{retain_safe_backends, warn_if_client_too_old};
 /// How long a fetched index is served before the next request refetches it.
 pub const DEFAULT_TTL: Duration = Duration::from_hours(6);
 
-/// The variable (`SUPER_STT_REGISTRY_URL`) that points a daemon at another
+/// The variable (`<PREFIX>_REGISTRY_URL`) that points a daemon at another
 /// index. Only an `https` URL, or a loopback one, is accepted.
 pub const REGISTRY_URL: &str = "REGISTRY_URL";
 
