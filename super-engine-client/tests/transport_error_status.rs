@@ -164,6 +164,20 @@ async fn successful_uninstall_still_parses() {
     let _ = std::fs::remove_file(&socket);
 }
 
+/// Opens the stream the way a product's endpoint does: from a function that
+/// builds the request body and returns the stream past it. That only compiles
+/// if the stream borrows none of the arguments.
+async fn open_events(
+    socket: std::path::PathBuf,
+) -> impl futures_util::Stream<Item = super_engine_client::http_client::HttpResult<transport::SseEvent>>
++ Send
++ 'static {
+    let body = serde_json::json!({});
+    transport::post_json_events(socket, "token", "/x", &body)
+        .await
+        .expect("a 200 opens the stream")
+}
+
 /// A streaming endpoint's events arrive in order, and a keepalive comment
 /// between them is not one.
 #[tokio::test]
@@ -179,9 +193,7 @@ async fn a_post_reads_back_its_events() {
          event: done\ndata: {\"transcription\":\"hello\"}\n\n",
     );
 
-    let stream = transport::post_json_events(socket.clone(), "token", "/x", &serde_json::json!({}))
-        .await
-        .expect("a 200 opens the stream");
+    let stream = open_events(socket.clone()).await;
     let events: Vec<SseEvent> = stream.map(|e| e.expect("no body error")).collect().await;
 
     assert_eq!(

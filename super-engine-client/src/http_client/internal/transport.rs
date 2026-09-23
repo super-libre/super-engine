@@ -454,6 +454,9 @@ pub struct SseEvent {
 /// neither an event name nor data, which is what a keepalive comment is, are
 /// skipped. Dropping the stream closes the connection.
 ///
+/// The stream borrows none of the arguments, so it can outlive the request
+/// body a caller built for it.
+///
 /// # Errors
 /// Returns [`HttpError::InvalidSession`] on `401`; [`HttpError::Other`] on
 /// connection, HTTP, or body encoding failure, or any other non-2xx.
@@ -462,7 +465,7 @@ pub async fn post_json_events(
     token: &str,
     path: &str,
     body: &serde_json::Value,
-) -> HttpResult<impl futures_util::Stream<Item = HttpResult<SseEvent>> + Send + 'static> {
+) -> HttpResult<impl futures_util::Stream<Item = HttpResult<SseEvent>> + Send + use<>> {
     let req = build_post_json(path, body, Some(token))?;
     let response = open(&socket_path, req, Some(REQUEST_TIMEOUT)).await?;
     let status = response.status();
