@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The daemon side of the backend registry: fetching and caching the
 //! product's `index.json` ([`client`]), the policy applied to what it serves
-//! ([`index`]), what this machine can run ([`host`]), and the record of which
-//! build is installed in a backend's directory ([`installed`]).
+//! ([`index`]), what this machine can run ([`host`]), which build of a
+//! backend and which variant of each model file it should get ([`compat`]),
+//! and the record of which build is installed in a backend's directory
+//! ([`installed`]).
 
 pub mod client;
+pub mod compat;
 pub mod host;
 pub mod index;
 pub mod installed;
