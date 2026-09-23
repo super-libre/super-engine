@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Installed backends, as a daemon sees them.
 //!
-//! [`validate_runtime`] is the runtime policy a daemon holds a backend's
-//! `backend.toml` to at discovery, on top of what `Manifest::parse` already
-//! enforces: the checks only the daemon cares about.
+//! [`discover`] scans the backends directory into [`DiscoveredBackend`]s,
+//! each carrying the [`ModelDefinition`]s it serves. [`validate_runtime`] is
+//! the runtime policy a daemon holds a backend's `backend.toml` to at
+//! discovery, on top of what `Manifest::parse` already enforces: the checks
+//! only the daemon cares about.
+
+mod discovery;
+mod model;
+
+pub use discovery::{
+    DiscoveredBackend, default_backends_dir, dir_name, discover, find_model, installed_version,
+    list_models,
+};
+pub use model::ModelDefinition;
 
 use anyhow::Result;
 use super_engine_spec::manifest::{Kind, Manifest};

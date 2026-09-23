@@ -4,8 +4,8 @@
 //!
 //! - [`auth`]: session tokens, the consent dialog, and the guards every
 //!   route sits behind.
-//! - [`backends`]: installed backends — the runtime policy a manifest is held
-//!   to at discovery.
+//! - [`backends`]: installed backends — finding them on disk, the models
+//!   they serve, and the runtime policy a manifest is held to at discovery.
 //! - [`download_stream`]: streaming a download to disk, hashing it on the
 //!   way.
 //! - [`events`]: the event bus, its core topics, and the `/events` stream.
