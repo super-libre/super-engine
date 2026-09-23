@@ -346,8 +346,9 @@ where
 /// A `subprocess` executable is not self-contained in the same way: it may need
 /// siblings no manifest field declares — a bundled interpreter, shared
 /// libraries — and the registry equivalent is an opaque tarball, so its tree is
-/// copied whole. Only VCS metadata is dropped, being the one thing that cannot
-/// be a runtime dependency.
+/// copied whole. Two things are dropped, being the two that cannot be a runtime
+/// dependency: VCS metadata, and any directory tagged as regenerable cache (see
+/// [`is_cache_dir`]).
 fn copy_staged_backend(
     src: &Path,
     dst: &Path,
@@ -400,6 +401,41 @@ fn copy_staged_backend(
     Ok(())
 }
 
+/// Marker file of the [Cache Directory Tagging Specification][spec], which
+/// Cargo writes into `target/`.
+///
+/// [spec]: https://bford.info/cachedir/
+const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+
+/// The line a well-formed [`CACHEDIR_TAG`] opens with, byte for byte. The
+/// specification puts it at offset zero so a reader can identify the file
+/// without parsing it.
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether `dir` is tagged as regenerable cache, and so may be skipped.
+///
+/// This is what keeps an import from copying a build tree. Pointing
+/// `local_path` at a source checkout is the normal way to test a backend, and
+/// a Rust checkout's `target/` routinely runs to several gigabytes — for a
+/// backend that downloads models into it while being tested, tens. Copying it
+/// turns an install that should be a file copy into a minute of disk traffic,
+/// and every byte of it is rebuildable output the backend never reads.
+///
+/// Keyed on the tag rather than on the name `target`, because the tag is the
+/// directory declaring itself disposable. A backend that genuinely needs a
+/// directory at runtime does not put that marker in it.
+fn is_cache_dir(dir: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(dir.join(CACHEDIR_TAG)) else {
+        return false;
+    };
+    let mut head = vec![0_u8; CACHEDIR_TAG_SIGNATURE.len()];
+    // A short read is a malformed tag, so it fails the comparison rather than
+    // matching a prefix of the signature.
+    file.read_exact(&mut head).is_ok() && head == CACHEDIR_TAG_SIGNATURE
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -423,6 +459,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
             ));
         }
         if ft.is_dir() {
+            // The build tree, usually. Logged rather than silent: a user who
+            // staged data there needs to know why it did not arrive.
+            if is_cache_dir(&from) {
+                log::info!("skipping cache directory {}", from.display());
+                continue;
+            }
             copy_dir_recursive(&from, &to)?;
         } else {
             std::fs::copy(&from, &to)?;
@@ -1194,6 +1236,10 @@ supported_devices = ["cpu"]
 
     /// A subprocess executable may need siblings no manifest field declares, so
     /// its tree is taken whole — except the history, which cannot be one.
+    ///
+    /// The build tree here carries no `CACHEDIR.TAG`, so it is data as far as
+    /// this copy can tell and is kept. That is the conservative half of the
+    /// rule; the tagged half is below.
     #[test]
     fn subprocess_import_keeps_the_tree_but_drops_vcs_metadata() {
         let src = staged_checkout();
@@ -1204,6 +1250,74 @@ supported_devices = ["cpu"]
         assert!(out.join("README.md").is_file());
         assert!(out.join("target/wasm32-wasip2/release/y.wasm").is_file());
         assert!(!out.join(".git").exists());
+    }
+
+    /// Write the tag Cargo puts in `target/` so the directory is recognizable
+    /// as regenerable cache.
+    fn tag_as_cache(dir: &Path) {
+        std::fs::write(
+            dir.join(CACHEDIR_TAG),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n\
+              # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+    }
+
+    /// The build tree is what makes importing a source checkout slow: it is
+    /// gigabytes of rebuildable output that the backend never reads. Cargo
+    /// tags it, so the import can leave it behind without guessing from the
+    /// directory's name.
+    #[test]
+    fn subprocess_import_drops_a_tagged_build_tree() {
+        let src = staged_checkout();
+        tag_as_cache(&src.path().join("target"));
+        let dst = tempfile::tempdir().unwrap();
+        let out = dst.path().join("out");
+        copy_staged_backend(src.path(), &out, "subprocess", "y.wasm").unwrap();
+
+        assert!(!out.join("target").exists(), "the build tree was copied");
+        // Everything the backend might actually need still arrives.
+        assert!(out.join("y.wasm").is_file());
+        assert!(out.join("backend.toml").is_file());
+        assert!(out.join("README.md").is_file());
+    }
+
+    /// Only the real marker counts. A directory that merely has a file by that
+    /// name is not making the claim, and dropping it would lose data.
+    #[test]
+    fn a_directory_is_cache_only_with_a_well_formed_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_cache_dir(dir.path()), "no tag at all");
+
+        std::fs::write(dir.path().join(CACHEDIR_TAG), b"not the signature").unwrap();
+        assert!(!is_cache_dir(dir.path()), "wrong contents");
+
+        // Shorter than the signature: a truncated tag must not match on a
+        // prefix.
+        std::fs::write(dir.path().join(CACHEDIR_TAG), b"Signature: 8a47").unwrap();
+        assert!(!is_cache_dir(dir.path()), "truncated tag");
+
+        tag_as_cache(dir.path());
+        assert!(is_cache_dir(dir.path()), "the tag Cargo writes");
+    }
+
+    /// A tagged directory nested below the root is skipped too: a backend that
+    /// vendors a sub-crate has one build tree per crate.
+    #[test]
+    fn a_nested_build_tree_is_dropped_as_well() {
+        let src = staged_checkout();
+        let nested = src.path().join("vendor/thing/target");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("artifact"), b"rebuildable").unwrap();
+        tag_as_cache(&nested);
+        std::fs::write(src.path().join("vendor/thing/keep.txt"), b"source").unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        let out = dst.path().join("out");
+        copy_staged_backend(src.path(), &out, "subprocess", "y.wasm").unwrap();
+
+        assert!(out.join("vendor/thing/keep.txt").is_file());
+        assert!(!out.join("vendor/thing/target").exists());
     }
 
     /// A nested entrypoint (`bin/qwen3-asr`) needs its parent created.
