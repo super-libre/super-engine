@@ -64,6 +64,15 @@ impl ProductSpec {
     pub fn http_host(&self) -> String {
         format!("{}.local", self.short_name)
     }
+
+    /// The file name of the helper that shows the consent dialog on Linux,
+    /// e.g. `super-stt-consent`. The daemon runs it only from its own
+    /// directory. [`consent`](crate::consent) is what the two say to each
+    /// other.
+    #[must_use]
+    pub fn consent_helper(&self) -> String {
+        format!("{}-consent", self.slug)
+    }
 }
 
 /// Super STT: speech to text.
@@ -115,11 +124,13 @@ mod tests {
         assert_eq!(SUPER_STT.session_keyring_service(), "super-stt-session");
         assert_eq!(SUPER_STT.http_host(), "stt.local");
         assert_eq!(SUPER_STT.env("HTTP_SOCKET"), "SUPER_STT_HTTP_SOCKET");
+        assert_eq!(SUPER_STT.consent_helper(), "super-stt-consent");
 
         assert_eq!(SUPER_TTS.socket_file(), "super-tts-http.sock");
         assert_eq!(SUPER_TTS.session_keyring_service(), "super-tts-session");
         assert_eq!(SUPER_TTS.http_host(), "tts.local");
         assert_eq!(SUPER_TTS.env("HTTP_SOCKET"), "SUPER_TTS_HTTP_SOCKET");
+        assert_eq!(SUPER_TTS.consent_helper(), "super-tts-consent");
     }
 
     /// Two daemons may run side by side, so nothing either one binds, stores

@@ -4,6 +4,7 @@
 //! identified, and the wire types every client reads.
 
 pub mod audio;
+pub mod consent;
 pub mod logging;
 pub mod models;
 pub mod paths;
