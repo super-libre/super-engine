@@ -12,6 +12,7 @@
 //! - [`resource_management`]: the per-client connection cap and rate limit.
 //! - [`http`]: the Unix socket and loopback TCP listeners, what the daemon
 //!   knows about each caller, and the error bodies the guards answer with.
+//! - [`openapi`]: checks on the `OpenAPI` document a daemon generates.
 //! - [`self_update`]: whether the product has a newer release, and which
 //!   installer to offer for it.
 //!
@@ -24,5 +25,6 @@ pub mod download_stream;
 pub mod events;
 pub mod http;
 pub mod keyring;
+pub mod openapi;
 pub mod resource_management;
 pub mod self_update;
