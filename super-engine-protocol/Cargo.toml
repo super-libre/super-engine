@@ -1,0 +1,26 @@
+[package]
+    name = "super-engine-protocol"
+    version.workspace = true
+    authors.workspace = true
+    edition.workspace = true
+    description = "What a Super STT or Super TTS daemon and its clients agree on"
+    license.workspace = true
+    repository.workspace = true
+
+[dependencies]
+    dirs.workspace = true
+    env_logger.workspace = true
+    libc.workspace = true
+    log.workspace = true
+    serde.workspace = true
+    serde_json.workspace = true
+    strum.workspace = true
+    strum_macros.workspace = true
+    utoipa = { workspace = true, optional = true }
+
+[features]
+    # Derive `utoipa::ToSchema` on the wire types the daemons document.
+    openapi = ["dep:utoipa"]
+
+[lints]
+    workspace = true
