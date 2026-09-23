@@ -29,7 +29,9 @@
     ring = "0.17"
     serde.workspace = true
     serde_json.workspace = true
+    super-engine-forge = { path = "../super-engine-forge" }
     super-engine-protocol = { path = "../super-engine-protocol" }
+    super-engine-spec = { path = "../super-engine-spec" }
     thiserror.workspace = true
     tokio = {
         workspace = true,
@@ -51,6 +53,7 @@
 [dev-dependencies]
     bytes = "1"
     futures-util.workspace = true
+    mockito = "1.7.2"
     tempfile = "3.27.0"
     # `ServiceExt::oneshot`, to run a guard as a router would.
     tower = { version = "0.5", features = ["util"] }

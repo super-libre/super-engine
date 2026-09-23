@@ -9,6 +9,8 @@
 //! - [`resource_management`]: the per-client connection cap and rate limit.
 //! - [`http`]: the Unix socket and loopback TCP listeners, what the daemon
 //!   knows about each caller, and the error bodies the guards answer with.
+//! - [`self_update`]: whether the product has a newer release, and which
+//!   installer to offer for it.
 //!
 //! Everything named after the product (the keyring service, the consent
 //! helper, the environment variables) comes from the
@@ -18,3 +20,4 @@ pub mod auth;
 pub mod http;
 pub mod keyring;
 pub mod resource_management;
+pub mod self_update;
