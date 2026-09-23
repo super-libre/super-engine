@@ -1,0 +1,8 @@
+**/target
+**/*.log
+
+lcov.info
+coverage-html/
+
+.claude/worktrees/
+.claude/scheduled_tasks.lock

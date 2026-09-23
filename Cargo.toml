@@ -1,0 +1,30 @@
+[workspace]
+  resolver = "2"
+  members  = [
+    "super-engine-spec",
+  ]
+
+  [workspace.package]
+    version    = "0.1.0"
+    authors    = ["Jorge Menjivar <jorge@menjivar.ai>"]
+    edition    = "2024"
+    license    = "GPL-3.0-only"
+    repository = "https://github.com/super-libre/super-engine"
+
+  [workspace.dependencies]
+    serde      = { version = "1.0.219", features = ["derive"] }
+    serde_json = "1.0.149"
+    thiserror  = "2.0"
+    toml       = "1.0.6"
+    # OpenAPI: the daemons generate their protocol spec from the router and the
+    # wire types, so the types here derive `ToSchema` behind an `openapi`
+    # feature rather than being described a second time.
+    utoipa     = { version = "5.5.0", features = ["axum_extras", "chrono"] }
+
+  [workspace.lints.clippy]
+    pedantic = { level = "warn", priority = -1 }
+
+  # Mirrors the clippy gate (see `just check`) so `cargo clippy` / `cargo build`
+  # apply the same standard as CI.
+  [workspace.lints.rust]
+    unused_must_use = "deny"
