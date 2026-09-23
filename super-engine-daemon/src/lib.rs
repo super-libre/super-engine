@@ -6,6 +6,9 @@
 //!   route sits behind.
 //! - [`backends`]: installed backends — finding them on disk, the models
 //!   they serve, and the runtime policy a manifest is held to at discovery.
+//! - [`download`]: provisioning a model's files before its backend loads it.
+//! - [`download_progress`]: what a model load reports as it goes, and the
+//!   loads in flight.
 //! - [`download_stream`]: streaming a download to disk, hashing it on the
 //!   way.
 //! - [`events`]: the event bus, its core topics, and the `/events` stream.
@@ -26,6 +29,8 @@
 
 pub mod auth;
 pub mod backends;
+pub mod download;
+pub mod download_progress;
 pub mod download_stream;
 pub mod events;
 pub mod http;
