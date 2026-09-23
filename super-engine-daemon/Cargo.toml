@@ -18,6 +18,8 @@
     base64 = "0.22.1"
     chrono.workspace = true
     futures-util.workspace = true
+    # CUDA, ROCm and Vulkan detection, for picking the build a host can run.
+    gpu-probe = "0.1.1"
     hex = "0.4.3"
     # Reading out the body of a request refused before its handler.
     http-body-util = "0.1"
@@ -29,10 +31,12 @@
     keyring.workspace = true
     libc.workspace = true
     log.workspace = true
+    parking_lot = "0.12"
     reqwest.workspace = true
     # Session tokens are drawn from the system's secure random source, and
     # downloads hashed as they stream.
     ring = "0.17"
+    semver = "1"
     serde.workspace = true
     serde_json.workspace = true
     super-engine-forge = { path = "../super-engine-forge" }
@@ -63,6 +67,8 @@
 [dev-dependencies]
     bytes = "1"
     mockito = "1.7.2"
+    # The product the registry tests parse manifests and indexes for.
+    super-engine-spec = { path = "../super-engine-spec", features = ["test-product"] }
     tempfile = "3.27.0"
     # `ServiceExt::oneshot`, to run a guard as a router would.
     tower = { version = "0.5", features = ["util"] }

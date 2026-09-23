@@ -13,6 +13,8 @@
 //! - [`http`]: the Unix socket and loopback TCP listeners, what the daemon
 //!   knows about each caller, and the error bodies the guards answer with.
 //! - [`openapi`]: checks on the `OpenAPI` document a daemon generates.
+//! - [`registry`]: the backend registry's index, what this host can run of
+//!   it, and which build of a backend to install.
 //! - [`self_update`]: whether the product has a newer release, and which
 //!   installer to offer for it.
 //!
@@ -26,5 +28,6 @@ pub mod events;
 pub mod http;
 pub mod keyring;
 pub mod openapi;
+pub mod registry;
 pub mod resource_management;
 pub mod self_update;
