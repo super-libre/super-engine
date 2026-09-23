@@ -4,6 +4,8 @@
 //!
 //! - [`auth`]: session tokens, the consent dialog, and the guards every
 //!   route sits behind.
+//! - [`backends`]: installed backends — the runtime policy a manifest is held
+//!   to at discovery.
 //! - [`download_stream`]: streaming a download to disk, hashing it on the
 //!   way.
 //! - [`events`]: the event bus, its core topics, and the `/events` stream.
@@ -23,6 +25,7 @@
 //! [`ProductSpec`](super_engine_protocol::ProductSpec) the daemon passes in.
 
 pub mod auth;
+pub mod backends;
 pub mod download_stream;
 pub mod events;
 pub mod http;
