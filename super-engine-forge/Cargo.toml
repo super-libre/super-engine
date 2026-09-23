@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[package]
+    name = "super-engine-forge"
+    version.workspace = true
+    authors.workspace = true
+    edition.workspace = true
+    description = "Pluggable git-forge clients (release discovery + asset download) for Super STT"
+    license.workspace = true
+    repository.workspace = true
+
+[dependencies]
+    async-trait = "0.1.89"
+    log.workspace = true
+    reqwest.workspace = true
+    rustls = {
+        version = "0.23",
+        default-features = false,
+        features = ["ring", "std", "tls12"]
+    }
+    serde.workspace = true
+    super-engine-spec = { path = "../super-engine-spec" }
+    thiserror.workspace = true
+
+[dev-dependencies]
+    mockito = "1"
+    tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+    workspace = true
