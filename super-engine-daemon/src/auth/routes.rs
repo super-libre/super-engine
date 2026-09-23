@@ -173,9 +173,13 @@ A denial is remembered for the `(binary, scopes)` pair for the rest of the daemo
 lifetime and answers `403` immediately without re-prompting — renaming your app does \
 not clear it, since the key is the binary. Restarting the daemon does.
 
+Do not call this to find out whether a token you already hold is still good: that is \
+`GET /auth/status`, which never prompts.
+
 Setting the product's `AUTO_APPROVE` variable to `1` in the daemon's environment \
 (`SUPER_STT_AUTO_APPROVE` for Super STT, `SUPER_TTS_AUTO_APPROVE` for Super TTS) skips \
-the popup entirely; it is for tests and CI, not for production.",
+the popup entirely; it is honored only in debug builds, for tests and CI, so a stray \
+environment variable cannot defeat the consent gate in a shipped binary.",
     request_body = AuthRequestBody,
     responses(
         (status = 200, description = "The user approved. Store the token.", body = AuthOk),
@@ -396,6 +400,7 @@ pub struct AuthStatusOk {
     #[schema(example = "success")]
     pub status: &'static str,
     /// The scopes the token was minted under.
+    #[schema(example = json!(["status", "settings"]))]
     pub scopes: Vec<String>,
     /// RFC 3339 expiry, so a headless client can renew before it lapses.
     pub expires_at: String,
@@ -424,7 +429,7 @@ which is what makes it the right probe for a headless or CLI client. Reaching th
 handler at all means the token validated.
 
 Use it to fail fast on a token about to expire, rather than discovering it \
-mid-operation.",
+mid-operation. `GET /ping` proves the daemon is up; this proves the token still is.",
     security(("session_token" = [])),
     responses(
         (status = 200, description = "The token is valid.", body = AuthStatusOk),
