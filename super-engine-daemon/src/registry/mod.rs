@@ -4,13 +4,18 @@
 //! ([`index`]), what this machine can run ([`host`]), which build of a
 //! backend and which variant of each model file it should get ([`compat`]),
 //! and the record of which build is installed in a backend's directory
-//! ([`installed`]).
+//! ([`installed`]). Resolving a custom repo or a staged local directory into an
+//! index entry ([`custom_repo`], [`local_dir`]) and deciding which of a
+//! backend's files survive an update ([`carry_over`]) are here too.
 
+pub mod carry_over;
 pub mod client;
 pub mod compat;
+pub mod custom_repo;
 pub mod host;
 pub mod index;
 pub mod installed;
+pub mod local_dir;
 
 use super_engine_protocol::ProductSpec;
 use super_engine_spec::index::IndexBackend;
