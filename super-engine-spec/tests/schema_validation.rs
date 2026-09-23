@@ -149,6 +149,68 @@ fn rejects_contract_violations() {
     }
 }
 
+/// The file selector validates, and its forbidden-without-its-family rule
+/// bites — the schema half of the parser's `validate_files`.
+#[test]
+fn the_schema_gates_a_file_discriminator_on_its_family() {
+    // `sub_base` with one model carrying `files`.
+    fn with_file(file: &Value) -> Value {
+        let mut d = sub_base();
+        d["models"] = json!([{ "name": "m",
+            "primary_language": "en", "supported_languages": ["en"],
+            "supported_devices": ["cpu", "gpu"],
+            "files": [file] }]);
+        d
+    }
+
+    let v = backend_validator();
+    for (label, file) in [
+        (
+            "a plain file",
+            json!({ "url": "https://example.com/k.bin", "destination": "c/k.bin" }),
+        ),
+        (
+            "a cuda variant",
+            json!({ "url": "https://example.com/k.bin", "destination": "c/k.bin",
+                    "accel": "cuda", "cuda_sm": 90, "optional": true }),
+        ),
+        (
+            "a cuda variant covering several capabilities",
+            json!({ "url": "https://example.com/k.bin", "destination": "c/k.bin",
+                    "accel": "cuda", "cuda_sm": [86, 89] }),
+        ),
+        (
+            "a rocm variant",
+            json!({ "url": "https://example.com/k.bin", "destination": "c/k.bin",
+                    "accel": ["rocm"], "gfx": ["gfx1100"] }),
+        ),
+    ] {
+        assert!(v.is_valid(&with_file(&file)), "{label}: must validate");
+    }
+    for (label, file) in [
+        (
+            "cuda_sm on a cpu variant",
+            json!({ "url": "https://example.com/k.bin", "destination": "c/k.bin",
+                    "accel": "cpu", "cuda_sm": 90 }),
+        ),
+        (
+            "gfx without rocm",
+            json!({ "url": "https://example.com/k.bin", "destination": "c/k.bin",
+                    "accel": "cuda", "cuda_major": 13, "gfx": ["gfx1100"] }),
+        ),
+        (
+            "vulkan_api without vulkan",
+            json!({ "url": "https://example.com/k.bin", "destination": "c/k.bin",
+                    "accel": "cpu", "vulkan_api": "1.3" }),
+        ),
+    ] {
+        assert!(
+            !v.is_valid(&with_file(&file)),
+            "{label}: should have failed"
+        );
+    }
+}
+
 /// The `base_url` rule is narrow: the option may be declared, and every other
 /// option keeps its `default`. Without this the conditional could be widened to
 /// ban defaults outright and the rejection case above would still pass.
@@ -561,6 +623,21 @@ fn allows_documented_optionals() {
     let mut other = wasm_base();
     other["backend"]["license"] = json!("other");
     assert!(v.is_valid(&other), "license = \"other\" must validate");
+    // Per-architecture variants of one destination.
+    let mut variants = sub_base();
+    variants["models"] = json!([{ "name": "m",
+        "primary_language": "en", "supported_languages": ["en"],
+        "supported_devices": ["cpu", "gpu"],
+        "files": [
+            { "url": "https://example.com/k-sm90.bin", "destination": "c/k.bin",
+              "accel": "cuda", "cuda_sm": 90, "optional": true },
+            { "url": "https://example.com/k-rocm.bin", "destination": "c/k.bin",
+              "accel": ["rocm"], "gfx": ["gfx1100"], "optional": true }
+        ] }]);
+    assert!(
+        v.is_valid(&variants),
+        "per-architecture file variants must validate"
+    );
     // cuda_major without cuda_sm — the wildcard-SM build.
     let mut wildcard = sub_base();
     wildcard["assets"]["subprocess"] = json!([
