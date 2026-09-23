@@ -20,3 +20,7 @@ doctest *args:
 
 # Full local CI gate: format, lint, tests, doctests
 ci: fmt-check check test doctest
+
+# Remove build artifacts
+clean:
+    cargo clean
