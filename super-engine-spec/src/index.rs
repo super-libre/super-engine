@@ -286,7 +286,12 @@ pub struct IndexModel<M> {
     pub provider: String,
     pub supported_devices: Vec<String>,
     /// The fields the product adds ([`Product::IndexModel`]).
+    ///
+    /// Inlined in the `OpenAPI` schema: a flattened field is otherwise emitted as
+    /// a reference to the product's type, which nothing registers in a
+    /// daemon's document, so the reference dangles.
     #[serde(flatten)]
+    #[cfg_attr(feature = "openapi", schema(inline))]
     pub product: M,
 }
 
@@ -902,5 +907,21 @@ mod tests {
                 accel.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// A daemon registers `IndexModel` in its `OpenAPI` document, and nothing
+    /// else registers the product's type, so the product fields have to be in
+    /// the schema itself rather than referenced from it.
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn the_openapi_schema_carries_the_product_fields_itself() {
+        use utoipa::PartialSchema;
+        let schema = serde_json::to_value(IndexModel::schema()).expect("serializes");
+        let text = schema.to_string();
+        assert!(!text.contains("$ref"), "a reference would dangle: {text}");
+        assert!(
+            text.contains("\"role\""),
+            "the product field is missing: {text}"
+        );
     }
 }
