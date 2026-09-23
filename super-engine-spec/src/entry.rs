@@ -12,15 +12,15 @@ use crate::forge::Forge;
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Entry {
-    /// Reverse-DNS identifier for the backend, e.g. `com.example.voxtral`.
+    /// Reverse-DNS identifier for the backend, e.g. `com.example.backend`.
     /// Must equal the `[backend].id` of the release manifest this entry points
     /// at. Required — the generated `registry.schema.json` says so, and the
     /// indexer refuses an entry without one.
     ///
-    /// `Option` only because six entries predate the requirement and their
-    /// published manifests declare no `[backend].id` to match against. The
-    /// indexer tolerates exactly those (`registry_toml::GRANDFATHERED`) so the
-    /// catalog keeps building; the schema flags them, which is the backlog.
+    /// `Option` only because some entries predate the requirement and their
+    /// published manifests declare no `[backend].id` to match against. A
+    /// product's indexer tolerates exactly those so its catalog keeps
+    /// building; the schema flags them, which is the backlog.
     #[serde(default)]
     pub id: Option<String>,
     /// Repository hosting the backend, as `<host>/<owner>/<repo>` (e.g.

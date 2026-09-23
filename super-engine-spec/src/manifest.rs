@@ -72,7 +72,7 @@ pub struct Manifest<P: Product> {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(rename = "BackendMeta"))]
 pub struct BackendMeta<C> {
-    /// Globally unique reverse-DNS identifier, e.g. `com.example.whisper`.
+    /// Globally unique reverse-DNS identifier, e.g. `com.example.backend`.
     /// Names the directory this backend installs into. Optional on disk so a
     /// backend installed before the field existed keeps loading; required for
     /// registry listing, which the indexer enforces.
@@ -391,7 +391,8 @@ impl fmt::Display for Accel {
 }
 
 /// One `[[secrets]]` declaration — an encrypted credential the backend reads
-/// as a request header (`x-stt-secret-<name>` for Super STT).
+/// as the product's secret request header (`x-stt-secret-<name>` for Super
+/// STT, `x-tts-secret-<name>` for Super TTS).
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Secret {
@@ -411,7 +412,8 @@ pub struct Secret {
 }
 
 /// One `[[options]]` declaration — non-secret configuration the backend reads
-/// as a request header (`x-stt-option-<name>` for Super STT).
+/// as the product's option request header (`x-stt-option-<name>` for Super
+/// STT, `x-tts-option-<name>` for Super TTS).
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Opt {
@@ -544,9 +546,8 @@ impl Opt {
     /// option with no `choices` accepts any text at all.
     ///
     /// Two failures, both about delivery rather than meaning. An option value
-    /// becomes a request header (`x-stt-option-*` for Super STT), and a header
-    /// value can hold
-    /// neither a control character nor an unbounded number of bytes. A value
+    /// becomes a request header, and a header value can hold neither a
+    /// control character nor an unbounded number of bytes. A value
     /// that fails either one is worse stored than refused: the write reports
     /// success, and then every request the backend makes dies inside the
     /// transport, naming nothing the user set.
@@ -842,10 +843,10 @@ impl<'de> Deserialize<'de> for Device {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileSpec {
     /// Full download URL for this file, e.g.
-    /// `https://huggingface.co/openai/whisper-tiny/resolve/main/config.json`.
+    /// `https://huggingface.co/example/model/resolve/main/config.json`.
     pub url: String,
     /// Relative file path (including filename) under the backend directory to
-    /// write the download to, e.g. `models/whisper-tiny/config.json`.
+    /// write the download to, e.g. `models/model/config.json`.
     /// Validated as a safe relative path so it cannot escape the backend dir.
     ///
     /// Also the variant key: every entry writing to one `destination` is a
@@ -2058,7 +2059,7 @@ mod tests {
         assert!(m.options[2].accepts("https://gateway.example.com/v1"));
     }
 
-    /// An option value becomes an `x-stt-option-*` request header, and a header
+    /// An option value becomes a request header, and a header
     /// holds neither a control character nor an unbounded number of bytes.
     /// Refusing the write is the only way the user learns: a stored value that
     /// cannot be delivered reports success and then fails every request the
