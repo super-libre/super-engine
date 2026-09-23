@@ -23,6 +23,17 @@ pub enum HttpError {
         /// [`auth.md`]: ../../../docs/protocol/auth.md
         reason: String,
     },
+    /// The token is valid, but the daemon did not grant it a scope the
+    /// route requires. Mirrors the 403 `{ "message": "scope_denied" }`
+    /// response body.
+    ///
+    /// Distinct from [`Self::InvalidSession`] because the token is fine and
+    /// distinct from [`Self::AuthDenied`] because nobody was asked anything:
+    /// this is a token minted for a narrower scope set than the caller now
+    /// needs, which is what happens when a client grows a feature and its
+    /// users still hold a token from the version before. Callers should drop
+    /// the cached token and re-obtain with the scopes they need.
+    ScopeDenied,
     /// Anything else: daemon unreachable, malformed body, transport
     /// error, daemon-returned `{"status":"error",…}` body without a
     /// recognized identifier, etc.
@@ -36,6 +47,14 @@ impl HttpError {
     #[must_use]
     pub const fn is_invalid_session(&self) -> bool {
         matches!(self, Self::InvalidSession { .. })
+    }
+
+    /// True if the error means "your token is good but does not carry this
+    /// permission" — the other condition that a re-`obtain` can fix, because
+    /// the new token is requested with the scopes the caller actually needs.
+    #[must_use]
+    pub const fn is_scope_denied(&self) -> bool {
+        matches!(self, Self::ScopeDenied)
     }
 
     /// The human half, for text put in front of a person.
@@ -61,7 +80,7 @@ impl HttpError {
                 "The session with the {} service expired. Reconnecting.",
                 product.display_name
             ),
-            Self::AuthDenied { .. } => format!(
+            Self::AuthDenied { .. } | Self::ScopeDenied => format!(
                 "{} did not grant this app permission for that.",
                 product.display_name
             ),
@@ -175,6 +194,9 @@ impl std::fmt::Display for HttpError {
         match self {
             Self::InvalidSession { reason } => write!(f, "invalid_session ({reason})"),
             Self::AuthDenied { reason } => write!(f, "auth_denied ({reason})"),
+            // The wording the untyped path produced, kept so UI toasts and
+            // the strings tests match on do not move with the typing.
+            Self::ScopeDenied => f.write_str("scope_denied (HTTP 403)"),
             Self::Other(s) => f.write_str(s),
         }
     }

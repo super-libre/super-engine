@@ -114,7 +114,22 @@ pub fn error_for_status(status: hyper::StatusCode, body: &[u8]) -> HttpError {
             reason: parse_invalid_session_reason(body),
         };
     }
+    // A 403 is only a scope refusal when the daemon says so. Every other 403
+    // — the registry's, or anything a future route adds — stays an
+    // operational failure, because re-authenticating would not fix it and the
+    // consent popup it would raise is worse than the error it replaces.
+    if status == hyper::StatusCode::FORBIDDEN && names_scope_denied(body) {
+        return HttpError::ScopeDenied;
+    }
     daemon_error(status, body)
+}
+
+/// Whether a 403 body is the daemon's `scope_denied` envelope.
+fn names_scope_denied(body: &[u8]) -> bool {
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    ["error_code", "error", "message"]
+        .iter()
+        .any(|key| parsed.get(key).and_then(serde_json::Value::as_str) == Some("scope_denied"))
 }
 
 /// Build an [`HttpError`] from a non-success, non-401 response body.
@@ -214,7 +229,18 @@ pub(crate) async fn open(
         .map_err(|e| HttpError::Other(format!("HTTP handshake failed: {e}")))?;
     let conn_task = tokio::spawn(async move {
         if let Err(e) = conn.await {
-            log::debug!("http connection ended: {e}");
+            // Hyper's own `Display` is a category — an I/O failure prints as
+            // the bare "connection error" — and the thing worth reading is
+            // always the source under it. Walk the chain, or this line says
+            // nothing at all on the one day somebody reads it.
+            use std::fmt::Write as _;
+            let mut detail = e.to_string();
+            let mut source = std::error::Error::source(&e);
+            while let Some(cause) = source {
+                let _ = write!(detail, ": {cause}");
+                source = cause.source();
+            }
+            log::debug!("http connection ended: {detail}");
         }
     });
     // On success `conn_task` keeps driving the connection so the body
@@ -347,8 +373,48 @@ pub async fn delete_json<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use super::daemon_error;
+    use super::{daemon_error, error_for_status};
+    use crate::http_client::HttpError;
     use hyper::StatusCode;
+
+    /// A `scope_denied` 403 is typed, because it is the one 403 a caller can
+    /// act on: drop the token and ask for the scopes it actually needs. Left
+    /// untyped it is an `Other` string that no retry path matches, and a
+    /// client holding a token minted before it grew a scope is stuck for good.
+    #[test]
+    fn a_scope_refusal_is_typed_so_a_caller_can_re_authenticate() {
+        let body = br#"{"status":"error","message":"scope_denied"}"#;
+        assert!(error_for_status(StatusCode::FORBIDDEN, body).is_scope_denied());
+        // The wording the untyped path produced is preserved.
+        assert_eq!(
+            error_for_status(StatusCode::FORBIDDEN, body).to_string(),
+            "scope_denied (HTTP 403)"
+        );
+    }
+
+    /// Every other 403 stays operational. Re-authenticating would not fix one,
+    /// and the consent popup a retry raises is worse than the error it hides.
+    #[test]
+    fn other_forbidden_responses_are_not_treated_as_scope_refusals() {
+        for body in [
+            br#"{"status":"error","error_code":"backend_forbidden"}"#.as_slice(),
+            br#"{"status":"error","message":"not your voice"}"#.as_slice(),
+            b"".as_slice(),
+        ] {
+            let e = error_for_status(StatusCode::FORBIDDEN, body);
+            assert!(!e.is_scope_denied(), "{e} should stay operational");
+            assert!(matches!(e, HttpError::Other(_)));
+        }
+    }
+
+    /// A 401 keeps its own variant: the token is bad rather than narrow.
+    #[test]
+    fn an_unauthorized_response_is_still_an_invalid_session() {
+        let body = br#"{"status":"error","message":"invalid_session","data":{"reason":"expired"}}"#;
+        let e = error_for_status(StatusCode::UNAUTHORIZED, body);
+        assert!(e.is_invalid_session());
+        assert!(!e.is_scope_denied());
+    }
 
     /// A non-2xx body must never reach the `T` deserializer. The daemon's
     /// error envelopes don't share a shape with the endpoint's success type,

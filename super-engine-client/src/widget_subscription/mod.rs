@@ -180,7 +180,8 @@ async fn acquire_token(socket: &Path, config: &WidgetSubscriptionConfig) -> Toke
         }
         Err(
             e @ (http_client::HttpError::AuthDenied { .. }
-            | http_client::HttpError::InvalidSession { .. }),
+            | http_client::HttpError::InvalidSession { .. }
+            | http_client::HttpError::ScopeDenied),
         ) => TokenOutcome::Reauth(e.to_string()),
         Err(e @ http_client::HttpError::Other(_)) => TokenOutcome::Disconnected(e.to_string()),
     }
@@ -199,7 +200,11 @@ enum OpenOutcome {
 async fn open_stream(socket: &Path, token: &str, config: &WidgetSubscriptionConfig) -> OpenOutcome {
     match http_client::events_stream(socket.to_path_buf(), token, config.topics).await {
         Ok(s) => OpenOutcome::Ready(Box::pin(s)),
-        Err(e) if e.is_invalid_session() => {
+        // `scope_denied` joins `invalid_session` here: the daemon refuses the
+        // whole stream when the token lacks a topic's scope, and a token that
+        // predates a topic the widget has since started subscribing to is the
+        // same dead end a re-auth fixes.
+        Err(e) if e.is_invalid_session() || e.is_scope_denied() => {
             let _ = session::forget(config.app_id);
             OpenOutcome::Reauth(e.to_string())
         }
