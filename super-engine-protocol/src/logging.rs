@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! One `env_logger` initializer for every Super STT binary.
+//! One `env_logger` initializer for every daemon and client binary.
 //!
 //! Replaces five near-identical setups (and one that silently defaulted to
 //! `error`, plus a CLI with none at all). `RUST_LOG` always wins; otherwise the

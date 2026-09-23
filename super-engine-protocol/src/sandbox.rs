@@ -30,9 +30,8 @@ pub fn app_id_from_info(contents: &str) -> Option<String> {
 
 /// This process's own flatpak application id, or `None` outside a sandbox.
 ///
-/// Read from `/.flatpak-info` rather than `FLATPAK_ID` for the same reason
-/// [`in_flatpak`] is: the file is written by flatpak, the variable is just an
-/// environment variable.
+/// Read from `/.flatpak-info` rather than `FLATPAK_ID`: the file is written
+/// by flatpak, the variable is just an environment variable.
 #[must_use]
 pub fn own_app_id() -> Option<String> {
     let contents = std::fs::read_to_string("/.flatpak-info").ok()?;

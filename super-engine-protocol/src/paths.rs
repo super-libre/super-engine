@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! One home for the Super STT base directories.
+//! One home for a product's base directories.
 //!
 //! Replaces the byte-identical daemon↔applet `get_config_path` cores and the
-//! scattered `dirs`-miss fallbacks. Each helper returns the `super-stt`
-//! subdirectory of its base, applying the same fallback the call sites used
+//! scattered `dirs`-miss fallbacks. Each helper returns the product's
+//! subdirectory of its base (`super-stt` for Super STT), applying the same fallback the call sites used
 //! (so behavior is unchanged) — callers append their own filename. The
 //! validated runtime-socket path lives separately in
 //! [`crate::runtime`] (`get_http_socket_path` etc.).
@@ -14,6 +14,8 @@
 //! matters beyond Linux.
 
 use std::path::PathBuf;
+
+use crate::product::ProductSpec;
 
 /// An explicitly set XDG base-directory variable, when it names an absolute
 /// path.
@@ -41,39 +43,38 @@ fn xdg_override(var: &str) -> Option<PathBuf> {
     (path.is_absolute()).then_some(path)
 }
 
-/// `$XDG_CONFIG_HOME/super-stt` (fallback: the platform's config directory —
+/// `$XDG_CONFIG_HOME/<slug>` (fallback: the platform's config directory —
 /// `$HOME/.config` on Linux, `~/Library/Application Support` on macOS — else
-/// `/tmp/.config/super-stt`). Daemon: append `daemon.toml`; applet: append
+/// `/tmp/.config/<slug>`). Daemon: append `daemon.toml`; applet: append
 /// `applet-<variant>.toml`.
 #[must_use]
-pub fn config_dir() -> PathBuf {
+pub fn config_dir(product: &ProductSpec) -> PathBuf {
     xdg_override("XDG_CONFIG_HOME")
         .or_else(dirs::config_dir)
         .unwrap_or_else(|| home_join(".config"))
-        .join("super-stt")
+        .join(product.slug)
 }
 
-/// `$XDG_DATA_HOME/super-stt` (fallback: the platform's data directory —
+/// `$XDG_DATA_HOME/<slug>` (fallback: the platform's data directory —
 /// `$HOME/.local/share` on Linux, `~/Library/Application Support` on macOS —
-/// else `/tmp/.local/share/super-stt`). Used for installed backends.
+/// else `/tmp/.local/share/<slug>`). Used for installed backends.
 #[must_use]
-pub fn data_dir() -> PathBuf {
+pub fn data_dir(product: &ProductSpec) -> PathBuf {
     xdg_override("XDG_DATA_HOME")
         .or_else(dirs::data_dir)
         .unwrap_or_else(|| home_join(".local/share"))
-        .join("super-stt")
+        .join(product.slug)
 }
 
-/// `$XDG_CACHE_HOME/super-stt` (fallback: the platform's cache directory —
+/// `$XDG_CACHE_HOME/<slug>` (fallback: the platform's cache directory —
 /// `$HOME/.cache` on Linux, `~/Library/Caches` on macOS — else
-/// `$TMPDIR/super-stt`). Used for the registry index cache and staged
-/// installs.
+/// `$TMPDIR/<slug>`). Used for the registry index cache and staged installs.
 #[must_use]
-pub fn cache_dir() -> PathBuf {
+pub fn cache_dir(product: &ProductSpec) -> PathBuf {
     xdg_override("XDG_CACHE_HOME")
         .or_else(dirs::cache_dir)
         .unwrap_or_else(std::env::temp_dir)
-        .join("super-stt")
+        .join(product.slug)
 }
 
 /// `$HOME/<suffix>`, falling back to `/tmp/<suffix>` when `HOME` is unset —
@@ -86,6 +87,7 @@ fn home_join(suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{cache_dir, config_dir, data_dir};
+    use crate::product::{ProductSpec, SUPER_STT, SUPER_TTS};
 
     /// Every base has to be redirectable by its XDG variable, on every
     /// platform, and has to land somewhere absolute under the user's own tree
@@ -105,7 +107,10 @@ mod tests {
     fn every_base_dir_honors_its_xdg_override() {
         let root = std::env::temp_dir().join("super-stt-paths-test");
         for (var, dir) in [
-            ("XDG_CONFIG_HOME", config_dir as fn() -> std::path::PathBuf),
+            (
+                "XDG_CONFIG_HOME",
+                config_dir as fn(&ProductSpec) -> std::path::PathBuf,
+            ),
             ("XDG_DATA_HOME", data_dir),
             ("XDG_CACHE_HOME", cache_dir),
         ] {
@@ -113,9 +118,14 @@ mod tests {
                 std::env::set_var(var, &root);
             }
             assert_eq!(
-                dir(),
+                dir(&SUPER_STT),
                 root.join("super-stt"),
                 "{var} did not redirect its base directory"
+            );
+            assert_eq!(
+                dir(&SUPER_TTS),
+                root.join("super-tts"),
+                "{var} put both products in one directory"
             );
 
             // A relative value is refused rather than resolved against the
@@ -124,7 +134,7 @@ mod tests {
                 std::env::set_var(var, "relative/path");
             }
             assert_ne!(
-                dir(),
+                dir(&SUPER_STT),
                 std::path::PathBuf::from("relative/path").join("super-stt"),
                 "{var} accepted a relative path"
             );
@@ -134,7 +144,7 @@ mod tests {
             unsafe {
                 std::env::remove_var(var);
             }
-            let default = dir();
+            let default = dir(&SUPER_STT);
             assert!(
                 default.is_absolute(),
                 "{var} unset: {} is not absolute",

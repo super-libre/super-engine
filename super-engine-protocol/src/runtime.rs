@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Secure path helpers: socket-path construction under the per-user runtime
-//! directory — `$XDG_RUNTIME_DIR/stt/` on Linux, the Darwin per-user temp
-//! directory's `stt/` on macOS.
+//! directory — `$XDG_RUNTIME_DIR/<short name>/` on Linux (`stt/` for Super
+//! STT), the Darwin per-user temp directory's `<short name>/` on macOS.
+
+use crate::product::ProductSpec;
 
 /// The longest path a pathname Unix socket may occupy, terminator included:
 /// the size of `sockaddr_un::sun_path`. Linux gives 108 bytes, macOS 104.
@@ -106,10 +108,11 @@ fn darwin_user_temp_dir() -> Option<String> {
     Some(dir.trim_end_matches('/').to_string())
 }
 
-/// Build a validated runtime path `<runtime dir>/stt/<relative>` with
+/// Build a validated runtime path `<runtime dir>/<short name>/<relative>` with
 /// path-traversal / prefix / length checks on the runtime dir and a
-/// `/tmp/stt/<relative>` fallback. `relative` is a caller-controlled subpath
-/// (a bare filename, or e.g. `backends/<name>.sock`) joined after `stt/`.
+/// `/tmp/<short name>/<relative>` fallback. `relative` is a caller-controlled
+/// subpath (a bare filename, or e.g. `backends/<name>.sock`) joined after the
+/// product's directory.
 ///
 /// The runtime dir is `$XDG_RUNTIME_DIR` on Linux and the Darwin per-user
 /// temp directory on macOS — see [`runtime_dir_hint`].
@@ -117,8 +120,8 @@ fn darwin_user_temp_dir() -> Option<String> {
 /// Shared entry point for every runtime socket so callers can't bypass the
 /// SSRF/traversal guards with a hand-rolled runtime-dir join.
 #[must_use]
-pub fn secure_runtime_path(relative: &str) -> std::path::PathBuf {
-    let fallback = || std::path::PathBuf::from(format!("/tmp/stt/{relative}"));
+pub fn secure_runtime_path(product: &ProductSpec, relative: &str) -> std::path::PathBuf {
+    let fallback = || std::path::PathBuf::from(format!("/tmp/{}/{relative}", product.short_name));
     let runtime_dir = runtime_dir_hint();
 
     if runtime_dir.is_empty() || runtime_dir.len() > 256 {
@@ -135,7 +138,7 @@ pub fn secure_runtime_path(relative: &str) -> std::path::PathBuf {
     }
 
     let path = std::path::PathBuf::from(runtime_dir)
-        .join("stt")
+        .join(product.short_name)
         .join(relative);
     if let Ok(canonical) = path.canonicalize() {
         if !is_allowed(&canonical.to_string_lossy()) {
@@ -155,28 +158,31 @@ fn is_allowed(path: &str) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-/// Get the path of the HTTP-protocol Unix socket (`super-stt-http.sock`) — the
-/// daemon's sole client-facing listener, which all clients connect to.
+/// Get the path of the product's HTTP-protocol Unix socket
+/// (`super-stt-http.sock` for Super STT) — the daemon's sole client-facing
+/// listener, which all clients connect to.
 ///
-/// A non-empty `SUPER_STT_HTTP_SOCKET` overrides the path verbatim (tests use
-/// this to bind a unique socket per run without touching the runtime dir).
-/// Both the daemon and every client resolve their path through here, so the
-/// override applies uniformly — set it and both ends agree. When unset, the
-/// path is `<runtime dir>/stt/super-stt-http.sock` via [`secure_runtime_path`],
-/// which applies the traversal / prefix / length guards.
+/// A non-empty `<PREFIX>_HTTP_SOCKET` (`SUPER_STT_HTTP_SOCKET`) overrides the
+/// path verbatim (tests use this to bind a unique socket per run without
+/// touching the runtime dir). Both the daemon and every client resolve their
+/// path through here, so the override applies uniformly — set it and both ends
+/// agree. When unset, the path is `<runtime dir>/stt/super-stt-http.sock` via
+/// [`secure_runtime_path`], which applies the traversal / prefix / length
+/// guards.
 #[must_use]
-pub fn get_http_socket_path() -> std::path::PathBuf {
-    if let Some(override_path) = std::env::var_os("SUPER_STT_HTTP_SOCKET")
+pub fn get_http_socket_path(product: &ProductSpec) -> std::path::PathBuf {
+    if let Some(override_path) = std::env::var_os(product.env("HTTP_SOCKET"))
         && !override_path.is_empty()
     {
         return std::path::PathBuf::from(override_path);
     }
-    secure_runtime_path("super-stt-http.sock")
+    secure_runtime_path(product, &product.socket_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::product::{SUPER_STT, SUPER_TTS};
 
     /// A runtime dir this platform accepts, used as the "honored" case below.
     #[cfg(target_os = "linux")]
@@ -190,7 +196,7 @@ mod tests {
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", GOOD_RUNTIME_DIR);
         }
-        let path = secure_runtime_path("super-stt-http.sock");
+        let path = secure_runtime_path(&SUPER_STT, "super-stt-http.sock");
         assert!(path.to_string_lossy().contains("super-stt-http.sock"));
 
         // Path traversal falls back to /tmp/stt/.
@@ -198,7 +204,7 @@ mod tests {
             std::env::set_var("XDG_RUNTIME_DIR", "../../../etc");
         }
         assert_eq!(
-            secure_runtime_path("super-stt-http.sock"),
+            secure_runtime_path(&SUPER_STT, "super-stt-http.sock"),
             std::path::PathBuf::from("/tmp/stt/super-stt-http.sock")
         );
 
@@ -207,7 +213,7 @@ mod tests {
             std::env::set_var("XDG_RUNTIME_DIR", "/etc/passwd");
         }
         assert_eq!(
-            secure_runtime_path("super-stt-http.sock"),
+            secure_runtime_path(&SUPER_STT, "super-stt-http.sock"),
             std::path::PathBuf::from("/tmp/stt/super-stt-http.sock")
         );
 
@@ -217,7 +223,7 @@ mod tests {
             std::env::set_var("XDG_RUNTIME_DIR", &long_path);
         }
         assert_eq!(
-            secure_runtime_path("super-stt-http.sock"),
+            secure_runtime_path(&SUPER_STT, "super-stt-http.sock"),
             std::path::PathBuf::from("/tmp/stt/super-stt-http.sock")
         );
 
@@ -234,7 +240,7 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
-        let path = secure_runtime_path("super-stt-http.sock");
+        let path = secure_runtime_path(&SUPER_STT, "super-stt-http.sock");
         let rendered = path.to_string_lossy().into_owned();
         assert!(
             is_allowed(&rendered),
@@ -273,7 +279,7 @@ mod tests {
             std::env::set_var("SUPER_STT_HTTP_SOCKET", "/tmp/stt/custom-run.sock");
         }
         assert_eq!(
-            get_http_socket_path(),
+            get_http_socket_path(&SUPER_STT),
             std::path::PathBuf::from("/tmp/stt/custom-run.sock")
         );
 
@@ -282,7 +288,7 @@ mod tests {
             std::env::set_var("SUPER_STT_HTTP_SOCKET", "");
         }
         assert!(
-            get_http_socket_path()
+            get_http_socket_path(&SUPER_STT)
                 .to_string_lossy()
                 .ends_with("super-stt-http.sock")
         );
@@ -290,5 +296,23 @@ mod tests {
         unsafe {
             std::env::remove_var("SUPER_STT_HTTP_SOCKET");
         }
+    }
+
+    /// Two daemons can run at once, so each product's socket lives in its own
+    /// runtime directory under its own name.
+    #[test]
+    fn each_product_has_its_own_socket() {
+        let stt = secure_runtime_path(&SUPER_STT, &SUPER_STT.socket_file());
+        let tts = secure_runtime_path(&SUPER_TTS, &SUPER_TTS.socket_file());
+        assert!(
+            stt.ends_with("stt/super-stt-http.sock"),
+            "{}",
+            stt.display()
+        );
+        assert!(
+            tts.ends_with("tts/super-tts-http.sock"),
+            "{}",
+            tts.display()
+        );
     }
 }

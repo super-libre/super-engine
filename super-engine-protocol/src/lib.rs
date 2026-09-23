@@ -7,9 +7,11 @@ pub mod audio;
 pub mod logging;
 pub mod models;
 pub mod paths;
+pub mod product;
 pub mod runtime;
 pub mod sandbox;
 pub mod scopes;
 pub mod serde_helpers;
 
 pub use audio::FrequencyData;
+pub use product::{ProductSpec, SUPER_STT, SUPER_TTS};
