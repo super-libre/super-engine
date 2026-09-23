@@ -7,7 +7,8 @@
 //! ([`installed`]). Resolving a custom repo or a staged local directory into an
 //! index entry ([`custom_repo`], [`local_dir`]) and deciding which of a
 //! backend's files survive an update ([`carry_over`]) are here too, as is the
-//! install pipeline itself ([`install`]).
+//! install pipeline itself ([`install`]) and the cleanup of duplicate
+//! directories it can leave behind ([`reconcile`]).
 
 pub mod carry_over;
 pub mod client;
@@ -18,6 +19,7 @@ pub mod index;
 pub mod install;
 pub mod installed;
 pub mod local_dir;
+pub mod reconcile;
 
 use super_engine_protocol::ProductSpec;
 use super_engine_spec::index::IndexBackend;
