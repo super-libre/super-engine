@@ -1,6 +1,7 @@
 [workspace]
   resolver = "2"
   members  = [
+    "super-engine-client",
     "super-engine-forge",
     "super-engine-protocol",
     "super-engine-spec",
@@ -16,6 +17,21 @@
   [workspace.dependencies]
     dirs         = "6.0.0"
     env_logger   = "0.11.8"
+    futures-util = "0.3.31"
+    # Both native backends are named because the clients build for both
+    # platforms. Neither costs the other anything: keyring puts
+    # `dbus-secret-service` behind `cfg(target_os = "linux")` and
+    # `security-framework` behind `cfg(target_os = "macos")`, so each feature
+    # pulls a dependency only on the target that uses it. Without
+    # `apple-native` keyring falls back to its *mock* store on macOS, which
+    # would silently drop every session token at exit.
+    keyring      = {
+      version  = "3",
+      features = [
+        "apple-native",
+        "sync-secret-service",
+      ]
+    }
     libc         = "0.2"
     log        = "0.4.29"
     reqwest    = {

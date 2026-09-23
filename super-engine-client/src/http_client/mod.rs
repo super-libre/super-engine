@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//! HTTP client for the daemon protocol.
+//!
+//! The transport is HTTP/1.1 over a Unix domain socket
+//! (`super_engine_protocol::runtime::get_http_socket_path`). Each request
+//! opens a fresh `tokio::net::UnixStream`, runs `hyper::client::conn::http1`
+//! over it, and parses the JSON response into the type the caller names.
+//!
+//! Authentication is per-request: callers pass a session token (obtained
+//! from [`crate::session::obtain`]) and this module attaches it
+//! as `Authorization: Bearer <token>` on every call except
+//! [`auth_request`]. On 401 the daemon's `data.reason` is surfaced so the
+//! caller can `session::forget` + re-`obtain`.
+
+mod internal;
+mod v1;
+
+pub use internal::error::{HttpError, HttpResult};
+
+pub use v1::auth::request::{AuthOk, auth_request};
+pub use v1::auth::status::{AuthStatusInfo, auth_status};
+pub use v1::events::{WidgetEvent, events_stream};
+pub use v1::health::{ping, status};
+
+/// Public transport surface for downstream clients that compose their own
+/// per-scope endpoint wrappers (e.g. the settings app, and each product's own
+/// endpoints). Returns [`HttpError`] on transport/auth failure; `401` becomes
+/// [`HttpError::InvalidSession`].
+pub mod transport {
+    pub use super::internal::transport::{delete_json, get_json, post_json, post_json_no_timeout};
+
+    /// The single non-2xx-to-[`HttpError`] mapping, exported so the daemon's
+    /// envelope-contract test can assert that every error shape it emits is
+    /// one this client can actually read.
+    pub use super::internal::transport::{daemon_error, error_for_status};
+}

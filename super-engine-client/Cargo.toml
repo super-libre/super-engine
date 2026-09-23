@@ -1,0 +1,36 @@
+[package]
+    name = "super-engine-client"
+    version.workspace = true
+    authors.workspace = true
+    edition.workspace = true
+    description = "A client of a Super STT or Super TTS daemon"
+    license.workspace = true
+    repository.workspace = true
+
+[dependencies]
+    async-stream = "0.3.6"
+    futures-util.workspace = true
+    http-body-util = "0.1"
+    hyper = { version = "1", features = ["client", "http1"] }
+    hyper-util = {
+        version = "0.1",
+        features = ["client", "client-legacy", "http1", "tokio"]
+    }
+    keyring.workspace = true
+    log.workspace = true
+    serde.workspace = true
+    serde_json.workspace = true
+    super-engine-protocol = { path = "../super-engine-protocol" }
+    thiserror.workspace = true
+    tokio = {
+        workspace = true,
+        features = [
+            "macros",
+            "net",
+            "rt-multi-thread",
+            "time",
+        ]
+    }
+
+[lints]
+    workspace = true
