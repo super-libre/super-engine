@@ -4,19 +4,19 @@
 //! Two shapes cover all use: [`short_client`] for small metadata/index fetches
 //! (a tight overall timeout), and [`download_client`] for large streaming asset
 //! downloads (no short overall cap, but a connect timeout that still fails fast
-//! on an unreachable host). Both carry the workspace user-agent. Replaces five
+//! on an unreachable host). Both carry the caller's user-agent. Replaces five
 //! ad-hoc builders that variously used `expect`/`unwrap`/`unwrap_or_default`, no
 //! user-agent, and — in the indexer — no timeout at all.
+//!
+//! The user-agent is the product's, version-stamped (`super-stt/0.2.4`), and
+//! is sent on every request so forge/CDN logs and rate-limiters can attribute
+//! traffic to the product and release that made it.
 //!
 //! The rustls crypto provider must be installed by the binary before the first
 //! request (these builders don't touch it); building the client itself never
 //! makes a request.
 
 use std::time::Duration;
-
-/// Workspace user-agent, version-stamped. Sent on every request so forge/CDN
-/// logs and rate-limiters can attribute traffic.
-pub const USER_AGENT: &str = concat!("super-stt/", env!("CARGO_PKG_VERSION"));
 
 /// Install the `ring` rustls crypto provider — the workspace uses
 /// `reqwest`/`rustls` with no bundled provider, so every binary must install one
@@ -33,9 +33,9 @@ pub fn install_crypto_provider() {
 /// Panics only if `reqwest` cannot build a client with these default settings
 /// (not expected on any supported platform).
 #[must_use]
-pub fn short_client() -> reqwest::Client {
+pub fn short_client(user_agent: &str) -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(user_agent)
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
@@ -51,9 +51,9 @@ pub fn short_client() -> reqwest::Client {
 /// Panics only if `reqwest` cannot build a client with these default settings
 /// (not expected on any supported platform).
 #[must_use]
-pub fn download_client() -> reqwest::Client {
+pub fn download_client(user_agent: &str) -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(user_agent)
         .timeout(Duration::from_hours(1))
         .connect_timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(10))

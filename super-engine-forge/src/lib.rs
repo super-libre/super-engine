@@ -151,12 +151,13 @@ pub trait ForgeClient: Send + Sync {
     async fn download(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, ForgeError>;
 }
 
-/// Build the client for a forge. The match is exhaustive with no catch-all
-/// arm, so adding a `Forge` variant fails to compile until its adapter exists.
+/// Build the client for a forge, sending `user_agent` (see [`http`]). The
+/// match is exhaustive with no catch-all arm, so adding a `Forge` variant fails
+/// to compile until its adapter exists.
 #[must_use]
-pub fn client(forge: Forge) -> Box<dyn ForgeClient> {
+pub fn client(forge: Forge, user_agent: &str) -> Box<dyn ForgeClient> {
     match forge {
-        Forge::Github => Box::new(Github::from_env()),
+        Forge::Github => Box::new(Github::from_env(user_agent)),
     }
 }
 
@@ -180,7 +181,7 @@ pub fn forge_for_host(host: &str) -> Option<Forge> {
 /// Whether an operator-provided API base URL may be used: `https://`, or a
 /// loopback `http://` for local testing. Anything else is rejected so adapters
 /// fall back to their secure default. Shared with the daemon's registry client
-/// (`SUPER_STT_REGISTRY_URL` / `GITHUB_API_BASE` gating).
+/// (the registry URL override and `GITHUB_API_BASE` gating).
 #[must_use]
 pub fn accept_base_url(url: &str) -> bool {
     if let Some(rest) = url.strip_prefix("https://") {
@@ -276,6 +277,6 @@ mod dispatch_tests {
     #[test]
     fn dispatches_github() {
         crate::install_crypto_provider();
-        let _c = client(Forge::Github);
+        let _c = client(Forge::Github, "super-engine-test/0");
     }
 }

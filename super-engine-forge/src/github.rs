@@ -68,16 +68,17 @@ impl From<GhAsset> for ReleaseAsset {
 }
 
 impl Github {
-    /// Construct a client for `base` with an optional bearer `token`.
+    /// Construct a client for `base` with an optional bearer `token`, sending
+    /// `user_agent` (see [`crate::http`]).
     ///
     /// # Panics
     /// If the underlying reqwest client cannot be built (e.g. a TLS backend
     /// initialization failure) — not expected in practice.
     #[must_use]
-    pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
+    pub fn new(base: impl Into<String>, token: Option<String>, user_agent: &str) -> Self {
         Self {
             base: base.into(),
-            http: crate::http::short_client(),
+            http: crate::http::short_client(user_agent),
             token,
         }
     }
@@ -85,7 +86,7 @@ impl Github {
     /// Build from the environment: `GITHUB_API_BASE` (validated `https`/loopback,
     /// else the secure default) and an optional `GITHUB_TOKEN`.
     #[must_use]
-    pub fn from_env() -> Self {
+    pub fn from_env(user_agent: &str) -> Self {
         let base = match std::env::var("GITHUB_API_BASE") {
             Ok(v) if crate::accept_base_url(&v) => v,
             Ok(v) => {
@@ -94,11 +95,11 @@ impl Github {
             }
             Err(_) => DEFAULT_BASE.into(),
         };
-        Self::new(base, std::env::var("GITHUB_TOKEN").ok())
+        Self::new(base, std::env::var("GITHUB_TOKEN").ok(), user_agent)
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        // User-Agent is set at the client level (the workspace UA); GitHub only
+        // User-Agent is set at the client level (the caller's); GitHub only
         // requires it to be present and non-empty.
         let mut b = self
             .http
@@ -165,6 +166,8 @@ mod tests {
     use super::Github;
     use crate::{ForgeClient, ReleaseKind, RepoRef};
 
+    const TEST_USER_AGENT: &str = "super-engine-test/0";
+
     #[tokio::test]
     async fn latest_release_maps_github_json_to_neutral_release() {
         crate::install_crypto_provider();
@@ -176,7 +179,7 @@ mod tests {
             )
             .create_async()
             .await;
-        let gh = Github::new(s.url(), None);
+        let gh = Github::new(s.url(), None, TEST_USER_AGENT);
         let repo = RepoRef::parse("github.com/x/y").unwrap();
         let r = gh.latest_release(&repo).await.unwrap();
         assert_eq!(r.tag, "v1.2.3");
@@ -200,7 +203,7 @@ mod tests {
             .with_body(body)
             .create_async()
             .await;
-        let gh = Github::new(s.url(), None);
+        let gh = Github::new(s.url(), None, TEST_USER_AGENT);
         let repo = RepoRef::parse("github.com/x/y").unwrap();
         gh.latest_release(&repo).await.unwrap().kind
     }
@@ -234,7 +237,7 @@ mod tests {
             .with_body(r#"[{"tag_name":"v1.1.0"},{"tag_name":"v1.0.0"}]"#)
             .create_async()
             .await;
-        let gh = Github::new(s.url(), None);
+        let gh = Github::new(s.url(), None, TEST_USER_AGENT);
         let repo = RepoRef::parse("github.com/x/y").unwrap();
         let rels = gh.list_releases(&repo).await.unwrap();
         assert_eq!(rels.len(), 2);
@@ -252,7 +255,7 @@ mod tests {
             .with_body("hello")
             .create_async()
             .await;
-        let gh = Github::new(s.url(), None);
+        let gh = Github::new(s.url(), None, TEST_USER_AGENT);
         let bytes = gh
             .download(&format!("{}/asset", s.url()), 1024)
             .await
@@ -269,7 +272,7 @@ mod tests {
             .with_body("hello world") // 11 bytes
             .create_async()
             .await;
-        let gh = Github::new(s.url(), None);
+        let gh = Github::new(s.url(), None, TEST_USER_AGENT);
         // Cap below the body size — must abort with TooLarge, not buffer it all.
         let err = gh
             .download(&format!("{}/big", s.url()), 4)
@@ -286,7 +289,7 @@ mod tests {
             .with_status(404)
             .create_async()
             .await;
-        let gh = Github::new(s.url(), None);
+        let gh = Github::new(s.url(), None, TEST_USER_AGENT);
         let repo = RepoRef::parse("github.com/x/y").unwrap();
         let err = gh.latest_release(&repo).await.unwrap_err();
         assert_eq!(err.http_status(), Some(reqwest::StatusCode::NOT_FOUND));
