@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
+use super_engine_protocol::ProductSpec;
+
 /// Errors returned by every HTTP-protocol call. The `Display` impl
 /// reproduces the legacy `String` error wording so existing UI
 /// error-toast plumbing keeps working unchanged.
@@ -49,15 +51,20 @@ impl HttpError {
     ///
     /// A message that carries no such decoration is returned unchanged, so an
     /// error from anywhere else still reads as itself.
+    ///
+    /// `product` is the daemon the error came from, which the two auth
+    /// messages name.
     #[must_use]
-    pub fn user_message(&self) -> String {
+    pub fn user_message(&self, product: &ProductSpec) -> String {
         match self {
-            Self::InvalidSession { .. } => {
-                "The session with the Super STT service expired. Reconnecting.".to_string()
-            }
-            Self::AuthDenied { .. } => {
-                "Super STT did not grant this app permission for that.".to_string()
-            }
+            Self::InvalidSession { .. } => format!(
+                "The session with the {} service expired. Reconnecting.",
+                product.display_name
+            ),
+            Self::AuthDenied { .. } => format!(
+                "{} did not grant this app permission for that.",
+                product.display_name
+            ),
             Self::Other(s) => strip_log_decoration(s),
         }
     }
@@ -97,6 +104,23 @@ fn strip_log_decoration(s: &str) -> String {
 #[cfg(test)]
 mod user_message_tests {
     use super::HttpError;
+    use super_engine_protocol::{SUPER_STT, SUPER_TTS};
+
+    /// The auth messages name the daemon the error came from.
+    #[test]
+    fn the_auth_messages_name_the_product() {
+        let denied = HttpError::AuthDenied {
+            reason: "user_denied".into(),
+        };
+        assert_eq!(
+            denied.user_message(&SUPER_STT),
+            "Super STT did not grant this app permission for that."
+        );
+        assert_eq!(
+            denied.user_message(&SUPER_TTS),
+            "Super TTS did not grant this app permission for that."
+        );
+    }
 
     /// The exact string issue #423's drawer would have shown.
     #[test]
@@ -107,7 +131,7 @@ mod user_message_tests {
                 .to_string(),
         );
         assert_eq!(
-            e.user_message(),
+            e.user_message(&SUPER_STT),
             "no published release at `github.com/o/b`. A fork does not inherit the \
              upstream's releases"
         );
@@ -128,7 +152,7 @@ mod user_message_tests {
             "Not Found",
         ] {
             assert_eq!(
-                HttpError::Other(raw.to_string()).user_message(),
+                HttpError::Other(raw.to_string()).user_message(&SUPER_STT),
                 raw,
                 "{raw}"
             );
@@ -139,7 +163,8 @@ mod user_message_tests {
     fn a_bare_token_with_no_message_is_kept() {
         // Nothing human to fall back on, so the token is better than "".
         assert_eq!(
-            HttpError::Other("registry_unavailable (HTTP 503)".to_string()).user_message(),
+            HttpError::Other("registry_unavailable (HTTP 503)".to_string())
+                .user_message(&SUPER_STT),
             "registry_unavailable"
         );
     }

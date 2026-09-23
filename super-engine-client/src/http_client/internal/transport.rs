@@ -11,6 +11,12 @@ use serde::de::DeserializeOwned;
 /// URL on the wire is `/v1/ping`, `/v1/transcribe`, etc.
 pub(crate) const API_PREFIX: &str = "/v1";
 
+/// The host every request names. HTTP/1.1 requires one, and over a Unix
+/// socket there is no host to name, so this is the one `curl --unix-socket`
+/// sends. The daemon does not read it, which is what lets one client serve
+/// both products without being told which it is talking to.
+pub(crate) const HOST: &str = "localhost";
+
 /// Body type so a GET/DELETE (empty) and a POST (JSON) share one hyper request
 /// type. `http_body_util::Either` supplies the `Body` impl — both arms are
 /// `Bytes` bodies with an `Infallible` error — replacing a hand-rolled `unsafe`
@@ -20,8 +26,8 @@ pub(crate) type RequestBody = http_body_util::Either<Empty<Bytes>, Full<Bytes>>;
 pub(crate) fn build_get(path: &str, token: Option<&str>) -> Result<Request<RequestBody>, String> {
     let mut builder = Request::builder()
         .method(Method::GET)
-        .uri(format!("http://stt.local{API_PREFIX}{path}"))
-        .header("host", "stt.local");
+        .uri(format!("http://{HOST}{API_PREFIX}{path}"))
+        .header("host", HOST);
     if let Some(t) = token {
         builder = builder.header("authorization", format!("Bearer {t}"));
     }
@@ -38,8 +44,8 @@ pub(crate) fn build_post_json(
     let body_bytes = serde_json::to_vec(body).map_err(|e| format!("Failed to encode body: {e}"))?;
     let mut builder = Request::builder()
         .method(Method::POST)
-        .uri(format!("http://stt.local{API_PREFIX}{path}"))
-        .header("host", "stt.local")
+        .uri(format!("http://{HOST}{API_PREFIX}{path}"))
+        .header("host", HOST)
         .header("content-type", "application/json")
         .header("content-length", body_bytes.len().to_string());
     if let Some(t) = token {
@@ -58,8 +64,8 @@ pub(crate) fn build_delete(
 ) -> Result<Request<RequestBody>, String> {
     let mut builder = Request::builder()
         .method(Method::DELETE)
-        .uri(format!("http://stt.local{API_PREFIX}{path}"))
-        .header("host", "stt.local");
+        .uri(format!("http://{HOST}{API_PREFIX}{path}"))
+        .header("host", HOST);
     if let Some(t) = token {
         builder = builder.header("authorization", format!("Bearer {t}"));
     }

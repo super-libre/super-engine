@@ -161,7 +161,7 @@ fn obtain_error_routing_contract() {
 #[test]
 fn config_defaults_are_sane() {
     let cfg = WidgetSubscriptionConfig::new(
-        AppId("test-app"),
+        AppId::new(&super_engine_protocol::SUPER_STT, "test-app"),
         "Test App",
         &["recording_events"],
         &["recording_state"],

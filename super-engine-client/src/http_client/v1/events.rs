@@ -59,10 +59,11 @@ fn build_events_request(
     Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "http://stt.local{}/events?topics={topics_csv}",
+            "http://{}{}/events?topics={topics_csv}",
+            transport::HOST,
             transport::API_PREFIX
         ))
-        .header("host", "stt.local")
+        .header("host", transport::HOST)
         .header("accept", "text/event-stream")
         .header("authorization", format!("Bearer {token}"))
         .body(http_body_util::Either::Left(Empty::new()))
@@ -93,7 +94,7 @@ fn parse_widget_event_stream(
 /// per the SSE spec) is surfaced as a synthetic
 /// `WidgetEvent { name: "keepalive", payload: Null }` so the
 /// subscription helper's idle deadline (in
-/// `super-stt-shared::daemon::widget_subscription`) is reset on every
+/// `crate::widget_subscription`) is reset on every
 /// keepalive — without this synthetic event, the daemon's `:
 /// keepalive\n\n` heartbeats would be silently swallowed and the
 /// helper would tear the stream down every minute.

@@ -13,25 +13,49 @@
 //!    process run. Best-effort write whenever a fresh token is minted.
 //!
 //! Each app gets its own keyring "user" (see [`keyring_account`]) so they
-//! don't overwrite each other's tokens. The storage value is just the
-//! bearer string; scope and expiry live server-side and the daemon
-//! returns `invalid_session` if the client presents a stale token.
+//! don't overwrite each other's tokens, in the keyring service of the product
+//! it is talking to, so an app that talks to both daemons keeps a token for
+//! each. The storage value is just the bearer string; scope and expiry live
+//! server-side and the daemon returns `invalid_session` if the client
+//! presents a stale token.
 
 use crate::http_client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use super_engine_protocol::ProductSpec;
 use tokio::sync::Mutex as AsyncMutex;
 
-const KEYRING_SERVICE: &str = "super-stt-session";
-
-/// Per-app keyring "user" identifier. Pick a stable string that uniquely
-/// identifies your app (e.g. `"super-stt-cli"`, `"super-stt-app"`).
+/// Which app is asking, and which product's daemon it is asking.
 #[derive(Clone, Copy, Debug)]
-pub struct AppId(pub &'static str);
+pub struct AppId {
+    /// The product whose daemon issues the token. Its keyring service
+    /// ([`ProductSpec::session_keyring_service`]) is where the token is kept.
+    pub product: &'static ProductSpec,
+    /// A stable string that uniquely identifies the app (e.g.
+    /// `"super-stt-cli"`, `"super-stt-app"`): the keyring "user" the token is
+    /// stored under.
+    pub name: &'static str,
+}
 
+impl AppId {
+    /// `name`, talking to `product`'s daemon.
+    #[must_use]
+    pub const fn new(product: &'static ProductSpec, name: &'static str) -> Self {
+        Self { product, name }
+    }
+
+    /// The key this app's lock and cached token live under in this process.
+    /// The product is part of it, so an app talking to both daemons holds a
+    /// token for each.
+    fn key(self) -> (&'static str, &'static str) {
+        (self.product.slug, self.name)
+    }
+}
+
+type AppKey = (&'static str, &'static str);
 type ObtainLock = Arc<AsyncMutex<()>>;
-type ObtainLockMap = StdMutex<HashMap<&'static str, ObtainLock>>;
+type ObtainLockMap = StdMutex<HashMap<AppKey, ObtainLock>>;
 
 /// Per-`AppId` async mutex registry. Ensures at most one
 /// `auth_request` flight is in progress per app at any time so parallel
@@ -43,7 +67,7 @@ static OBTAIN_LOCKS: LazyLock<ObtainLockMap> = LazyLock::new(|| StdMutex::new(Ha
 
 fn lock_for(app_id: AppId) -> ObtainLock {
     let mut map = OBTAIN_LOCKS.lock().unwrap();
-    map.entry(app_id.0)
+    map.entry(app_id.key())
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))
         .clone()
 }
@@ -52,24 +76,24 @@ fn lock_for(app_id: AppId) -> ObtainLock {
 /// consulted before any keyring access. This is what lets a tight
 /// reconnect loop (e.g. while the daemon is down) avoid hammering the
 /// keyring. Cleared by `forget`.
-static TOKEN_CACHE: LazyLock<StdMutex<HashMap<&'static str, String>>> =
+static TOKEN_CACHE: LazyLock<StdMutex<HashMap<AppKey, String>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 fn cache_get(app_id: AppId) -> Option<String> {
-    TOKEN_CACHE.lock().unwrap().get(app_id.0).cloned()
+    TOKEN_CACHE.lock().unwrap().get(&app_id.key()).cloned()
 }
 
 fn cache_set(app_id: AppId, token: String) {
-    TOKEN_CACHE.lock().unwrap().insert(app_id.0, token);
+    TOKEN_CACHE.lock().unwrap().insert(app_id.key(), token);
 }
 
 fn cache_clear(app_id: AppId) {
-    TOKEN_CACHE.lock().unwrap().remove(app_id.0);
+    TOKEN_CACHE.lock().unwrap().remove(&app_id.key());
 }
 
-/// When `SUPER_STT_KEYRING_MOCK` is set, route all client-side keyring
-/// access (the session-token store this module manages) to an in-memory
-/// mock instead of the system secret service.
+/// When `product`'s `<PREFIX>_KEYRING_MOCK` (`SUPER_STT_KEYRING_MOCK`) is set,
+/// route all client-side keyring access (the session-token store this module
+/// manages) to an in-memory mock instead of the system secret service.
 ///
 /// This is the client-side twin of the daemon's
 /// `install_mock_if_requested`: the CLI / settings app / applet reach the
@@ -77,9 +101,10 @@ fn cache_clear(app_id: AppId) {
 /// shell or CI run has no unlocked secret service — touching the real one
 /// there blocks on an unlock prompt or fails. Call this once at process
 /// startup, before any keyring access, as it sets the process-wide default
-/// credential builder.
-pub fn install_mock_keyring_if_requested() {
-    if std::env::var_os("SUPER_STT_KEYRING_MOCK").is_some() {
+/// credential builder. A client of both products calls it for each: either
+/// variable set is a request for the mock.
+pub fn install_mock_keyring_if_requested(product: &ProductSpec) {
+    if std::env::var_os(product.env("KEYRING_MOCK")).is_some() {
         keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
     }
 }
@@ -96,15 +121,24 @@ pub fn install_mock_keyring_if_requested() {
 /// install keeps the plain `AppId`, so nothing already stored moves.
 fn keyring_account(app_id: AppId) -> String {
     match super_engine_protocol::sandbox::own_app_id() {
-        Some(sandbox_id) => format!("{}@flatpak:{sandbox_id}", app_id.0),
-        None => app_id.0.to_string(),
+        Some(sandbox_id) => format!("{}@flatpak:{sandbox_id}", app_id.name),
+        None => app_id.name.to_string(),
     }
+}
+
+/// The keyring entry `app_id`'s token lives in: the product's session
+/// service, under this install's account.
+fn keyring_entry(app_id: AppId) -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(
+        &app_id.product.session_keyring_service(),
+        &keyring_account(app_id),
+    )
 }
 
 /// Read the cached token for `app_id`, or None if no token is stored.
 #[must_use]
 pub fn load(app_id: AppId) -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &keyring_account(app_id)).ok()?;
+    let entry = keyring_entry(app_id).ok()?;
     entry.get_password().ok()
 }
 
@@ -118,8 +152,7 @@ pub fn load(app_id: AppId) -> Option<String> {
 /// Returns an error if the keyring is unavailable or the write fails.
 pub fn save(app_id: AppId, token: &str) -> Result<(), String> {
     cache_set(app_id, token.to_string());
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &keyring_account(app_id))
-        .map_err(|e| format!("keyring access failed: {e}"))?;
+    let entry = keyring_entry(app_id).map_err(|e| format!("keyring access failed: {e}"))?;
     entry
         .set_password(token)
         .map_err(|e| format!("keyring write failed: {e}"))?;
@@ -133,8 +166,7 @@ pub fn save(app_id: AppId, token: &str) -> Result<(), String> {
 /// Returns an error if the keyring is unavailable.
 pub fn forget(app_id: AppId) -> Result<(), String> {
     cache_clear(app_id);
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &keyring_account(app_id))
-        .map_err(|e| format!("keyring access failed: {e}"))?;
+    let entry = keyring_entry(app_id).map_err(|e| format!("keyring access failed: {e}"))?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("keyring delete failed: {e}")),
@@ -244,6 +276,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super_engine_protocol::{SUPER_STT, SUPER_TTS};
 
     /// Verify that once a token is in the in-memory cache, `obtain`
     /// returns it without touching the keyring or the network. We
@@ -251,7 +284,7 @@ mod tests {
     /// through to `auth_request`.
     #[tokio::test]
     async fn obtain_returns_from_cache_without_network() {
-        let app_id = AppId("test-cache-hit");
+        let app_id = AppId::new(&SUPER_STT, "test-cache-hit");
         // Manually pre-populate the cache.
         cache_set(app_id, "TOK-from-cache".to_string());
 
@@ -274,7 +307,7 @@ mod tests {
     /// is the necessary-and-sufficient ingredient.
     #[test]
     fn cache_set_get_clear_round_trip() {
-        let app_id = AppId("test-cache-roundtrip");
+        let app_id = AppId::new(&SUPER_STT, "test-cache-roundtrip");
         cache_clear(app_id);
         assert_eq!(cache_get(app_id), None, "fresh slot must be empty");
 
@@ -287,5 +320,28 @@ mod tests {
 
         cache_clear(app_id);
         assert_eq!(cache_get(app_id), None, "clear must drop the entry");
+    }
+
+    /// One app talking to both daemons holds a token for each: the product is
+    /// part of the key, so caching one never hands it to the other.
+    #[test]
+    fn one_app_keeps_a_token_per_product() {
+        let stt = AppId::new(&SUPER_STT, "test-two-products");
+        let tts = AppId::new(&SUPER_TTS, "test-two-products");
+        cache_set(stt, "TOK-stt".to_string());
+        cache_set(tts, "TOK-tts".to_string());
+
+        let (from_stt, from_tts) = (cache_get(stt), cache_get(tts));
+        cache_clear(stt);
+        let after_clear = cache_get(tts);
+        cache_clear(tts);
+
+        assert_eq!(from_stt.as_deref(), Some("TOK-stt"));
+        assert_eq!(from_tts.as_deref(), Some("TOK-tts"));
+        assert_eq!(
+            after_clear.as_deref(),
+            Some("TOK-tts"),
+            "forgetting one product's token must leave the other's"
+        );
     }
 }

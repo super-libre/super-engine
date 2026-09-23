@@ -85,7 +85,8 @@ pub enum WidgetSubscriptionUpdate {
 /// only the `app_id`/`app_name`/`scopes`/`topics` fields differing.
 #[derive(Clone, Copy)]
 pub struct WidgetSubscriptionConfig {
-    /// Stable per-app keyring user (e.g. `"super-stt-cosmic-applet"`).
+    /// Which app is subscribing, to which product's daemon. The product also
+    /// decides which scope each topic needs.
     pub app_id: AppId,
     /// Human-readable name shown in the consent popup.
     pub app_name: &'static str,
@@ -112,9 +113,9 @@ impl WidgetSubscriptionConfig {
         topics: &'static [&'static str],
     ) -> Self {
         debug_assert!(
-            uncovered_topic(scopes, topics).is_none(),
+            uncovered_topic(app_id.product, scopes, topics).is_none(),
             "widget subscription requests a topic its scopes don't grant: {:?}",
-            uncovered_topic(scopes, topics),
+            uncovered_topic(app_id.product, scopes, topics),
         );
         Self {
             app_id,
@@ -128,26 +129,9 @@ impl WidgetSubscriptionConfig {
     }
 }
 
-/// The scope a subscriber needs for `topic`. See
-/// [`super_engine_protocol::scopes::required_scope_for_topic`].
-#[must_use]
-pub fn required_scope_for_topic(topic: &str) -> Option<&'static str> {
-    super_engine_protocol::scopes::required_scope_for_topic(
-        &super_engine_protocol::SUPER_STT,
-        topic,
-    )
-}
-
-/// The first topic in `topics` that `scopes` does not grant. See
-/// [`super_engine_protocol::scopes::uncovered_topic`].
-#[must_use]
-pub fn uncovered_topic<'t>(scopes: &[&str], topics: &[&'t str]) -> Option<&'t str> {
-    super_engine_protocol::scopes::uncovered_topic(
-        &super_engine_protocol::SUPER_STT,
-        scopes,
-        topics,
-    )
-}
+/// The topic-to-scope table every subscriber checks its request against,
+/// re-exported where the subscription is built.
+pub use super_engine_protocol::scopes::{required_scope_for_topic, uncovered_topic};
 
 /// True if the daemon's `auth_denied` reason string is one of the
 /// user-denied variants — `user_denied` (just clicked Deny) or
