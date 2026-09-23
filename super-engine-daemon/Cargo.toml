@@ -1,0 +1,55 @@
+[package]
+    name = "super-engine-daemon"
+    version.workspace = true
+    authors.workspace = true
+    edition.workspace = true
+    description = "The parts of a Super STT or Super TTS daemon that do not depend on the product"
+    license.workspace = true
+    repository.workspace = true
+
+[dependencies]
+    anyhow.workspace = true
+    axum = {
+        version = "0.8",
+        default-features = false,
+        features = ["json", "tokio"]
+    }
+    chrono.workspace = true
+    hyper = { version = "1", features = ["http1", "server"] }
+    hyper-util = {
+        version = "0.1",
+        features = ["http1", "server", "service", "tokio"]
+    }
+    keyring.workspace = true
+    libc.workspace = true
+    log.workspace = true
+    # Session tokens are drawn from the system's secure random source.
+    ring = "0.17"
+    serde.workspace = true
+    serde_json.workspace = true
+    super-engine-protocol = { path = "../super-engine-protocol" }
+    thiserror.workspace = true
+    tokio = {
+        workspace = true,
+        features = [
+            "fs",
+            "io-util",
+            "macros",
+            "net",
+            "process",
+            "rt-multi-thread",
+            "sync",
+            "time",
+        ]
+    }
+    # Every daemon publishes an `OpenAPI` document, and the auth routes carry
+    # their own `#[utoipa::path]`, so this is not optional.
+    utoipa.workspace = true
+
+[dev-dependencies]
+    tempfile = "3.27.0"
+    # `ServiceExt::oneshot`, to run a guard as a router would.
+    tower = { version = "0.5", features = ["util"] }
+
+[lints]
+    workspace = true

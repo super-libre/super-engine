@@ -2,6 +2,7 @@
   resolver = "2"
   members  = [
     "super-engine-client",
+    "super-engine-daemon",
     "super-engine-forge",
     "super-engine-protocol",
     "super-engine-spec",
@@ -15,6 +16,8 @@
     repository = "https://github.com/super-libre/super-engine"
 
   [workspace.dependencies]
+    anyhow       = "1.0.100"
+    chrono       = { version = "0.4", features = ["serde"] }
     dirs         = "6.0.0"
     env_logger   = "0.11.8"
     futures-util = "0.3.31"
