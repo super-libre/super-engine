@@ -4,6 +4,8 @@
 //!
 //! - [`auth`]: session tokens, the consent dialog, and the guards every
 //!   route sits behind.
+//! - [`download_stream`]: streaming a download to disk, hashing it on the
+//!   way.
 //! - [`keyring`]: the system keyring, which holds the session tokens and each
 //!   backend's API credentials.
 //! - [`resource_management`]: the per-client connection cap and rate limit.
@@ -17,6 +19,7 @@
 //! [`ProductSpec`](super_engine_protocol::ProductSpec) the daemon passes in.
 
 pub mod auth;
+pub mod download_stream;
 pub mod http;
 pub mod keyring;
 pub mod resource_management;
