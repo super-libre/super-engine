@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Shared version parsing + update comparison for registry backends.
 //!
-//! One home so the daemon (`POST /registry/backends/update`), the app (the
+//! One home so the daemon (its registry update endpoint), the app (the
 //! "Update available" affordance), and the indexer (release selection +
 //! manifest validation) agree on what parses as a version and what counts as
 //! "newer" — previously four subtly different implementations, including a

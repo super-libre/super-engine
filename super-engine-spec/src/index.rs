@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Canonical `index.json` schema — the registry catalog the indexer publishes
 //! and the daemon consumes. Previously this shape was declared three times
-//! (indexer producer, daemon consumer, and the shared `/registry/backends`
-//! leaf types), kept in sync by comment only and prone to drift. It now lives
-//! here once; the producer and consumer both use these types, and the
-//! `/registry/backends` response reuses the `IndexModel`/`IndexSecret`/
+//! (indexer producer, daemon consumer, and the registry listing's leaf
+//! types), kept in sync by comment only and prone to drift. It now lives here
+//! once; the producer and consumer both use these types, and the listing
+//! ([`registry`](crate::registry)) reuses the `IndexModel`/`IndexSecret`/
 //! `IndexOption`/`IndexStale` leaves.
 //!
 //! Daemon-only policy (the `min_client` soft-floor check and the unsafe-path
@@ -269,7 +269,7 @@ impl<M> IndexBackend<M> {
 /// The browse-only model subset the catalog and host-compatibility filter need
 /// before download. The authoritative manifest (languages, files, …) ships as
 /// the pinned `manifest` asset and is installed verbatim — it is not re-encoded
-/// here. Also the leaf type for `/registry/backends` (`RegistryModel`).
+/// here. Also the leaf type of a daemon's registry listing (`RegistryModel`).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexModel<M> {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Canonical types for the backend contract Super STT and Super TTS share: a
 //! backend's `backend.toml` manifest, the maintainer-facing `registry.toml`,
-//! and the `index.json` catalog built from them.
+//! and the `index.json` catalog built from them — and, in [`registry`], what
+//! a daemon's `/registry` endpoints serve from that catalog.
 //!
 //! Each product plugs its own contract generations and fields in through
 //! [`product::Product`].
@@ -15,6 +16,7 @@ pub mod index;
 pub mod license;
 pub mod manifest;
 pub mod product;
+pub mod registry;
 mod safe_path;
 #[cfg(feature = "schema")]
 pub mod schema;
