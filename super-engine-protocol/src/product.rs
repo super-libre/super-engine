@@ -30,6 +30,10 @@ pub struct ProductSpec {
     /// The loopback TCP port the daemon serves browsers on. Ports 7300–7309
     /// are the block reserved for the Super family, one per daemon.
     pub tcp_port: u16,
+    /// Where the product's releases are published, as
+    /// `<host>/<owner>/<repo>`: what the daemon checks for updates and the
+    /// installer downloads from.
+    pub repo: &'static str,
     /// The scopes this product adds to [`CORE_SCOPES`](crate::scopes::CORE_SCOPES).
     pub scopes: &'static [&'static str],
     /// The event topics this product adds to
@@ -82,6 +86,7 @@ pub static SUPER_STT: ProductSpec = ProductSpec {
     short_name: "stt",
     env_prefix: "SUPER_STT",
     tcp_port: 7300,
+    repo: "github.com/jorge-menjivar/super-stt",
     scopes: &["transcribe", "recording_events", "global_transcriptions"],
     topics: &[
         ("recording_started", "recording_events"),
@@ -101,6 +106,7 @@ pub static SUPER_TTS: ProductSpec = ProductSpec {
     short_name: "tts",
     env_prefix: "SUPER_TTS",
     tcp_port: 7301,
+    repo: "github.com/jorge-menjivar/super-tts",
     scopes: &["speak", "voices", "playback_events"],
     topics: &[
         ("speaking_state", "playback_events"),
@@ -143,6 +149,7 @@ mod tests {
                 assert_ne!(a.short_name, b.short_name);
                 assert_ne!(a.env_prefix, b.env_prefix);
                 assert_ne!(a.tcp_port, b.tcp_port);
+                assert_ne!(a.repo, b.repo);
             }
         }
     }
