@@ -7,11 +7,17 @@
 //! Parsing is deliberately lenient where the runtime allows it (unknown
 //! fields ignored, `[assets]` optional); consumer-specific policy lives in
 //! each consumer's `validate` step.
+//!
+//! Generic over the [`Product`] the backend serves: the contract generations,
+//! the product's `[capabilities]` and `[[models]]` fields, and any rules those
+//! fields carry are the product's, and everything else here is shared.
 
 use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::product::{Generation, Product};
 
 /// The option name that carries a backend's configurable endpoint.
 ///
@@ -27,16 +33,25 @@ pub const BASE_URL_OPTION: &str = "base_url";
 /// A backend's `backend.toml`: identity, packaging, network policy,
 /// secrets/options, and the models it provides.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(bound(deserialize = ""))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct Manifest {
+#[cfg_attr(
+    feature = "schema",
+    schemars(
+        rename = "Manifest",
+        bound = "P::Contract: schemars::JsonSchema, P::Capabilities: schemars::JsonSchema, \
+                 P::Model: schemars::JsonSchema"
+    )
+)]
+pub struct Manifest<P: Product> {
     /// Backend identity and packaging.
-    pub backend: BackendMeta,
+    pub backend: BackendMeta<P::Contract>,
     /// Outbound network the backend is permitted to reach.
     #[serde(default)]
     pub network: Network,
     /// Optional feature flags that unlock transport extensions.
     #[serde(default)]
-    pub capabilities: Capabilities,
+    pub capabilities: Capabilities<P::Capabilities>,
     /// Binary artifacts a release publishes. Optional for locally installed
     /// backends; required (per `kind`) for registry publication.
     #[serde(default)]
@@ -49,14 +64,15 @@ pub struct Manifest {
     pub options: Vec<Opt>,
     /// One entry per model the backend provides.
     #[serde(default)]
-    pub models: Vec<ModelEntry>,
+    pub models: Vec<ModelEntry<P::Model>>,
 }
 
 /// `[backend]` — identity and packaging.
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct BackendMeta {
-    /// Globally unique reverse-DNS identifier, e.g. `app.super-stt.voxtral`.
+#[cfg_attr(feature = "schema", schemars(rename = "BackendMeta"))]
+pub struct BackendMeta<C> {
+    /// Globally unique reverse-DNS identifier, e.g. `com.example.whisper`.
     /// Names the directory this backend installs into. Optional on disk so a
     /// backend installed before the field existed keeps loading; required for
     /// registry listing, which the indexer enforces.
@@ -80,8 +96,9 @@ pub struct BackendMeta {
     /// Must not escape the backend directory: no absolute paths, no `..`
     /// components, no backslashes, no embedded NUL.
     pub entrypoint: String,
-    /// The backend-protocol contract version implemented.
-    pub contract: Contract,
+    /// The backend-protocol contract generation implemented. See
+    /// [`Generation`].
+    pub contract: C,
     /// License of the backend: a current SPDX identifier that is OSI-approved
     /// or FSF Free/Libre (e.g. `Apache-2.0`, `MIT`, `GPL-3.0-only`), or the
     /// literal `other` for a license outside that set. Optional for local
@@ -114,123 +131,6 @@ impl fmt::Display for Kind {
     }
 }
 
-/// Backend-protocol contract version: the one thing a manifest declares about
-/// what it implements.
-///
-/// A contract generation names a set of manifest fields and backend routes.
-/// Each generation is additive over the one before — v2 is v1 plus the
-/// `[[models]].role` field and the `POST /v1/process` route — so a backend
-/// declares the *lowest* generation whose fields it uses, and a daemon
-/// supports every generation up to the one it was built with.
-///
-/// This is a closed enum on purpose. A daemon that predates a generation
-/// cannot parse a manifest declaring it, which is what stops such a daemon
-/// from installing a backend it cannot drive: the refusal needs no field the
-/// old daemon would have to know about, because it is the *absence* of
-/// knowledge that refuses. Every generation added here therefore also gates
-/// itself against every daemon released before it.
-///
-/// Variant order is generation order; the derived `Ord` relies on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum Contract {
-    /// The v1 contract (`docs/protocol/backend/contract.md`): transcription
-    /// only.
-    V1,
-    /// v1 plus `[[models]].role` and `POST /v1/process` — a backend may serve
-    /// transcript post-processors.
-    V2,
-}
-
-impl Contract {
-    /// The newest generation this crate understands. A manifest may not
-    /// declare anything above it, because the closed enum refuses to parse it.
-    pub const LATEST: Self = Self::V2;
-
-    /// Every generation, oldest first.
-    pub const ALL: &'static [Self] = &[Self::V1, Self::V2];
-
-    /// The generation immediately before this one; `None` for the first.
-    #[must_use]
-    pub fn previous(self) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .rev()
-            .copied()
-            .find(|candidate| *candidate < self)
-    }
-
-    /// The Super STT release that first understood this generation — the
-    /// floor below which a daemon cannot install a backend declaring it.
-    ///
-    /// The indexer stamps this onto each index entry as `min_client`, so a
-    /// daemon that does not know the generation can still tell the user what
-    /// to update to. A backend author never writes a Super STT version: they
-    /// declare the contract, and this table is what it means.
-    ///
-    /// Reported, never compared: the daemon decides compatibility by whether
-    /// it can parse the generation at all, so a prerelease of the version
-    /// named here (`0.2.4-beta.1`, which semver orders *below* `0.2.4`) is not
-    /// wrongly locked out. It is a string for the user, not a gate.
-    ///
-    /// A new row is a forecast until its release ships, and nothing can check
-    /// it: the version that introduces a generation is by definition not yet
-    /// tagged when the row is written. Renumbering that release means
-    /// renumbering here.
-    #[must_use]
-    pub const fn min_client(self) -> &'static str {
-        match self {
-            // Not 0.1.0: `[backend].contract` — and the backend manifest
-            // itself — first shipped in 0.2.0 (#212). A 0.1.x daemon has no
-            // notion of an installable backend to gate.
-            Self::V1 => "0.2.0",
-            Self::V2 => "0.2.4-beta.1",
-        }
-    }
-}
-
-impl fmt::Display for Contract {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::V1 => write!(f, "v1"),
-            Self::V2 => write!(f, "v2"),
-        }
-    }
-}
-
-impl std::str::FromStr for Contract {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|c| c.to_string() == s)
-            .ok_or_else(|| {
-                let known: Vec<String> = Self::ALL.iter().map(ToString::to_string).collect();
-                format!(
-                    "unknown contract `{s}`; this build knows {}",
-                    known.join(", ")
-                )
-            })
-    }
-}
-
-/// Routed through `FromStr` so one table — `ALL` plus `Display` — is the only
-/// place a generation is spelled, and so the error names what this build does
-/// know. That message is what a user sees when a daemon meets a backend from a
-/// newer generation, so it is worth more than serde's "unknown variant".
-impl<'de> Deserialize<'de> for Contract {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let text = String::deserialize(d)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
-}
-
 /// What a generation does to a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldRule {
@@ -248,15 +148,21 @@ pub enum FieldRule {
 
 /// A manifest field and what a contract generation does to it.
 ///
-/// The one table behind both enforcement points: [`Manifest::parse`] holds a
-/// manifest to the rules of the contract it declares, and the generated schema
-/// encodes the same rules, so an editor flags a violation before anything is
-/// published. Adding a field to a new generation means adding a row here, and
-/// nothing else has to be taught.
+/// Each product lists its rows in [`Product::CONTRACT_FIELDS`]: the one table
+/// behind both enforcement points. [`Manifest::parse`] holds a manifest to the
+/// rules of the contract it declares, and the generated schema encodes the
+/// same rules, so an editor flags a violation before anything is published.
+/// Adding a field to a new generation means adding a row there, and nothing
+/// else has to be taught.
+///
+/// Field **names** only. A generation that widens an existing field's value
+/// set instead — a new `Device`, say — cannot be expressed here, and a
+/// manifest using such a value under an older `contract` is caught by that
+/// field's own `FromStr` rather than by this table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContractField {
+pub struct ContractField<C> {
     /// The generation the rule takes effect in.
-    pub since: Contract,
+    pub since: C,
     /// Which rule this row expresses.
     pub rule: FieldRule,
     /// The top-level table the field lives in: `backend` for `[backend]`,
@@ -266,7 +172,7 @@ pub struct ContractField {
     pub key: &'static str,
 }
 
-impl ContractField {
+impl<C> ContractField<C> {
     /// How the field is spelled in a manifest and in error messages, e.g.
     /// `[[models]].role`.
     #[must_use]
@@ -305,39 +211,6 @@ impl ContractField {
     }
 }
 
-/// Every field rule a generation after v1 introduces.
-///
-/// Field **names** only. A generation that widens an existing field's value
-/// set instead — a new `ModelRole`, a new `Device` — cannot be expressed here,
-/// and a manifest using such a value under an older `contract` is caught by
-/// that field's own `FromStr` rather than by this table.
-pub const CONTRACT_FIELDS: &[ContractField] = &[
-    ContractField {
-        since: Contract::V2,
-        rule: FieldRule::Added,
-        table: "models",
-        key: "role",
-    },
-    ContractField {
-        since: Contract::V2,
-        rule: FieldRule::Added,
-        table: "models",
-        key: "force_preview_support",
-    },
-    // `id` names the install directory and is what the registry matches an
-    // entry against, so a published backend has always needed one — the
-    // indexer refuses a release without it. It stayed optional in the type
-    // only so backends installed before the field existed keep loading, and v2
-    // is new enough that no such backend can declare it. Requiring it here
-    // moves the failure from a rejected release to the author's editor.
-    ContractField {
-        since: Contract::V2,
-        rule: FieldRule::RequiredFrom,
-        table: "backend",
-        key: "id",
-    },
-];
-
 /// `[network]` — outbound network policy.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -352,26 +225,16 @@ pub struct Network {
 /// `[capabilities]` — transport extensions beyond the base `/v1` contract.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct Capabilities {
+#[cfg_attr(feature = "schema", schemars(rename = "Capabilities"))]
+pub struct Capabilities<C> {
     /// Opt into the realtime WebSocket import/export. wasm-only — a
     /// `subprocess` backend declaring this is rejected at discovery.
     /// Required for any model with `realtime = true`. Default `false`.
     #[serde(default)]
     pub websocket: bool,
-    /// Opt into being handed the user's dictation context: an `x-stt-prompt`
-    /// header and an `x-stt-vocabulary` header, on every `/v1` request.
-    /// Default `false`, which means neither header is sent.
-    ///
-    /// Unlike `websocket` this is not transport-restricted, and the deviation
-    /// is deliberate: both headers ride the ordinary request every backend
-    /// already receives, so a `subprocess` backend can use them exactly as a
-    /// `wasm` one does. The flag exists to keep the headers off backends that
-    /// would not know what to do with them, not to gate a transport.
-    ///
-    /// Declared per backend rather than per model, because it describes what
-    /// the code reading the request does, and that code is the backend's.
-    #[serde(default)]
-    pub context: bool,
+    /// The keys the product adds, read from the same table.
+    #[serde(flatten)]
+    pub product: C,
 }
 
 /// `[assets]` — binary artifacts a release publishes, so the registry indexer
@@ -524,7 +387,7 @@ impl fmt::Display for Accel {
 }
 
 /// One `[[secrets]]` declaration — an encrypted credential the backend reads
-/// as an `x-stt-secret-<name>` request header.
+/// as a request header (`x-stt-secret-<name>` for Super STT).
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Secret {
@@ -544,7 +407,7 @@ pub struct Secret {
 }
 
 /// One `[[options]]` declaration — non-secret configuration the backend reads
-/// as an `x-stt-option-<name>` request header.
+/// as a request header (`x-stt-option-<name>` for Super STT).
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Opt {
@@ -592,7 +455,8 @@ impl Opt {
     /// nothing about an open-ended option.
     ///
     /// Two failures, both about delivery rather than meaning. An option value
-    /// becomes an `x-stt-option-*` request header, and a header value can hold
+    /// becomes a request header (`x-stt-option-*` for Super STT), and a header
+    /// value can hold
     /// neither a control character nor an unbounded number of bytes. A value
     /// that fails either one is worse stored than refused: the write reports
     /// success, and then every request the backend makes dies inside the
@@ -685,8 +549,8 @@ pub enum OptionDefault {
 }
 
 impl fmt::Display for OptionDefault {
-    /// The string form injected via `x-stt-option-*` headers and shown in the
-    /// settings catalog: strings pass through unquoted; integers and bools
+    /// The string form injected via the option request headers and shown in
+    /// the settings catalog: strings pass through unquoted; integers and bools
     /// use their plain display form.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -701,7 +565,8 @@ impl fmt::Display for OptionDefault {
 /// `(name, source)`, where `source` is `[backend].source`.
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct ModelEntry {
+#[cfg_attr(feature = "schema", schemars(rename = "ModelEntry"))]
+pub struct ModelEntry<M> {
     /// Wire model name.
     pub name: String,
     /// Whether the model accepts more than one language. Default `true`.
@@ -725,29 +590,11 @@ pub struct ModelEntry {
     /// Suggested minimum interval between streaming passes, in milliseconds.
     #[serde(default)]
     pub processing_interval_ms: Option<u64>,
-    /// When `true`, the model is driven over the consumer WebSocket endpoint
-    /// rather than batch `POST /v1/transcribe`. Requires
-    /// `[capabilities] websocket = true`. Default `false`.
+    /// When `true`, the model is driven over the realtime WebSocket transport
+    /// rather than batch requests. Requires `[capabilities] websocket = true`.
+    /// Default `false`.
     #[serde(default)]
     pub realtime: bool,
-    /// Force live previews onto a model that has none of its own: while the
-    /// microphone is open, the daemon re-transcribes a sliding window of the
-    /// capture every `processing_interval_ms` and shows the result. Each pass
-    /// is a full transcription the final pass repeats — for an online model,
-    /// a billed request per pass whose output is discarded — so it is off
-    /// unless the manifest turns it on. Default `false`. Not consulted for a
-    /// `realtime` model, which streams its own previews.
-    ///
-    /// A v2 field: declaring it under `contract = "v1"` is a parse error.
-    #[serde(default)]
-    pub force_preview_support: bool,
-    /// What the model is for: transcribing audio, or post-processing a
-    /// transcript. Default [`ModelRole::Transcription`], so every manifest
-    /// written before the field existed keeps its models transcribing.
-    ///
-    /// A v2 field: declaring it under `contract = "v1"` is a parse error.
-    #[serde(default)]
-    pub role: ModelRole,
     /// Files the model needs, each provisioned to its own `destination`
     /// before `POST /v1/load`. Cloud models declare none.
     #[serde(default)]
@@ -770,9 +617,12 @@ pub struct ModelEntry {
     /// Delete the field once no supported backend validates the key.
     #[serde(default)]
     pub provider: Option<String>,
+    /// The keys the product adds, read from the same table.
+    #[serde(flatten)]
+    pub product: M,
 }
 
-impl ModelEntry {
+impl<M> ModelEntry<M> {
     /// Whether the model is served by a remote API with no local compute —
     /// encoded by the `none` sentinel in `supported_devices` (which validation
     /// requires to be the sole entry when present). This is the single source
@@ -781,68 +631,6 @@ impl ModelEntry {
     #[must_use]
     pub fn is_online(&self) -> bool {
         self.supported_devices.contains(&Device::None)
-    }
-}
-
-/// What a model is for.
-///
-/// A backend serves both roles from the same manifest and the same install: a
-/// role only decides which `/v1` route the daemon drives the model over —
-/// `POST /v1/transcribe` for [`Transcription`](Self::Transcription),
-/// `POST /v1/process` for [`PostProcessor`](Self::PostProcessor) — and which
-/// of the daemon's two model slots it may be selected into. Everything else
-/// (files, devices, secrets, options, discovery, install) is identical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum ModelRole {
-    /// Transcribes audio. The default, and what every model was before the
-    /// field existed.
-    #[default]
-    Transcription,
-    /// Rewrites a finished transcript — filler removal, punctuation,
-    /// formatting. Driven over `POST /v1/process`.
-    PostProcessor,
-}
-
-impl fmt::Display for ModelRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transcription => write!(f, "transcription"),
-            Self::PostProcessor => write!(f, "post_processor"),
-        }
-    }
-}
-
-impl std::str::FromStr for ModelRole {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "transcription" => Ok(Self::Transcription),
-            "post_processor" => Ok(Self::PostProcessor),
-            _ => Err(format!("Unknown model role: {s}")),
-        }
-    }
-}
-
-/// Routed through `FromStr` so the spelling is validated identically wherever
-/// a role is deserialized — TOML manifests and JSON index entries alike.
-impl<'de> Deserialize<'de> for ModelRole {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let text = String::deserialize(d)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-impl ModelRole {
-    /// Whether this is the post-processing role.
-    #[must_use]
-    pub fn is_post_processor(self) -> bool {
-        matches!(self, Self::PostProcessor)
     }
 }
 
@@ -971,10 +759,10 @@ pub enum ManifestError {
     FieldRequiresContract {
         /// The field, spelled as in the manifest (e.g. `[[models]].role`).
         field: String,
-        /// The generation that introduced it.
-        since: Contract,
-        /// The generation the manifest declares.
-        declared: Contract,
+        /// The generation that introduced it, as the manifest spells it.
+        since: String,
+        /// The generation the manifest declares, as the manifest spells it.
+        declared: String,
     },
     /// A field the manifest's `contract` requires was not declared.
     #[error(
@@ -984,10 +772,10 @@ pub enum ManifestError {
     FieldRequiredByContract {
         /// The field, spelled as in the manifest (e.g. `[backend].id`).
         field: String,
-        /// The generation the manifest declares.
-        declared: Contract,
+        /// The generation the manifest declares, as the manifest spells it.
+        declared: String,
         /// The newest generation that does not require it.
-        previous: Contract,
+        previous: String,
     },
     /// A `[[models.files]]` `destination` is not a safe relative path.
     #[error("backend.toml file destination {0:?} is not a safe relative path")]
@@ -1044,13 +832,17 @@ pub enum ManifestError {
         /// The asset's label (its `file`, or its first `parts` entry).
         file: String,
     },
+    /// A rule of the product's own, from [`Product::validate`].
+    #[error(transparent)]
+    Product(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// Whether any [`CONTRACT_FIELDS`] rule can bite at `declared`. When none can
-/// — which for a manifest declaring the latest generation with no required
-/// fields is the common case — the raw document never has to be parsed.
-fn applies_to(declared: Contract) -> bool {
-    CONTRACT_FIELDS.iter().any(|field| match field.rule {
+/// Whether any [`Product::CONTRACT_FIELDS`] rule can bite at `declared`. When
+/// none can — which for a manifest declaring the latest generation with no
+/// required fields is the common case — the raw document never has to be
+/// parsed.
+fn applies_to<P: Product>(declared: P::Contract) -> bool {
+    P::CONTRACT_FIELDS.iter().any(|field| match field.rule {
         FieldRule::Added => field.since > declared,
         FieldRule::RequiredFrom => declared >= field.since,
     })
@@ -1063,7 +855,7 @@ fn applies_to(declared: Contract) -> bool {
 /// rather than defaulted. A table that is an array (`[[models]]`) counts a
 /// field declared if *any* entry declares it; a plain table (`[backend]`) is
 /// checked once.
-fn declares(raw: &toml::Table, field: &ContractField) -> bool {
+fn declares<C>(raw: &toml::Table, field: &ContractField<C>) -> bool {
     match raw.get(field.table) {
         Some(toml::Value::Array(entries)) if field.is_array_table() => entries
             .iter()
@@ -1073,32 +865,37 @@ fn declares(raw: &toml::Table, field: &ContractField) -> bool {
     }
 }
 
-/// The first [`CONTRACT_FIELDS`] rule the document breaks, in table order, as
-/// the error it should be reported as. `None` when the manifest stays within
-/// its contract.
-fn contract_violation(raw: &toml::Table, declared: Contract) -> Option<ManifestError> {
-    CONTRACT_FIELDS.iter().find_map(|field| match field.rule {
-        // A field from a later generation, spelled under an earlier one.
-        FieldRule::Added if field.since > declared && declares(raw, field) => {
-            Some(ManifestError::FieldRequiresContract {
-                field: field.path(),
-                since: field.since,
-                declared,
-            })
-        }
-        // A field this generation requires, left out.
-        FieldRule::RequiredFrom if declared >= field.since && !declares(raw, field) => {
-            Some(ManifestError::FieldRequiredByContract {
-                field: field.path(),
-                declared,
-                previous: field.since.previous().unwrap_or(field.since),
-            })
-        }
-        _ => None,
-    })
+/// The first [`Product::CONTRACT_FIELDS`] rule the document breaks, in table
+/// order, as the error it should be reported as. `None` when the manifest stays
+/// within its contract.
+fn contract_violation<P: Product>(
+    raw: &toml::Table,
+    declared: P::Contract,
+) -> Option<ManifestError> {
+    P::CONTRACT_FIELDS
+        .iter()
+        .find_map(|field| match field.rule {
+            // A field from a later generation, spelled under an earlier one.
+            FieldRule::Added if field.since > declared && declares(raw, field) => {
+                Some(ManifestError::FieldRequiresContract {
+                    field: field.path(),
+                    since: field.since.to_string(),
+                    declared: declared.to_string(),
+                })
+            }
+            // A field this generation requires, left out.
+            FieldRule::RequiredFrom if declared >= field.since && !declares(raw, field) => {
+                Some(ManifestError::FieldRequiredByContract {
+                    field: field.path(),
+                    declared: declared.to_string(),
+                    previous: field.since.previous().unwrap_or(field.since).to_string(),
+                })
+            }
+            _ => None,
+        })
 }
 
-impl Manifest {
+impl<P: Product> Manifest<P> {
     /// Parse a `backend.toml` from its text.
     ///
     /// The entrypoint is joined onto the backend dir to spawn/load the
@@ -1108,9 +905,10 @@ impl Manifest {
     /// # Errors
     /// Returns a [`ManifestError`] on TOML errors, an unsafe entrypoint or
     /// file destination, a malformed `[backend].id`, a malformed
-    /// `[[assets.subprocess]]` entry, or a field the declared
-    /// [`contract`](Contract) does not include
-    /// ([`FieldRequiresContract`](ManifestError::FieldRequiresContract)).
+    /// `[[assets.subprocess]]` entry, a field the declared
+    /// [`contract`](Generation) does not include
+    /// ([`FieldRequiresContract`](ManifestError::FieldRequiresContract)), or a
+    /// rule of the product's own ([`Product::validate`]).
     pub fn parse(text: &str) -> Result<Self, ManifestError> {
         Self::parse_inner(text, ContractFields::Enforced)
     }
@@ -1138,17 +936,17 @@ impl Manifest {
     fn parse_inner(text: &str, fields: ContractFields) -> Result<Self, ManifestError> {
         let mut m: Self = toml::from_str(text)?;
         // Every field defaults when absent, so the typed struct cannot tell
-        // "declared `role`" from "left it out". The raw document can, and the
-        // rule is about what was written: a v1 manifest may not spell a v2
-        // field at all, not even with its default value, because the v1
-        // schema does not have it. Parsed from the text a second time rather
+        // "declared the field" from "left it out". The raw document can, and
+        // the rule is about what was written: an older manifest may not spell
+        // a newer generation's field at all, not even with its default value,
+        // because that generation's schema does not have it. Parsed from the text a second time rather
         // than converted from one `Table`, so the typed parse above keeps its
         // line/column spans in error messages — and only when some field could
         // actually be in breach, which for a manifest declaring the latest
         // generation is never.
-        if fields == ContractFields::Enforced && applies_to(m.backend.contract) {
+        if fields == ContractFields::Enforced && applies_to::<P>(m.backend.contract) {
             let raw: toml::Table = toml::from_str(text)?;
-            if let Some(violation) = contract_violation(&raw, m.backend.contract) {
+            if let Some(violation) = contract_violation::<P>(&raw, m.backend.contract) {
                 return Err(violation);
             }
         }
@@ -1220,6 +1018,7 @@ impl Manifest {
                 return Err(ManifestError::VulkanApiRequiresVulkan { file: a.label() });
             }
         }
+        P::validate(&m)?;
         Ok(m)
     }
 
@@ -1269,6 +1068,10 @@ enum ContractFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_product::{Contract, Role as ModelRole, TestProduct};
+
+    type Manifest = super::Manifest<TestProduct>;
+    const CONTRACT_FIELDS: &[ContractField<Contract>] = TestProduct::CONTRACT_FIELDS;
 
     /// A minimal manifest with no `[backend].id`, for tests that only care
     /// about behavior around the field.
@@ -1514,8 +1317,8 @@ mod tests {
                 declared,
             } => {
                 assert_eq!(field, "[[models]].role");
-                assert_eq!(since, Contract::V2);
-                assert_eq!(declared, Contract::V1);
+                assert_eq!(since, Contract::V2.to_string());
+                assert_eq!(declared, Contract::V1.to_string());
             }
             other => panic!("expected FieldRequiresContract, got {other}"),
         }
@@ -1570,7 +1373,7 @@ mod tests {
         );
         let m = Manifest::parse_installed(&text).expect("an installed manifest still loads");
         assert!(
-            m.models[0].role.is_post_processor(),
+            m.models[0].product.role.is_post_processor(),
             "and keeps the role it was installed with"
         );
     }
@@ -1604,7 +1407,7 @@ mod tests {
     fn a_v1_manifest_without_v2_fields_parses_and_defaults_the_role() {
         let m = Manifest::parse(&manifest_with("v1", "")).expect("plain v1 parses");
         assert_eq!(m.backend.contract, Contract::V1);
-        assert_eq!(m.models[0].role, ModelRole::Transcription);
+        assert_eq!(m.models[0].product.role, ModelRole::Transcription);
     }
 
     /// v2 is v1 plus the new fields: it accepts both a manifest that uses them
@@ -1613,9 +1416,9 @@ mod tests {
     fn a_v2_manifest_may_declare_role_or_omit_it() {
         let with = Manifest::parse(&manifest_with("v2", r#"role = "post_processor""#))
             .expect("role under v2 parses");
-        assert!(with.models[0].role.is_post_processor());
+        assert!(with.models[0].product.role.is_post_processor());
         let without = Manifest::parse(&manifest_with("v2", "")).expect("plain v2 parses");
-        assert_eq!(without.models[0].role, ModelRole::Transcription);
+        assert_eq!(without.models[0].product.role, ModelRole::Transcription);
     }
 
     /// `force_preview_support` is a v2 field too, and it is refused under v1 by the same
@@ -1627,7 +1430,7 @@ mod tests {
         match err {
             ManifestError::FieldRequiresContract { field, since, .. } => {
                 assert_eq!(field, "[[models]].force_preview_support");
-                assert_eq!(since, Contract::V2);
+                assert_eq!(since, Contract::V2.to_string());
             }
             other => panic!("expected FieldRequiresContract, got {other}"),
         }
@@ -1639,7 +1442,7 @@ mod tests {
     #[test]
     fn preview_support_is_not_forced_unless_declared() {
         let local = Manifest::parse(&manifest_with("v2", "")).expect("parses");
-        assert!(!local.models[0].force_preview_support);
+        assert!(!local.models[0].product.force_preview_support);
 
         let online = Manifest::parse(&manifest_with("v2", "").replace(
             r#"supported_devices = ["cpu"]"#,
@@ -1647,7 +1450,7 @@ mod tests {
         ))
         .expect("parses");
         assert!(online.models[0].is_online());
-        assert!(!online.models[0].force_preview_support);
+        assert!(!online.models[0].product.force_preview_support);
     }
 
     /// Declaring it is what turns it on, for any model.
@@ -1655,7 +1458,7 @@ mod tests {
     fn a_declared_force_preview_support_turns_previews_on() {
         let local =
             Manifest::parse(&manifest_with("v2", "force_preview_support = true")).expect("parses");
-        assert!(local.models[0].force_preview_support);
+        assert!(local.models[0].product.force_preview_support);
 
         let online = Manifest::parse(
             &manifest_with("v2", "force_preview_support = true").replace(
@@ -1664,7 +1467,7 @@ mod tests {
             ),
         )
         .expect("parses");
-        assert!(online.models[0].force_preview_support);
+        assert!(online.models[0].product.force_preview_support);
     }
 
     /// The closed enum is the gate: a generation this crate does not know is a

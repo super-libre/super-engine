@@ -138,10 +138,10 @@ pub fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
 
 /// `n_bytes` random bytes from the system RNG, hex-encoded — for building an
 /// unpredictable directory/file name (e.g. a staging directory a same-UID
-/// process must not be able to guess or pre-create/race). Shared by
-/// `super-stt-install`'s own staging directory (`StagingGuard`) and
-/// `super-stt-app`'s self-update download directory, so both draw from the
-/// same RNG/encoding in lock-step.
+/// process must not be able to guess or pre-create/race). Shared by the
+/// installer's own staging directory (`StagingGuard`) and the settings app's
+/// self-update download directory, so both draw from the same RNG/encoding in
+/// lock-step.
 ///
 /// # Panics
 /// If the system RNG is unavailable — a fatal host condition with no sane

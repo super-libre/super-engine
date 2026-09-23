@@ -7,11 +7,16 @@
 //! fields) and `additionalProperties: false` (the
 //! parsers stay lenient for forward compatibility; the editor schema is
 //! strict to catch typos). Draft-07 output for taplo compatibility.
+//!
+//! Generic over the [`Product`] the schema describes: its `$id`s and titles
+//! come from [`Product::SCHEMA`], and its contract rules from
+//! [`Product::CONTRACT_FIELDS`].
 
 use serde_json::{Value, json};
 
-const BACKEND_SCHEMA_ID: &str = "https://jorge-menjivar.github.io/super-stt/backend.schema.json";
-const REGISTRY_SCHEMA_ID: &str = "https://jorge-menjivar.github.io/super-stt/registry.schema.json";
+use crate::manifest::Manifest;
+use crate::product::{Generation, Product};
+
 const SPDX: &str = "SPDX-License-Identifier: GPL-3.0-only";
 
 fn draft07_value<T: schemars::JsonSchema>() -> Value {
@@ -199,17 +204,17 @@ fn inject_definition_rules(defs: &mut serde_json::Map<String, Value>) {
 /// an object schema — both mean a schemars upgrade changed the output shape
 /// and this builder must be updated, not silently skip its conditionals.
 #[must_use]
-pub fn backend_schema() -> Value {
-    let mut root = draft07_value::<crate::manifest::Manifest>();
+pub fn backend_schema<P: Product>() -> Value
+where
+    Manifest<P>: schemars::JsonSchema,
+{
+    let mut root = draft07_value::<Manifest<P>>();
 
     {
         let obj = root.as_object_mut().expect("root object");
-        obj.insert("$id".into(), json!(BACKEND_SCHEMA_ID));
+        obj.insert("$id".into(), json!(P::SCHEMA.backend_id));
         obj.insert("$comment".into(), json!(SPDX));
-        obj.insert(
-            "title".into(),
-            json!("Super STT backend manifest (backend.toml)"),
-        );
+        obj.insert("title".into(), json!(P::SCHEMA.backend_title));
     }
 
     // kind → assets shape, enforced only when [assets] is present (local
@@ -261,7 +266,7 @@ pub fn backend_schema() -> Value {
     // disallowing every field a later generation introduced. Built from the
     // same table the parser enforces (`CONTRACT_FIELDS`), so an editor bound
     // to this schema flags exactly what `Manifest::parse` would refuse.
-    for rule in contract_rules() {
+    for rule in contract_rules::<P>() {
         push_all_of(&mut root, rule);
     }
 
@@ -277,21 +282,21 @@ pub fn backend_schema() -> Value {
 }
 
 /// One `if`/`then` per contract generation, encoding the same
-/// [`CONTRACT_FIELDS`](crate::manifest::CONTRACT_FIELDS) rules the parser
-/// enforces: fields a later generation introduced are disallowed, and fields
-/// this generation requires are required.
+/// [`Product::CONTRACT_FIELDS`] rules the parser enforces: fields a later
+/// generation introduced are disallowed, and fields this generation requires
+/// are required.
 ///
 /// A `[[models]]`-style table is an array of objects, so the rule goes on
 /// `items`; a plain table gets it directly. `false` as a property schema is
 /// what the other conditionals here use for "not under this condition" (see
 /// `cuda_major`), so an editor reports it the same way.
-fn contract_rules() -> Vec<Value> {
-    use crate::manifest::{CONTRACT_FIELDS, Contract, FieldRule};
-    Contract::ALL
+fn contract_rules<P: Product>() -> Vec<Value> {
+    use crate::manifest::FieldRule;
+    P::Contract::ALL
         .iter()
         .filter_map(|declared| {
             let mut then = json!({});
-            for field in CONTRACT_FIELDS {
+            for field in P::CONTRACT_FIELDS {
                 // Indexed only inside the arms: `then[table]` auto-vivifies a
                 // JSON null, and a null is not a subschema — a table touched
                 // without a rule to add would emit `{"backend": null}`.
@@ -347,7 +352,7 @@ fn contract_rules() -> Vec<Value> {
 /// Panics if the schemars output for [`crate::entry::Entry`] does not
 /// serialize — see [`backend_schema`].
 #[must_use]
-pub fn registry_schema() -> Value {
+pub fn registry_schema<P: Product>() -> Value {
     let mut entry = draft07_value::<crate::entry::Entry>();
     if let Some(obj) = entry.as_object_mut() {
         obj.remove("$schema");
@@ -393,9 +398,9 @@ pub fn registry_schema() -> Value {
 
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": REGISTRY_SCHEMA_ID,
+        "$id": P::SCHEMA.registry_id,
         "$comment": SPDX,
-        "title": "Super STT backend registry",
+        "title": P::SCHEMA.registry_title,
         "description": "Source of truth for the installable-backend catalog. Each top-level table is one backend, keyed by a unique backend id (ascii lowercase, digits, `-`, `_`). A scheduled GitHub Action reads this file, resolves each entry's latest GitHub release, validates it, and publishes index.json to the gh-pages branch. See registry/README.md for submission rules.",
         "type": "object",
         "additionalProperties": false,
@@ -410,8 +415,11 @@ pub fn registry_schema() -> Value {
 /// # Panics
 /// Panics when [`backend_schema`] does.
 #[must_use]
-pub fn backend_schema_pretty() -> String {
-    let mut s = serde_json::to_string_pretty(&backend_schema()).expect("serializes");
+pub fn backend_schema_pretty<P: Product>() -> String
+where
+    Manifest<P>: schemars::JsonSchema,
+{
+    let mut s = serde_json::to_string_pretty(&backend_schema::<P>()).expect("serializes");
     s.push('\n');
     s
 }
@@ -421,8 +429,8 @@ pub fn backend_schema_pretty() -> String {
 /// # Panics
 /// Panics when [`registry_schema`] does.
 #[must_use]
-pub fn registry_schema_pretty() -> String {
-    let mut s = serde_json::to_string_pretty(&registry_schema()).expect("serializes");
+pub fn registry_schema_pretty<P: Product>() -> String {
+    let mut s = serde_json::to_string_pretty(&registry_schema::<P>()).expect("serializes");
     s.push('\n');
     s
 }

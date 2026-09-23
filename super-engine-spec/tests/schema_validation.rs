@@ -4,9 +4,11 @@
 #![cfg(feature = "schema")]
 
 use serde_json::{Value, json};
+use super_engine_spec::product::{Generation, Product};
+use super_engine_spec::test_product::TestProduct;
 
 fn backend_validator() -> jsonschema::Validator {
-    jsonschema::validator_for(&super_engine_spec::schema::backend_schema())
+    jsonschema::validator_for(&super_engine_spec::schema::backend_schema::<TestProduct>())
         .expect("backend schema compiles")
 }
 
@@ -201,8 +203,14 @@ fn every_data_object_is_closed() {
         }
     }
     for (name, schema) in [
-        ("backend", super_engine_spec::schema::backend_schema()),
-        ("registry", super_engine_spec::schema::registry_schema()),
+        (
+            "backend",
+            super_engine_spec::schema::backend_schema::<TestProduct>(),
+        ),
+        (
+            "registry",
+            super_engine_spec::schema::registry_schema::<TestProduct>(),
+        ),
     ] {
         let mut errors = Vec::new();
         walk(&schema, name, &mut errors);
@@ -214,7 +222,7 @@ fn every_data_object_is_closed() {
 /// serde rename would make an `if` never fire, silently dropping the rule.
 #[test]
 fn conditional_property_names_exist() {
-    let schema = super_engine_spec::schema::backend_schema();
+    let schema = super_engine_spec::schema::backend_schema::<TestProduct>();
     let root_props = schema["properties"].as_object().expect("root properties");
     for key in ["backend", "assets"] {
         assert!(root_props.contains_key(key), "root missing `{key}`");
@@ -285,8 +293,9 @@ fn conditional_property_names_exist() {
 /// only `models`.
 #[test]
 fn every_mappable_contract_table_has_a_schema_definition() {
-    use super_engine_spec::manifest::{Contract, ContractField};
-    let schema = super_engine_spec::schema::backend_schema();
+    use super_engine_spec::manifest::ContractField;
+    use super_engine_spec::test_product::Contract;
+    let schema = super_engine_spec::schema::backend_schema::<TestProduct>();
     let defs = schema["definitions"].as_object().expect("definitions");
     for table in ["backend", "models", "secrets", "options"] {
         let field = ContractField {
@@ -356,8 +365,8 @@ fn the_schema_gates_role_on_contract_v2() {
 /// must not drift from `Contract::ALL`.
 #[test]
 fn the_schema_offers_exactly_the_known_contracts() {
-    use super_engine_spec::manifest::Contract;
-    let schema = super_engine_spec::schema::backend_schema();
+    use super_engine_spec::test_product::Contract;
+    let schema = super_engine_spec::schema::backend_schema::<TestProduct>();
     // Documented variants come out of schemars as a `oneOf` of `const`s.
     let offered: Vec<Value> = schema["definitions"]["Contract"]["oneOf"]
         .as_array()
@@ -374,10 +383,9 @@ fn the_schema_offers_exactly_the_known_contracts() {
 /// while the real one slips through.
 #[test]
 fn contract_rule_field_names_exist() {
-    use super_engine_spec::manifest::CONTRACT_FIELDS;
-    let schema = super_engine_spec::schema::backend_schema();
+    let schema = super_engine_spec::schema::backend_schema::<TestProduct>();
     let defs = schema["definitions"].as_object().expect("definitions");
-    for field in CONTRACT_FIELDS {
+    for field in TestProduct::CONTRACT_FIELDS {
         // A row naming a table the schema builder cannot map would generate a
         // rule matching nothing — silently un-gating the field. That is a
         // failure to report, not a reason to abort the run.

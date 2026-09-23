@@ -10,28 +10,32 @@
 //! Daemon-only policy (the `min_client` soft-floor check and the unsafe-path
 //! backend filter) stays in the daemon as free functions over [`Index`], the
 //! same extension pattern `validate_runtime` uses for `Manifest`.
+//!
+//! The per-model fields a product adds are the `M` every type here carries —
+//! [`Product::IndexModel`] — flattened into each model entry.
 
 use crate::manifest::{Device, Manifest, ModelEntry};
+use crate::product::{Generation, Product};
 use serde::{Deserialize, Serialize};
 
 /// `index.json` schema version the indexer emits.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Soft floor: the minimum Super STT client (daemon) version expected to
-/// understand this index. Older clients still use the registry but are warned
+/// Soft floor: the minimum client (daemon) version expected to understand
+/// this index. Older clients still use the registry but are warned
 /// to update. Compared with standard semver precedence on the consumer side.
 pub const MIN_CLIENT: &str = "0.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Index {
+pub struct Index<M> {
     pub schema_version: u32,
     pub generated_at: String,
     pub min_client: String,
-    pub backends: Vec<IndexBackend>,
+    pub backends: Vec<IndexBackend<M>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexBackend {
+pub struct IndexBackend<M> {
     pub id: String,
     /// The backend's reverse-DNS identifier from its release manifest. Names
     /// the install directory. `None` for an entry that predates the field;
@@ -55,8 +59,8 @@ pub struct IndexBackend {
     /// here, so a daemon still lists an entry whose generation it does not
     /// know — and can then say so, rather than failing the whole catalog.
     pub contract: String,
-    /// The Super STT release that first understood `contract`, from
-    /// [`Contract::min_client`](crate::manifest::Contract::min_client). Stamped
+    /// The product release that first understood `contract`, from
+    /// [`Generation::min_client`]. Stamped
     /// by the indexer so a daemon that predates the generation can still name
     /// the version to update to. `None` on an index published before the
     /// field existed.
@@ -68,7 +72,7 @@ pub struct IndexBackend {
     pub online: bool,
     pub supports_gpu: bool,
     pub supports_cpu: bool,
-    pub models: Vec<IndexModel>,
+    pub models: Vec<IndexModel<M>>,
     pub secrets: Vec<IndexSecret>,
     pub options: Vec<IndexOption>,
     pub assets: IndexAssets,
@@ -149,7 +153,7 @@ struct ModelSupport {
 /// marks online/remote models, `gpu` marks GPU, `cpu` marks CPU. Devices are
 /// typed and validated by `Manifest::parse`, so there is no string matching to
 /// get wrong.
-fn model_support(models: &[ModelEntry]) -> ModelSupport {
+fn model_support<M>(models: &[ModelEntry<M>]) -> ModelSupport {
     let any_device =
         |pred: fn(&Device) -> bool| models.iter().any(|m| m.supported_devices.iter().any(pred));
     ModelSupport {
@@ -159,7 +163,7 @@ fn model_support(models: &[ModelEntry]) -> ModelSupport {
     }
 }
 
-impl IndexBackend {
+impl<M> IndexBackend<M> {
     /// Assemble the manifest-derived fields of an index entry from a validated
     /// [`Manifest`]. The caller supplies the source-specific pins — the resolved
     /// `id`, `version`, `tag`, hashed `assets`, and optional pinned `manifest`
@@ -174,9 +178,9 @@ impl IndexBackend {
     /// custom-repo resolver, and the local-dir resolver all share; previously
     /// the local-dir path silently dropped secrets and options entirely.
     #[must_use]
-    pub fn from_manifest(
+    pub fn from_manifest<P: Product<IndexModel = M>>(
         id: String,
-        m: Manifest,
+        m: Manifest<P>,
         version: String,
         tag: String,
         assets: IndexAssets,
@@ -208,6 +212,7 @@ impl IndexBackend {
                 .models
                 .into_iter()
                 .map(|md| IndexModel {
+                    product: P::index_model(&md),
                     name: md.name,
                     provider: String::new(),
                     supported_devices: md
@@ -215,7 +220,6 @@ impl IndexBackend {
                         .iter()
                         .map(ToString::to_string)
                         .collect(),
-                    role: md.role.to_string(),
                 })
                 .collect(),
             secrets: m
@@ -268,7 +272,7 @@ impl IndexBackend {
 /// here. Also the leaf type for `/registry/backends` (`RegistryModel`).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexModel {
+pub struct IndexModel<M> {
     pub name: String,
     /// Wire-compatibility shim, always empty. Daemons through v0.2.0
     /// deserialize the index with this key **required**, so publishing an
@@ -281,20 +285,9 @@ pub struct IndexModel {
     #[serde(default, skip_deserializing)]
     pub provider: String,
     pub supported_devices: Vec<String>,
-    /// What the model is for: `"transcription"` (the default) or
-    /// `"post_processor"`. Lets Browse show that a backend provides a
-    /// post-processor before it is installed. `default` so an index published
-    /// before the field existed still parses, reading every model as
-    /// transcribing — which is what it was.
-    #[serde(default = "default_role")]
-    pub role: String,
-}
-
-/// The role an index entry without the key is read as. Every model predates
-/// the field, so they all transcribe. Spelled via the canonical enum so this
-/// cannot drift from [`ModelRole::default`](crate::manifest::ModelRole::default).
-fn default_role() -> String {
-    crate::manifest::ModelRole::default().to_string()
+    /// The fields the product adds ([`Product::IndexModel`]).
+    #[serde(flatten)]
+    pub product: M,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -382,7 +375,13 @@ pub struct IndexStale {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{ModelEntry, ModelRole};
+    use crate::test_product::{self, Model, Role as ModelRole, TestProduct};
+
+    type Index = super::Index<test_product::IndexModel>;
+    type IndexBackend = super::IndexBackend<test_product::IndexModel>;
+    type IndexModel = super::IndexModel<test_product::IndexModel>;
+    type Manifest = crate::manifest::Manifest<TestProduct>;
+    type ModelEntry = crate::manifest::ModelEntry<Model>;
 
     /// The published `index.json` must keep carrying `provider` on every model.
     /// Daemons through v0.2.0 declare it as a required `String`, so an index
@@ -398,7 +397,9 @@ mod tests {
             name: "m1".into(),
             provider: String::new(),
             supported_devices: vec!["cpu".into()],
-            role: ModelRole::Transcription.to_string(),
+            product: test_product::IndexModel {
+                role: ModelRole::Transcription.to_string(),
+            },
         };
         let v = serde_json::to_value(&m).expect("serializes");
         assert!(
@@ -432,13 +433,13 @@ mod tests {
         let without: IndexModel =
             serde_json::from_str(r#"{"name":"m1","supported_devices":["cpu"]}"#)
                 .expect("an index without `role` must parse");
-        assert_eq!(without.role, "transcription");
+        assert_eq!(without.product.role, "transcription");
 
         let with: IndexModel = serde_json::from_str(
             r#"{"name":"m1","supported_devices":["cpu"],"role":"post_processor"}"#,
         )
         .expect("an index carrying `role` must parse");
-        assert_eq!(with.role, "post_processor");
+        assert_eq!(with.product.role, "post_processor");
     }
 
     /// Build a `ModelEntry` with the given devices; the other
@@ -453,10 +454,12 @@ mod tests {
             estimated_vram_bytes: 0,
             processing_interval_ms: None,
             realtime: false,
-            force_preview_support: false,
-            role: ModelRole::Transcription,
             files: vec![],
             provider: None,
+            product: Model {
+                force_preview_support: false,
+                role: ModelRole::Transcription,
+            },
         }
     }
 
@@ -548,7 +551,7 @@ mod tests {
     /// to `"string"` — not the empty strings the custom-repo path produced.
     #[test]
     fn from_manifest_maps_secrets_options_with_name_and_type_fallbacks() {
-        let m = crate::manifest::Manifest::parse(
+        let m = Manifest::parse(
             r#"
             [backend]
             source = "github.com/x/y"
@@ -597,7 +600,7 @@ mod tests {
     /// `id`, so the two must never be conflated.
     #[test]
     fn from_manifest_propagates_the_manifest_id_into_backend_id() {
-        let m = crate::manifest::Manifest::parse(
+        let m = Manifest::parse(
             r#"
             [backend]
             id = "app.super-stt.voxtral"
@@ -633,8 +636,8 @@ mod tests {
     /// generation can still name the version to update to.
     #[test]
     fn from_manifest_stamps_the_contract_and_its_client_floor() {
-        for contract in crate::manifest::Contract::ALL {
-            let m = crate::manifest::Manifest::parse(&format!(
+        for contract in test_product::Contract::ALL {
+            let m = Manifest::parse(&format!(
                 r#"
                 [backend]
                 id = "app.test.y"
@@ -682,7 +685,7 @@ mod tests {
     /// not an empty string or a fallback to `source`.
     #[test]
     fn from_manifest_leaves_backend_id_none_when_the_manifest_has_none() {
-        let m = crate::manifest::Manifest::parse(
+        let m = Manifest::parse(
             r#"
             [backend]
             source = "github.com/x/y"
@@ -719,7 +722,7 @@ mod tests {
     /// Every other option keeps its default.
     #[test]
     fn from_manifest_drops_a_base_url_default_and_keeps_the_others() {
-        let m = crate::manifest::Manifest::parse(
+        let m = Manifest::parse(
             r#"
             [backend]
             source = "github.com/x/y"
