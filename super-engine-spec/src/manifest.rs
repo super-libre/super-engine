@@ -439,6 +439,31 @@ pub struct Opt {
     /// `description` accepted anything the user typed, and shipped it.
     #[serde(default)]
     pub choices: Vec<OptionDefault>,
+    /// Lowest value a numeric option accepts, inclusive.
+    ///
+    /// A bound the daemon keeps, not a hint: a write outside it is refused.
+    /// Only for `integer` and `float` — a range over strings is not a thing
+    /// the manifest can mean, and the indexer refuses one.
+    #[serde(default)]
+    pub min: Option<f64>,
+    /// Highest value a numeric option accepts, inclusive. See [`Opt::min`].
+    #[serde(default)]
+    pub max: Option<f64>,
+    /// The increment a numeric option moves in.
+    ///
+    /// Declaring it alongside `min` and `max` is what turns the option into a
+    /// slider, the way declaring `choices` turns one into a dropdown: a
+    /// control that can only be dragged needs both ends and a grid to land on,
+    /// and an option that has all three has nothing a text box would add.
+    ///
+    /// The grid is the control's, not the contract's. The daemon enforces the
+    /// bounds and leaves the step to the client, because a value between two
+    /// notches is still a value the backend asked to be able to receive —
+    /// refusing it would make the option narrower than its own range says, and
+    /// would turn every float that is not exactly representable into a bug
+    /// report.
+    #[serde(default)]
+    pub step: Option<f64>,
     /// Whether a value must be set before the backend can load. Default
     /// `false`.
     #[serde(default)]
@@ -446,17 +471,77 @@ pub struct Opt {
 }
 
 impl Opt {
+    /// The type this option's values are, `string` when it declares none.
+    #[must_use]
+    pub fn declared_type(&self) -> OptionType {
+        self.r#type.unwrap_or(OptionType::String)
+    }
+
     /// Whether `value`, in the string form the daemon stores and injects, is
-    /// one this option accepts. An option declaring no choices accepts
-    /// anything, so this is the check itself, not a precondition for it.
+    /// one this option accepts: of the declared type, within its bounds, and —
+    /// when the option names a closed set — one of those.
+    ///
+    /// All three, because they fail differently and an option can be wrong
+    /// in any of them. A value off a dropdown is one the backend never offered;
+    /// a value of the wrong type is one it cannot read at all, and until this
+    /// checked it, an `integer` option would store `banana` and inject it.
     #[must_use]
     pub fn accepts(&self, value: &str) -> bool {
+        self.accepts_the_type(value) && self.is_in_range(value) && self.is_a_choice(value)
+    }
+
+    /// Whether `value` lies within the declared bounds, inclusive.
+    ///
+    /// An option declaring neither bound accepts every value of its type, so
+    /// this is a whole answer on its own. A value that is not a number is one
+    /// [`accepts_the_type`](Self::accepts_the_type) has already refused for
+    /// every type that can carry a bound, so it is not refused twice here.
+    #[must_use]
+    pub fn is_in_range(&self, value: &str) -> bool {
+        if self.min.is_none() && self.max.is_none() {
+            return true;
+        }
+        let Ok(x) = value.trim().parse::<f64>() else {
+            return true;
+        };
+        self.min.is_none_or(|low| x >= low) && self.max.is_none_or(|high| x <= high)
+    }
+
+    /// Whether a client should render this option as a slider: a numeric
+    /// option bounded at both ends and moving in a declared increment.
+    ///
+    /// The same shape-implies-control rule as `choices`, which renders a
+    /// dropdown. An option missing any of the three has something left to type
+    /// and gets a field instead.
+    #[must_use]
+    pub fn is_slider(&self) -> bool {
+        matches!(
+            self.declared_type(),
+            OptionType::Integer | OptionType::Float
+        ) && self.min.is_some()
+            && self.max.is_some()
+            && self.step.is_some()
+    }
+
+    /// Whether `value` parses as the declared type. See
+    /// [`OptionType::accepts`].
+    #[must_use]
+    pub fn accepts_the_type(&self, value: &str) -> bool {
+        self.declared_type().accepts(value)
+    }
+
+    /// Whether `value` is one of the closed set, or the option names none.
+    ///
+    /// An option declaring no choices accepts every value of its type, so this
+    /// is a whole answer on its own and not a precondition for one.
+    #[must_use]
+    pub fn is_a_choice(&self, value: &str) -> bool {
         self.choices.is_empty() || self.choices.iter().any(|c| c.to_string() == value)
     }
 
     /// Whether a value's *shape* is one the declared type can be delivered in —
-    /// the check [`accepts`](Self::accepts) does not do, because `choices` say
-    /// nothing about an open-ended option.
+    /// the check [`accepts`](Self::accepts) does not do, because a `string`
+    /// option with no `choices` accepts any text at all.
     ///
     /// Two failures, both about delivery rather than meaning. An option value
     /// becomes a request header (`x-stt-option-*` for Super STT), and a header
@@ -521,6 +606,7 @@ fn named(c: char) -> &'static str {
 pub enum OptionType {
     String,
     Integer,
+    Float,
     Bool,
 }
 
@@ -531,7 +617,35 @@ impl OptionType {
         match self {
             Self::String => "string",
             Self::Integer => "integer",
+            Self::Float => "float",
             Self::Bool => "bool",
+        }
+    }
+
+    /// Whether `value`, in the string form the daemon stores and injects, is
+    /// one of this type.
+    ///
+    /// The daemon keeps every option as text — that is what an option request
+    /// header is — so a declared type is a claim about what that text will
+    /// parse back to, and this is where the claim is kept. A backend that
+    /// declared `integer` and was handed `banana` would have to decide for
+    /// itself what to do with it, at the point where the only way left to
+    /// report the problem is to fail a request.
+    ///
+    /// `string` accepts anything, which is what makes it the default: an
+    /// option that declares no type is free text and always was.
+    ///
+    /// Not-a-number and the infinities are refused rather than accepted as
+    /// floats. They parse, and nothing downstream wants them: they are the
+    /// values that turn an arithmetic bug into a silent one.
+    #[must_use]
+    pub fn accepts(self, value: &str) -> bool {
+        let value = value.trim();
+        match self {
+            Self::String => true,
+            Self::Integer => value.parse::<i64>().is_ok(),
+            Self::Float => value.parse::<f64>().is_ok_and(f64::is_finite),
+            Self::Bool => matches!(value, "true" | "false"),
         }
     }
 }
@@ -548,7 +662,11 @@ impl fmt::Display for OptionType {
 #[serde(untagged)]
 pub enum OptionDefault {
     String(String),
+    // Before `Float` and after `String`: an untagged enum binds to the first
+    // variant that accepts the value, and every TOML integer would otherwise
+    // arrive as a float that prints its own decimal point back at the user.
     Integer(i64),
+    Float(f64),
     Bool(bool),
 }
 
@@ -560,6 +678,11 @@ impl fmt::Display for OptionDefault {
         match self {
             Self::String(s) => write!(f, "{s}"),
             Self::Integer(i) => write!(f, "{i}"),
+            // `{:?}`, not `{}`: both give the shortest form that reads back
+            // as the same double, but only this one keeps the decimal point,
+            // so a whole-numbered float stays visibly a float. A dropdown
+            // offering 0.9 and 1.1 must not show `1` between them.
+            Self::Float(x) => write!(f, "{x:?}"),
             Self::Bool(b) => write!(f, "{b}"),
         }
     }
@@ -1949,6 +2072,9 @@ mod tests {
             r#type: None,
             default: None,
             choices: Vec::new(),
+            min: None,
+            max: None,
+            step: None,
             required: false,
         };
 
@@ -1975,6 +2101,197 @@ mod tests {
         // Counted in characters, not bytes, so the message matches what the
         // user typed rather than how it encodes.
         assert!(opt.permits_shape(&"é".repeat(MAX_OPTION_CHARS)).is_ok());
+    }
+
+    /// A TOML float binds to `Float` and not to the `String` or `Integer`
+    /// ahead of it, and prints back as the number that was written rather than
+    /// the binary fraction nearest to it.
+    #[test]
+    fn option_default_binds_a_toml_float() {
+        let m = Manifest::parse(
+            r#"
+            [backend]
+            source = "github.com/x/y"
+            name = "Y"
+            version = "1.0.0"
+            kind = "wasm"
+            entrypoint = "y.wasm"
+            contract = "v1"
+            description = "Test backend."
+
+            [[options]]
+            name = "temperature"
+            description = "How freely the model samples."
+            type = "float"
+            default = 0.9
+            choices = [0.7, 0.8, 0.9]
+            "#,
+        )
+        .unwrap();
+        let opt = &m.options[0];
+        assert_eq!(opt.r#type, Some(OptionType::Float));
+        assert_eq!(opt.default, Some(OptionDefault::Float(0.9)));
+        assert_eq!(opt.default.as_ref().unwrap().to_string(), "0.9");
+        // A whole-numbered float keeps its point, so a ladder reads
+        // 0.9, 1.0, 1.1 rather than 0.9, 1, 1.1.
+        assert_eq!(OptionDefault::Float(1.0).to_string(), "1.0");
+        assert_eq!(OptionDefault::Float(-0.5).to_string(), "-0.5");
+        // And it still reads back as the same double.
+        assert!(OptionType::Float.accepts(&OptionDefault::Float(1.0).to_string()));
+        assert_eq!(
+            opt.choices
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["0.7", "0.8", "0.9"]
+        );
+    }
+
+    /// What each type takes, in the string form the daemon stores and injects.
+    #[test]
+    fn a_type_accepts_its_own_values() {
+        assert!(OptionType::String.accepts("anything at all"));
+        assert!(OptionType::Integer.accepts("30"));
+        assert!(OptionType::Integer.accepts(" -4 "));
+        assert!(!OptionType::Integer.accepts("2.5"));
+        assert!(!OptionType::Integer.accepts("banana"));
+        assert!(OptionType::Float.accepts("0.9"));
+        assert!(OptionType::Float.accepts("1"));
+        assert!(OptionType::Float.accepts("-1e3"));
+        assert!(!OptionType::Float.accepts("warm"));
+        assert!(OptionType::Bool.accepts("true"));
+        assert!(!OptionType::Bool.accepts("True"));
+        assert!(!OptionType::Bool.accepts("1"));
+    }
+
+    /// The infinities and not-a-number parse as doubles. They are refused
+    /// anyway: nothing downstream wants them, and they are what turns an
+    /// arithmetic bug into a silent one.
+    #[test]
+    fn a_float_refuses_the_values_that_are_not_finite() {
+        for value in ["inf", "-inf", "infinity", "NaN", "nan"] {
+            assert!(!OptionType::Float.accepts(value), "{value} was accepted");
+        }
+    }
+
+    /// Both halves of what an option accepts, and the reason they are separate:
+    /// an `integer` with no `choices` still must not store `banana`.
+    #[test]
+    fn an_option_accepts_its_type_and_its_choices() {
+        let m = Manifest::parse(
+            r#"
+            [backend]
+            source = "github.com/x/y"
+            name = "Y"
+            version = "1.0.0"
+            kind = "wasm"
+            entrypoint = "y.wasm"
+            contract = "v1"
+            description = "Test backend."
+
+            [[options]]
+            name = "retries"
+            description = "How many times to try again."
+            type = "integer"
+
+            [[options]]
+            name = "temperature"
+            description = "How freely the model samples."
+            type = "float"
+            choices = [0.7, 0.9]
+
+            [[options]]
+            name = "base_url"
+            description = "Where to send it."
+            "#,
+        )
+        .unwrap();
+        let (retries, temperature, base_url) = (&m.options[0], &m.options[1], &m.options[2]);
+
+        assert!(retries.accepts("3"));
+        assert!(
+            !retries.accepts("banana"),
+            "an open option still has a type"
+        );
+        assert!(retries.is_a_choice("banana"), "it names no closed set");
+
+        assert!(temperature.accepts("0.9"));
+        assert!(!temperature.accepts("0.85"), "off the list");
+        assert!(
+            temperature.accepts_the_type("0.85"),
+            "but a float all the same"
+        );
+        assert!(!temperature.accepts("warm"));
+
+        // No declared type is `string`, which is what makes it the default.
+        assert_eq!(base_url.declared_type(), OptionType::String);
+        assert!(base_url.accepts("anything at all"));
+    }
+
+    /// A bounded numeric option: the bounds are kept, the step is not, and
+    /// all three together are what a client renders as a slider.
+    #[test]
+    fn a_bounded_option_keeps_its_bounds_and_not_its_step() {
+        let m = Manifest::parse(
+            r#"
+            [backend]
+            source = "github.com/x/y"
+            name = "Y"
+            version = "1.0.0"
+            kind = "wasm"
+            entrypoint = "y.wasm"
+            contract = "v1"
+            description = "Test backend."
+
+            [[options]]
+            name = "temperature"
+            description = "How freely the model samples."
+            type = "float"
+            min = 0.6
+            max = 1.2
+            step = 0.1
+
+            [[options]]
+            name = "retries"
+            description = "How many times to try again."
+            type = "integer"
+            min = 0
+            max = 10
+
+            [[options]]
+            name = "base_url"
+            description = "Where to send it."
+            "#,
+        )
+        .unwrap();
+        let (temperature, retries, base_url) = (&m.options[0], &m.options[1], &m.options[2]);
+
+        assert_eq!(temperature.min, Some(0.6));
+        assert_eq!(temperature.max, Some(1.2));
+        assert_eq!(temperature.step, Some(0.1));
+        assert!(temperature.accepts("0.6"), "the low end is inclusive");
+        assert!(temperature.accepts("1.2"), "and so is the high end");
+        assert!(!temperature.accepts("0.5"));
+        assert!(!temperature.accepts("1.3"));
+        // The grid belongs to the control. A value between two notches is
+        // still inside the range the option said it could take.
+        assert!(
+            temperature.accepts("0.85"),
+            "`step` bounds the slider, not the contract"
+        );
+
+        // Both ends and a grid: a slider. Missing any of them: a field.
+        assert!(temperature.is_slider());
+        assert!(!retries.is_slider(), "no step, so nothing to slide along");
+        assert!(!base_url.is_slider(), "a string has no range to slide over");
+
+        // A bound on one side alone still bounds that side.
+        assert!(retries.accepts("0"));
+        assert!(!retries.accepts("11"));
+        assert!(!retries.accepts("-1"));
+
+        // No bounds declared is every value of the type, as it always was.
+        assert!(base_url.is_in_range("anything at all"));
     }
 
     /// Unknown fields and tables are ignored — older daemons must tolerate
