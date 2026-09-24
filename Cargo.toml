@@ -4,6 +4,7 @@
     "super-engine-client",
     "super-engine-daemon",
     "super-engine-forge",
+    "super-engine-indexer",
     "super-engine-protocol",
     "super-engine-spec",
   ]
