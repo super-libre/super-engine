@@ -80,6 +80,13 @@ impl ProductSpec {
     pub fn consent_helper(&self) -> String {
         format!("{}-consent", self.slug)
     }
+
+    /// The file name of the daemon's binary, `<slug>-daemon`: how a daemon
+    /// tells a live peer's backends from a dead one's.
+    #[must_use]
+    pub fn daemon_binary(&self) -> String {
+        format!("{}-daemon", self.slug)
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +95,7 @@ mod tests {
 
     /// Every name a daemon and its clients meet on follows from the spec:
     /// the socket, the keyring entry, the host header, the override
-    /// variables and the consent helper.
+    /// variables, the consent helper and the daemon itself.
     #[test]
     fn the_names_follow_from_the_spec() {
         assert_eq!(TEST.socket_file(), "super-test-http.sock");
@@ -96,5 +103,6 @@ mod tests {
         assert_eq!(TEST.http_host(), "test.local");
         assert_eq!(TEST.env("HTTP_SOCKET"), "SUPER_TEST_HTTP_SOCKET");
         assert_eq!(TEST.consent_helper(), "super-test-consent");
+        assert_eq!(TEST.daemon_binary(), "super-test-daemon");
     }
 }

@@ -81,6 +81,8 @@
     wasmtime-wasi-http = { version = "45.0.0", optional = true }
 
 [features]
+    # Run backends shipped as sandboxed native subprocesses.
+    subprocess = ["dep:bytes", "hyper/client"]
     # Run backends shipped as WASM components.
     wasm = [
         "dep:async-trait",

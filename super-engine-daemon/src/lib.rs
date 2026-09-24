@@ -22,6 +22,8 @@
 //!   it, and which build of a backend to install.
 //! - [`self_update`]: whether the product has a newer release, and which
 //!   installer to offer for it.
+//! - [`subprocess`] (feature `subprocess`): running a backend shipped as a
+//!   native binary, in a sandbox, over its `/v1` socket.
 //! - [`wasm`] (feature `wasm`): running a backend shipped as a WASM
 //!   component, and its realtime WebSocket host.
 //!
@@ -41,5 +43,7 @@ pub mod openapi;
 pub mod registry;
 pub mod resource_management;
 pub mod self_update;
+#[cfg(feature = "subprocess")]
+pub mod subprocess;
 #[cfg(feature = "wasm")]
 pub mod wasm;
