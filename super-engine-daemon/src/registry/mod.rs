@@ -8,12 +8,14 @@
 //! index entry ([`custom_repo`], [`local_dir`]) and deciding which of a
 //! backend's files survive an update ([`carry_over`]) are here too, as is the
 //! install pipeline itself ([`install`]) and the cleanup of duplicate
-//! directories it can leave behind ([`reconcile`]).
+//! directories it can leave behind ([`reconcile`]). [`endpoints`] is what the
+//! `/registry/backend/*` routes a daemon declares do.
 
 pub mod carry_over;
 pub mod client;
 pub mod compat;
 pub mod custom_repo;
+pub mod endpoints;
 pub mod host;
 pub mod index;
 pub mod install;
