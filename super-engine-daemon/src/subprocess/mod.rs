@@ -279,12 +279,17 @@ impl SubprocessBackend {
             String::from_utf8_lossy(&resp)
         );
 
-        // Loading the model onto the GPU can take a while.
-        let deadline = std::time::Instant::now() + Duration::from_mins(10);
+        let deadline = std::time::Instant::now() + LOAD_TIMEOUT;
         loop {
-            let (_, resp) = self.request("GET", "/v1/status", &[], Vec::new()).await?;
+            let (_, resp) = self
+                .request("GET", "/v1/status", &[], Vec::new())
+                .await
+                .map_err(|e| {
+                    self.load_failure(&format!("stopped answering while loading ({e:#})"))
+                })?;
             let json: serde_json::Value = serde_json::from_slice(&resp)?;
-            match json.get("state").and_then(|v| v.as_str()) {
+            let state = json.get("state").and_then(|v| v.as_str());
+            match state {
                 Some("ready") => {
                     let device = json.get("device").and_then(|v| v.as_str()).unwrap_or("?");
                     info!("backend ready (device={device})");
@@ -300,10 +305,30 @@ impl SubprocessBackend {
                 _ => {}
             }
             if std::time::Instant::now() >= deadline {
-                bail!("backend load timed out");
+                return Err(self.load_failure(&format!(
+                    "did not finish loading within {} minutes, and still reports `{}`",
+                    LOAD_TIMEOUT.as_secs() / 60,
+                    state.unwrap_or("no state")
+                )));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// A load that ended without the backend saying why, with the backend's
+    /// own recent output attached.
+    ///
+    /// A backend that reports `error` names its reason, and that is the whole
+    /// story. This is for the other endings: the backend exited, or went on
+    /// reporting `loading` after its load could no longer finish — a model
+    /// thread that panicked, say. Its status says nothing either way, but its
+    /// output usually holds the panic, and a bare "timed out" names neither.
+    fn load_failure(&self, what: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "backend {} {what}. Its recent output:\n{}",
+            self.label(),
+            self.logs()
+        )
     }
 
     /// Device label the backend reported at load time (e.g. `"cuda"`).
@@ -431,6 +456,13 @@ impl Drop for SubprocessBackend {
         let _ = std::fs::remove_file(&self.socket);
     }
 }
+
+/// How long a load may take before the daemon gives up on it.
+///
+/// Generous on purpose: a backend that compiles its GPU kernels at runtime
+/// does it during the load, which can take minutes on a cold cache, and
+/// `ready` is what the daemon starts sending requests against.
+const LOAD_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// The task driving one connection to a backend. Dropping it closes the
 /// connection.
