@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use super_engine_protocol::ProductSpec;
+use super_engine_protocol::models::theme::AudioTheme;
 
 pub const WARMUP_TONE_DURATION_MS: u64 = 20;
 pub const WARMUP_TONE_FREQUENCY: f32 = 44000.0;
@@ -385,6 +386,49 @@ pub async fn play_beep_sequence_async(
     .map_err(|e| anyhow::anyhow!("beep playback task failed: {e}"))?
 }
 
+/// The pause between a theme preview's start cue and its end cue.
+const PREVIEW_GAP: Duration = Duration::from_millis(500);
+
+/// Which cue of a theme preview could not be played.
+#[derive(Debug, thiserror::Error)]
+pub enum PreviewError {
+    #[error("the start cue could not be played: {0}")]
+    Start(anyhow::Error),
+    #[error("the end cue could not be played: {0}")]
+    End(anyhow::Error),
+}
+
+/// Play `theme`'s start cue, then its end cue half a second later, at
+/// `volume`: what a settings UI plays to preview a theme without starting
+/// anything. The silent theme plays nothing and does not wait.
+///
+/// # Errors
+///
+/// Which cue failed, and why. The end cue is not tried after the start cue
+/// fails.
+pub async fn preview_theme(
+    product: &'static ProductSpec,
+    theme: AudioTheme,
+    volume: f32,
+) -> Result<(), PreviewError> {
+    if theme == AudioTheme::Silent {
+        return Ok(());
+    }
+    let (frequencies, duration, fade_in, fade_out) = theme.start_sound();
+    log::info!("Previewing audio theme {theme}: start cue {frequencies:?}, {duration}ms");
+    play_beep_sequence_async(product, frequencies, duration, fade_in, fade_out, volume)
+        .await
+        .map_err(PreviewError::Start)?;
+
+    tokio::time::sleep(PREVIEW_GAP).await;
+
+    let (frequencies, duration, fade_in, fade_out) = theme.end_sound();
+    log::info!("Previewing audio theme {theme}: end cue {frequencies:?}, {duration}ms");
+    play_beep_sequence_async(product, frequencies, duration, fade_in, fade_out, volume)
+        .await
+        .map_err(PreviewError::End)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +562,14 @@ mod tests {
     #[test]
     fn the_mute_switch_is_the_products() {
         assert_eq!(mute_cues_env(&TEST), "SUPER_TEST_MUTE_CUES");
+    }
+
+    /// The silent theme has nothing to play, so its preview neither plays nor
+    /// waits out the gap between the two cues.
+    #[tokio::test]
+    async fn a_silent_preview_returns_at_once() {
+        let started = std::time::Instant::now();
+        preview_theme(&TEST, AudioTheme::Silent, 1.0).await.unwrap();
+        assert!(started.elapsed() < PREVIEW_GAP);
     }
 }
