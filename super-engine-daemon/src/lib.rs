@@ -7,6 +7,7 @@
 //! - [`config`]: the daemon's `daemon.toml`, and its HTTP surface settings.
 //! - [`backends`]: installed backends — finding them on disk, the models
 //!   they serve, and the runtime policy a manifest is held to at discovery.
+//! - [`devices`]: which device a model runs on, and the host's GPUs.
 //! - [`download`]: provisioning a model's files before its backend loads it.
 //! - [`download_progress`]: what a model load reports as it goes, and the
 //!   loads in flight.
@@ -40,6 +41,7 @@
 pub mod auth;
 pub mod backends;
 pub mod config;
+pub mod devices;
 pub mod download;
 pub mod download_progress;
 pub mod download_stream;
