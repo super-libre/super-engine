@@ -11,6 +11,13 @@
 //! given value means. See each product's
 //! `docs/protocol/backend/config.md`.
 
+use std::collections::HashMap;
+use std::hash::BuildHasher;
+
+use super_engine_spec::product::Product;
+
+use crate::backends::DiscoveredBackend;
+
 /// Name of the option that carries a backend's configurable endpoint, from the
 /// crate the daemon, the indexer, and the catalog synthesis all share.
 pub const OPTION_NAME: &str = super_engine_spec::manifest::BASE_URL_OPTION;
@@ -148,9 +155,111 @@ pub fn egress_entries(value: &str) -> Vec<String> {
     })
 }
 
+/// Canonicalize the user's `base_url` override for `backend` in place (see
+/// [`normalize`]); drop one that is only whitespace; fail on one no host can
+/// be read from. Does nothing unless the backend declares the option.
+///
+/// The value is what a backend dials and what [`egress_hosts`] authorizes,
+/// so both must read the same canonical form. One the daemon cannot read as a
+/// URL fails the load rather than being dropped: dropping it would fall back
+/// to the backend's built-in endpoint and send the user's data to the vendor
+/// they had configured their way out of.
+///
+/// # Errors
+/// Returns an error when a declared, non-empty `base_url` yields no host.
+pub fn canonicalize_override<P: Product, S: BuildHasher>(
+    backend: &DiscoveredBackend<P>,
+    overrides: &mut HashMap<String, String, S>,
+) -> anyhow::Result<()> {
+    let name = OPTION_NAME;
+    let Some(opt) = backend.options.iter().find(|o| o.name == name) else {
+        return Ok(());
+    };
+    let Some(raw) = overrides.get(name).cloned() else {
+        return Ok(());
+    };
+    if raw.trim().is_empty() {
+        overrides.remove(name);
+    } else if let Some(canonical) = normalize(&raw) {
+        // The scheme the daemon chose for a value that named none decides
+        // whether the request is encrypted, so an operator asking later why
+        // a gateway was reached in the clear needs it on the record.
+        if !raw.contains("://") {
+            log::info!(
+                "Backend {}: base_url `{}` names no scheme; reading it as `{canonical}`",
+                backend.source,
+                raw.trim()
+            );
+        }
+        overrides.insert(name.to_string(), canonical);
+    } else {
+        // Name the setting the user can act on, never the internals.
+        anyhow::bail!(
+            "{} is not a valid URL.",
+            opt.label.as_deref().unwrap_or(&opt.name)
+        );
+    }
+    Ok(())
+}
+
+/// What the *user* authorized via a `base_url` option: the `host:port` the
+/// value points at, followed by the bare host.
+///
+/// `base_url` is the documented convention for a backend's configurable
+/// endpoint; any backend declaring an
+/// option with that name has the SSRF guard relaxed for that one authority.
+/// The value is read from the config override **only** — never from the
+/// manifest default, which the backend author writes and which therefore
+/// cannot be allowed to widen the sandbox. (A manifest declaring one is
+/// refused at publication and scrubbed at load; this read stands on its own
+/// so the invariant does not depend on either check.) Because the value is
+/// the user's, it may be
+/// loopback or private, e.g. a local gateway.
+///
+/// The bare host carries no such relaxation; it keeps the gateway's other
+/// ports reachable while they stay public, so no extra port on a local or
+/// private gateway opens up (see
+/// [`check_host_allowed`](crate::wasm::host::check_host_allowed)).
+/// Unparseable or unset values contribute nothing.
+///
+/// Both outcomes are logged. This is the one path that relaxes the sandbox,
+/// so an operator asking later why a backend reached a private address needs
+/// a record of which endpoint was authorized for which backend, and when.
+#[must_use]
+pub fn egress_hosts<P: Product, S: BuildHasher>(
+    backend: &DiscoveredBackend<P>,
+    overrides: &HashMap<String, String, S>,
+) -> Vec<String> {
+    if !backend.options.iter().any(|o| o.name == OPTION_NAME) {
+        return Vec::new();
+    }
+    let Some(value) = overrides.get(OPTION_NAME) else {
+        return Vec::new();
+    };
+    let entries = egress_entries(value);
+    // Log the derived authority, never the configured value: the parser
+    // discards userinfo, so a URL pasted with credentials in it cannot reach
+    // the journal through here.
+    match entries.first() {
+        Some(endpoint) => log::info!(
+            "Backend {}: user-set base_url authorizes egress to {endpoint}, with the SSRF guard relaxed for it",
+            backend.source
+        ),
+        None => log::warn!(
+            "Backend {}: base_url is set but names no host the daemon can read; it authorizes nothing and the backend keeps only its manifest egress",
+            backend.source
+        ),
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{authority, default_port, egress_entries, normalize};
+    use super::{
+        HashMap, OPTION_NAME, authority, canonicalize_override, default_port, egress_entries,
+        egress_hosts, normalize,
+    };
+    use super_engine_spec::test_product::TestProduct;
 
     /// The form a backend is handed. Everything it may stop parsing for is
     /// asserted here, since a backend reading the value has only this
@@ -427,5 +536,78 @@ mod tests {
             egress_entries("http://192.168.1.50"),
             vec!["192.168.1.50:80".to_string(), "192.168.1.50".to_string()]
         );
+    }
+
+    /// A discovered backend declaring the `base_url` option, or not.
+    fn backend(declares_base_url: bool) -> crate::backends::DiscoveredBackend<TestProduct> {
+        let root = tempfile::tempdir().unwrap();
+        let option = if declares_base_url {
+            "[[options]]\nname = \"base_url\"\nlabel = \"Endpoint\"\ndescription = \"Base URL.\"\ntype = \"string\"\n"
+        } else {
+            ""
+        };
+        let dir = root.path().join("gateway");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("backend.toml"),
+            format!(
+                "[backend]\nsource = \"github.com/x/gateway\"\nname = \"Gateway\"\nversion = \"0.1.0\"\n\
+                 kind = \"wasm\"\nentrypoint = \"g.wasm\"\ncontract = \"v1\"\ndescription = \"Test.\"\n\n\
+                 [network]\nallowed_hosts = [\"api.example.com\"]\n\n{option}\n\
+                 [[models]]\nname = \"m\"\nmultilingual = false\nprimary_language = \"en\"\n\
+                 supported_languages = [\"en\"]\nsupported_devices = [\"none\"]\n"
+            ),
+        )
+        .unwrap();
+        let (mut found, _) = crate::backends::discover::<TestProduct>(root.path());
+        assert_eq!(found.len(), 1, "the fixture manifest is valid");
+        found.remove(0)
+    }
+
+    fn overrides(value: &str) -> HashMap<String, String> {
+        HashMap::from([(OPTION_NAME.to_string(), value.to_string())])
+    }
+
+    /// The value a backend dials and the one egress authorizes are the same
+    /// canonical form, and it is the user's override that decides both.
+    #[test]
+    fn an_override_is_canonicalized_and_authorizes_its_endpoint() {
+        let backend = backend(true);
+        let mut set = overrides("  gateway.local:8080 ");
+        canonicalize_override(&backend, &mut set).unwrap();
+        let canonical = set[OPTION_NAME].clone();
+        assert_eq!(canonical, normalize("gateway.local:8080").unwrap());
+        assert_eq!(egress_hosts(&backend, &set), egress_entries(&canonical));
+        assert!(!egress_hosts(&backend, &set).is_empty());
+    }
+
+    /// Whitespace alone is no value: it is dropped, and authorizes nothing.
+    #[test]
+    fn a_blank_override_is_dropped() {
+        let backend = backend(true);
+        let mut set = overrides("   ");
+        canonicalize_override(&backend, &mut set).unwrap();
+        assert!(set.is_empty());
+        assert!(egress_hosts(&backend, &set).is_empty());
+    }
+
+    /// A value no host can be read from fails, naming the setting by its
+    /// label, rather than falling back to the backend's built-in endpoint.
+    #[test]
+    fn an_unreadable_override_fails_by_its_label() {
+        let backend = backend(true);
+        let err = canonicalize_override(&backend, &mut overrides("http://")).unwrap_err();
+        assert_eq!(err.to_string(), "Endpoint is not a valid URL.");
+    }
+
+    /// A backend that does not declare the option is untouched by a stored
+    /// value, and gains no egress from it.
+    #[test]
+    fn an_undeclared_option_is_inert() {
+        let backend = backend(false);
+        let mut set = overrides("http://");
+        canonicalize_override(&backend, &mut set).unwrap();
+        assert_eq!(set[OPTION_NAME], "http://");
+        assert!(egress_hosts(&backend, &set).is_empty());
     }
 }
