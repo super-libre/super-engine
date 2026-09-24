@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: GPL-3.0-only
+name: Registry index (PR preview)
+
+# When a PR changes a product's registry (or the types that shape the index),
+# build the index.json the same way build-index.yml does on `main` — but
+# instead of publishing to gh-pages, surface it for manual review: a
+# job-summary table of the indexed backends plus the full index.json as a
+# downloadable artifact. This lets a reviewer confirm a newly-added backend
+# resolves from its release and lands in the index *before* the change is
+# merged or anything is published.
+#
+# A product calls this from its own registry-index-pr.yml, which owns the
+# triggers and the concurrency group:
+#
+#   jobs:
+#     preview:
+#       uses: super-libre/super-engine/.github/workflows/registry-index-pr.yml@<rev>
+#       with:
+#         indexer: super-stt-indexer
+#
+# Pin <rev> to the same super-engine rev as the product's Cargo.toml.
+
+on:
+  workflow_call:
+    inputs:
+      indexer:
+        description: The product's indexer package. Its binary has the same name.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: registry-index-pr-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build indexer
+        env:
+          INDEXER: ${{ inputs.indexer }}
+        run: cargo build --release -p "$INDEXER"
+
+      # Build a fresh index from the PR's registry.toml against the backends'
+      # GitHub releases. No --prior-index: every non-removed entry must resolve
+      # from its own release, so a newly-added backend only appears if it is
+      # actually installable (release present, backend.toml asset valid, source
+      # matches). Entries with no resolvable release are logged and omitted; the
+      # indexer only exits non-zero on a real registry error (e.g. duplicate
+      # sources), which correctly fails this check.
+      - name: Build candidate index.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INDEXER: ${{ inputs.indexer }}
+        run: |
+          mkdir -p out
+          "target/release/$INDEXER" build \
+            --registry registry/registry.toml \
+            --out out/index.json
+
+      - name: Summarize indexed backends
+        run: |
+          {
+            echo '## Candidate registry index'
+            echo
+            echo 'Built from `registry/registry.toml` against current GitHub releases — **not published**. Confirm a newly-added backend appears below before merging.'
+            echo
+            count=$(jq '.backends | length' out/index.json)
+            echo "### Indexed backends ($count)"
+            echo
+            echo '| id | source | version | tag | online |'
+            echo '| --- | --- | --- | --- | --- |'
+            jq -r '.backends[] | "| \(.id) | `\(.source)` | \(.version) | \(.tag) | \(.online) |"' out/index.json
+            echo
+
+            # Registry entries that did NOT make it into the index — no resolvable
+            # release yet, or marked `removed`. If a newly-added backend lands
+            # here, publish its release first.
+            comm -23 \
+              <(grep -oP '^\s*\[\K[^]]+' registry/registry.toml | sort -u) \
+              <(jq -r '.backends[].id' out/index.json | sort -u) > missing.txt || true
+            if [ -s missing.txt ]; then
+              echo '### Registry entries not in the index'
+              echo
+              echo 'No resolvable release yet, or marked `removed`:'
+              echo
+              sed 's/^/- `/; s/$/`/' missing.txt
+              echo
+            fi
+
+            echo '<details><summary>Full index.json</summary>'
+            echo
+            echo '```json'
+            cat out/index.json
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload index.json
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-index-json
+          path: out/index.json
+          if-no-files-found: error
