@@ -343,12 +343,11 @@ impl TestDaemon {
     async fn wait_until_ready(&self) {
         let deadline = Instant::now() + READY_TIMEOUT;
         while Instant::now() < deadline {
-            // Any answer will do, a `401` included: it is the listener that
-            // has to be up, not a session.
-            if send(self.product, &self.socket, Method::GET, "/ping", None, None)
-                .await
-                .is_ok()
-            {
+            // A connection, not a request. A request would be counted against
+            // this process's rate-limit window, which a test of that limit
+            // counts itself; a connection the listener has accepted is proof
+            // enough that it is up.
+            if UnixStream::connect(&self.socket).await.is_ok() {
                 return;
             }
             tokio::time::sleep(READY_POLL).await;
