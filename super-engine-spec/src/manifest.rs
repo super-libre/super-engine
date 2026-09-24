@@ -490,6 +490,62 @@ impl Opt {
         self.accepts_the_type(value) && self.is_in_range(value) && self.is_a_choice(value)
     }
 
+    /// Why this option will not take `value`, for a user to read: not of the
+    /// declared type, outside the declared bounds, or off the closed set of
+    /// `choices`. The checks of [`accepts`](Self::accepts), with a sentence
+    /// for whichever failed first.
+    ///
+    /// The three are told apart because they are different mistakes. A value
+    /// of the wrong type is one the backend cannot read, one off the dropdown
+    /// is one it never offered, and one outside a range is neither. Saying
+    /// "accepts one of:" to someone who typed `warm` into a numeric field would
+    /// list the numbers and leave them to infer why, and an option with no
+    /// `choices` has no list to offer at all.
+    ///
+    /// A `step` is not checked. It is the grid a slider lands on, not a bound:
+    /// a value between two notches is still inside the range the option
+    /// declared it could take.
+    ///
+    /// Whether the value can be delivered at all is
+    /// [`permits_shape`](Self::permits_shape)'s question, not this one's.
+    ///
+    /// # Errors
+    /// The sentence naming the option and what it takes.
+    pub fn permits_value(&self, value: &str) -> Result<(), String> {
+        let name = &self.name;
+        if !self.accepts_the_type(value) {
+            let wanted = match self.declared_type() {
+                OptionType::Integer => "an integer",
+                OptionType::Float => "a number",
+                OptionType::Bool => "`true` or `false`",
+                OptionType::String => "text",
+            };
+            return Err(format!("option `{name}` takes {wanted}, not {value:?}"));
+        }
+        if !self.is_in_range(value) {
+            let bound = match (self.min, self.max) {
+                (Some(low), Some(high)) => format!("between {low} and {high}"),
+                (Some(low), None) => format!("{low} or more"),
+                (None, Some(high)) => format!("{high} or less"),
+                // `is_in_range` refuses nothing when neither bound is declared.
+                (None, None) => String::new(),
+            };
+            return Err(format!(
+                "option `{name}` takes a value {bound}, not {value:?}"
+            ));
+        }
+        if self.is_a_choice(value) {
+            return Ok(());
+        }
+        let offered = self
+            .choices
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("option `{name}` accepts one of: {offered}"))
+    }
+
     /// Whether `value` lies within the declared bounds, inclusive.
     ///
     /// An option declaring neither bound accepts every value of its type, so
@@ -2174,6 +2230,90 @@ mod tests {
         for value in ["inf", "-inf", "infinity", "NaN", "nan"] {
             assert!(!OptionType::Float.accepts(value), "{value} was accepted");
         }
+    }
+
+    fn numeric(name: &str, r#type: OptionType) -> Opt {
+        Opt {
+            name: name.to_owned(),
+            label: None,
+            description: "an option".to_owned(),
+            r#type: Some(r#type),
+            default: None,
+            choices: Vec::new(),
+            min: None,
+            max: None,
+            step: None,
+            required: false,
+        }
+    }
+
+    /// A refusal names the type in words a user reads, not the manifest's type
+    /// token.
+    #[test]
+    fn a_wrong_type_is_refused_in_words() {
+        let refusal = |t, v| numeric("speed", t).permits_value(v).unwrap_err();
+        assert_eq!(
+            refusal(OptionType::Integer, "fast"),
+            "option `speed` takes an integer, not \"fast\""
+        );
+        assert_eq!(
+            refusal(OptionType::Float, "fast"),
+            "option `speed` takes a number, not \"fast\""
+        );
+        assert_eq!(
+            refusal(OptionType::Bool, "yes"),
+            "option `speed` takes `true` or `false`, not \"yes\""
+        );
+    }
+
+    /// A value out of range is told the range, however much of it is declared.
+    #[test]
+    fn a_value_out_of_range_is_told_the_range() {
+        let mut o = numeric("speed", OptionType::Float);
+        o.min = Some(0.5);
+        o.max = Some(2.0);
+        assert_eq!(
+            o.permits_value("3").unwrap_err(),
+            "option `speed` takes a value between 0.5 and 2, not \"3\""
+        );
+        assert_eq!(o.permits_value("1.5"), Ok(()));
+
+        o.max = None;
+        assert_eq!(
+            o.permits_value("0.1").unwrap_err(),
+            "option `speed` takes a value 0.5 or more, not \"0.1\""
+        );
+        o.min = None;
+        o.max = Some(2.0);
+        assert_eq!(
+            o.permits_value("9").unwrap_err(),
+            "option `speed` takes a value 2 or less, not \"9\""
+        );
+    }
+
+    /// A value off a closed set is offered the set.
+    #[test]
+    fn a_value_off_the_list_is_offered_the_list() {
+        let mut o = numeric("style", OptionType::String);
+        o.choices = vec![
+            OptionDefault::String("terse".to_owned()),
+            OptionDefault::String("chatty".to_owned()),
+        ];
+        assert_eq!(
+            o.permits_value("warm").unwrap_err(),
+            "option `style` accepts one of: terse, chatty"
+        );
+        assert_eq!(o.permits_value("terse"), Ok(()));
+    }
+
+    /// A step is the grid a slider lands on, not a bound.
+    #[test]
+    fn a_value_between_steps_is_taken() {
+        let mut o = numeric("speed", OptionType::Float);
+        o.min = Some(0.0);
+        o.max = Some(1.0);
+        o.step = Some(0.25);
+        assert_eq!(o.permits_value("0.3"), Ok(()));
     }
 
     /// Both halves of what an option accepts, and the reason they are separate:
