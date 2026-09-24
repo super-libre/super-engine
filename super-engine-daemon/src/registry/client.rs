@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use parking_lot::RwLock;
@@ -45,6 +46,11 @@ pub struct Client<M> {
     cache_path: PathBuf,
     ttl: Duration,
     state: Arc<RwLock<Option<Cached<M>>>>,
+    /// Held across a fetch, so only one is in flight at a time.
+    fetching: Arc<tokio::sync::Mutex<()>>,
+    /// How many fetches have finished, so a refresh that waited on one can
+    /// tell it happened.
+    fetches: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -73,6 +79,8 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
             cache_path,
             ttl,
             state: Arc::default(),
+            fetching: Arc::default(),
+            fetches: Arc::default(),
         }
     }
 
@@ -131,11 +139,24 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
     /// cache on first call (so the daemon can start cold and still serve
     /// the prior index without a successful network fetch).
     ///
+    /// Concurrent refreshes coalesce: one fetches, and the others wait for it
+    /// and answer with what it fetched. A refresh button pressed twice, or
+    /// several clients refreshing at once, is one request to the registry.
+    /// Should that fetch fail, the next waiter tries again.
+    ///
     /// # Errors
     /// Returns a `ClientError` on network failure, I/O error, or JSON parse error.
     /// Returns `ClientError::Unavailable` if the server answers with an unsolicited
     /// `304 Not Modified` and there is no cached index to fall back on.
     pub async fn refresh(&self) -> Result<Index<M>, ClientError> {
+        let finished_before = self.fetches.load(Ordering::Acquire);
+        let _fetching = self.fetching.lock().await;
+        if self.fetches.load(Ordering::Acquire) != finished_before
+            && let Some(c) = self.state.read().as_ref()
+        {
+            return Ok(c.index.clone());
+        }
+
         // Load from disk if memory is empty.
         let etag = {
             let need_load = self.state.read().is_none();
@@ -178,6 +199,7 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
                 return Err(ClientError::Unavailable);
             };
             c.fetched_at = SystemTime::now();
+            self.fetches.fetch_add(1, Ordering::Release);
             return Ok(c.index.clone());
         }
 
@@ -197,6 +219,7 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
             fetched_at: SystemTime::now(),
         };
         self.state.write().replace(cached.clone());
+        self.fetches.fetch_add(1, Ordering::Release);
         // Serialize + atomic-write the cache off the async worker (Tier 3 #3).
         let cache_path = self.cache_path.clone();
         let etag = cached.etag.clone();
@@ -290,6 +313,45 @@ mod tests {
         let idx = c.refresh().await.unwrap();
         assert_eq!(idx.schema_version, 1);
         assert!(dir.path().join("c.json").exists());
+    }
+
+    /// Two refreshes at once are one request: the second waits for the
+    /// first's fetch and answers with it.
+    #[tokio::test]
+    async fn concurrent_refreshes_share_one_fetch() {
+        super_engine_forge::install_crypto_provider();
+        let mut s = mockito::Server::new_async().await;
+        let fetch = s
+            .mock("GET", "/idx.json")
+            .with_status(200)
+            // Slow enough that the second refresh starts while the first is
+            // still in flight.
+            .with_chunked_body(|w| {
+                std::thread::sleep(Duration::from_millis(200));
+                w.write_all(fixture_index().as_bytes())
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let dir = tempdir().unwrap();
+        let c = client(format!("{}/idx.json", s.url()), dir.path().join("c.json"));
+
+        let (a, b) = tokio::join!(c.refresh(), c.refresh());
+        assert_eq!(a.unwrap().schema_version, 1);
+        assert_eq!(b.unwrap().schema_version, 1);
+        fetch.assert_async().await;
+
+        // Coalescing is for refreshes that overlap. One asked for after the
+        // fetch finished fetches again.
+        let again = s
+            .mock("GET", "/idx.json")
+            .with_status(200)
+            .with_body(fixture_index())
+            .expect(1)
+            .create_async()
+            .await;
+        c.refresh().await.unwrap();
+        again.assert_async().await;
     }
 
     #[tokio::test]
