@@ -335,3 +335,81 @@ fn an_instance_is_held_by_one_backend_at_a_time() {
     );
     drop(other);
 }
+
+/// A report is passed on when it changes, and only then: the status is polled
+/// twice a second, and a backend repeats itself between steps.
+#[test]
+fn a_load_report_is_passed_on_only_when_it_changes() {
+    let start = std::time::Instant::now();
+    let mut watch = LoadWatch::new(start);
+    let at = |step: &str, p: f32| {
+        Some(LoadProgress {
+            step: Some(step.to_string()),
+            progress: Some(p),
+            ..LoadProgress::default()
+        })
+    };
+    assert!(
+        watch.observe(None, start).is_none(),
+        "nothing said, nothing passed on"
+    );
+    assert_eq!(
+        watch.observe(at("building_kernels", 0.1), start),
+        at("building_kernels", 0.1)
+    );
+    assert!(
+        watch.observe(at("building_kernels", 0.1), start).is_none(),
+        "a repeat"
+    );
+    assert_eq!(
+        watch.observe(at("building_kernels", 0.2), start),
+        at("building_kernels", 0.2)
+    );
+}
+
+/// The rule that turns a hung load from ten minutes into two: once a backend
+/// has reported progress, two minutes without its report moving fails the
+/// load. Every move restarts the clock, so a slow load that keeps moving is
+/// never cut off.
+#[test]
+fn a_load_that_stops_moving_is_stalled_and_a_slow_one_is_not() {
+    let start = std::time::Instant::now();
+    let later = |s: u64| start + Duration::from_secs(s);
+    let at = |p: f32| {
+        Some(LoadProgress {
+            step: Some("building_kernels".to_string()),
+            progress: Some(p),
+            ..LoadProgress::default()
+        })
+    };
+    let mut watch = LoadWatch::new(start);
+    watch.observe(at(0.1), start);
+    assert!(!watch.stalled(later(119)));
+    watch.observe(at(0.2), later(119));
+    assert!(
+        !watch.stalled(later(200)),
+        "moving at 119 s restarts the clock"
+    );
+    assert!(
+        watch.stalled(later(239)),
+        "two minutes still after the last move"
+    );
+    assert_eq!(watch.last_position(), " (building_kernels, at 20%)");
+}
+
+/// A backend that never reports progress is not stalled for keeping quiet,
+/// even if it names a step: it is held to the flat load budget instead.
+#[test]
+fn a_backend_that_reports_no_progress_never_stalls() {
+    let start = std::time::Instant::now();
+    let mut watch = LoadWatch::new(start);
+    watch.observe(
+        Some(LoadProgress {
+            step: Some("loading_weights".to_string()),
+            ..LoadProgress::default()
+        }),
+        start,
+    );
+    assert!(!watch.reports_progress());
+    assert!(!watch.stalled(start + Duration::from_secs(3600)));
+}

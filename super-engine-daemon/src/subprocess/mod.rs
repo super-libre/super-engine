@@ -30,6 +30,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use log::info;
 use super_engine_protocol::ProductSpec;
+use super_engine_protocol::models::load_progress::LoadProgress;
 use super_engine_spec::manifest::Device;
 use tokio::net::UnixStream;
 
@@ -130,6 +131,10 @@ pub struct Launch<'a> {
     /// The already-formed secret/option header pairs to inject on every
     /// request.
     pub context_headers: Vec<(String, String)>,
+    /// Called with the backend's own report of its load each time it changes:
+    /// its phase, its step, how far through the step it is. See
+    /// [`LoadProgress`]. A daemon passes it on to its clients.
+    pub on_load_progress: Option<&'a (dyn Fn(LoadProgress) + Send + Sync)>,
 }
 
 /// Everything a platform spawner needs to start one backend instance.
@@ -171,6 +176,7 @@ impl SubprocessBackend {
             devices,
             device_pref,
             context_headers,
+            on_load_progress,
         } = launch;
 
         // Socket under the runtime dir (pathname socket — survives
@@ -249,7 +255,9 @@ impl SubprocessBackend {
         };
 
         backend.wait_for_ping(Duration::from_secs(30)).await?;
-        backend.load(model, provider, device_pref).await?;
+        backend
+            .load(model, provider, device_pref, on_load_progress)
+            .await?;
         Ok(backend)
     }
 
@@ -272,8 +280,21 @@ impl SubprocessBackend {
     }
 
     /// `POST /v1/load` then poll `/v1/status` until `ready` (or `error`),
-    /// capturing the device label the backend reports.
-    async fn load(&mut self, name: &str, provider: Option<&str>, device_pref: &str) -> Result<()> {
+    /// capturing the device label the backend reports, and passing each change
+    /// in the backend's own account of the load to `on_load_progress`.
+    ///
+    /// How long a load may take depends on whether the backend reports
+    /// progress. One that does is held to [`STALL_TIMEOUT`] without its
+    /// report moving, and to nothing else, so a slow first load on a slow
+    /// card is not cut off while it is visibly working. One that does not
+    /// gets [`LOAD_TIMEOUT`] in all.
+    async fn load(
+        &mut self,
+        name: &str,
+        provider: Option<&str>,
+        device_pref: &str,
+        on_load_progress: Option<&(dyn Fn(LoadProgress) + Send + Sync)>,
+    ) -> Result<()> {
         let body = serde_json::to_vec(&load_body(name, provider, device_pref))?;
         let (status, resp) = self
             .request("POST", "/v1/load", &json_headers(), body)
@@ -284,7 +305,8 @@ impl SubprocessBackend {
             String::from_utf8_lossy(&resp)
         );
 
-        let deadline = std::time::Instant::now() + LOAD_TIMEOUT;
+        let started = std::time::Instant::now();
+        let mut watch = LoadWatch::new(started);
         loop {
             let (_, resp) = self
                 .request("GET", "/v1/status", &[], Vec::new())
@@ -294,6 +316,12 @@ impl SubprocessBackend {
                 })?;
             let json: serde_json::Value = serde_json::from_slice(&resp)?;
             let state = json.get("state").and_then(|v| v.as_str());
+            let now = std::time::Instant::now();
+            if let Some(report) = watch.observe(LoadProgress::from_status(&json), now)
+                && let Some(on_load_progress) = on_load_progress
+            {
+                on_load_progress(report);
+            }
             match state {
                 Some("ready") => {
                     let device = json.get("device").and_then(|v| v.as_str()).unwrap_or("?");
@@ -309,7 +337,14 @@ impl SubprocessBackend {
                 ),
                 _ => {}
             }
-            if std::time::Instant::now() >= deadline {
+            if watch.stalled(now) {
+                return Err(self.load_failure(&format!(
+                    "stopped making progress: its load has not moved in {} seconds{}",
+                    STALL_TIMEOUT.as_secs(),
+                    watch.last_position()
+                )));
+            }
+            if !watch.reports_progress() && now.duration_since(started) >= LOAD_TIMEOUT {
                 return Err(self.load_failure(&format!(
                     "did not finish loading within {} minutes, and still reports `{}`",
                     LOAD_TIMEOUT.as_secs() / 60,
@@ -462,12 +497,87 @@ impl Drop for SubprocessBackend {
     }
 }
 
-/// How long a load may take before the daemon gives up on it.
+/// How long a load may take before the daemon gives up on it, when the
+/// backend does not report its progress.
 ///
 /// Generous on purpose: a backend that compiles its GPU kernels at runtime
 /// does it during the load, which can take minutes on a cold cache, and
-/// `ready` is what the daemon starts sending requests against.
+/// `ready` is what the daemon starts sending requests against. Without
+/// progress, a stalled load and a slow one look the same, so this is the only
+/// bound there is.
 const LOAD_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// How long a load that reports progress may go without it moving.
+///
+/// The contract asks a backend to move `step` or `progress` at least once a
+/// minute while it works, and this is twice that. Measured on a cold first
+/// load (voxtral on an RTX 3090), the longest healthy gap was 3 s on CUDA and
+/// 1.6 s on Vulkan when compiled kernels are counted with tuning results, and
+/// 23 s when only tuning results are; a slower card stretches every gap.
+const STALL_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// What a load's status polls have seen of the backend's own account of its
+/// load, to tell a stalled load from a slow one.
+struct LoadWatch {
+    /// The last report, to tell a change from a repeat.
+    last: Option<LoadProgress>,
+    /// When the report last changed, or the load started.
+    moved_at: std::time::Instant,
+    /// Whether the backend has reported `progress` during this load. Only
+    /// then does its standing still mean anything: a backend that never
+    /// reports progress is not stalled for keeping quiet.
+    reports_progress: bool,
+}
+
+impl LoadWatch {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            last: None,
+            moved_at: now,
+            reports_progress: false,
+        }
+    }
+
+    /// Take one poll's report, returning it when it differs from the last.
+    fn observe(
+        &mut self,
+        report: Option<LoadProgress>,
+        now: std::time::Instant,
+    ) -> Option<LoadProgress> {
+        if report == self.last {
+            return None;
+        }
+        self.moved_at = now;
+        self.reports_progress |= report.as_ref().is_some_and(|r| r.progress.is_some());
+        self.last.clone_from(&report);
+        report
+    }
+
+    fn reports_progress(&self) -> bool {
+        self.reports_progress
+    }
+
+    /// Whether the load has stopped moving: the backend reported progress,
+    /// and then nothing it reports has changed for [`STALL_TIMEOUT`].
+    fn stalled(&self, now: std::time::Instant) -> bool {
+        self.reports_progress && now.duration_since(self.moved_at) >= STALL_TIMEOUT
+    }
+
+    /// Where the load was when it stopped, for the error: `" (building_kernels,
+    /// at 45%)"`, or nothing when the backend said too little to name it.
+    fn last_position(&self) -> String {
+        let Some(last) = &self.last else {
+            return String::new();
+        };
+        let step = last.step.as_deref().or(last.phase.as_deref());
+        match (step, last.progress) {
+            (Some(step), Some(p)) => format!(" ({step}, at {:.0}%)", p * 100.0),
+            (Some(step), None) => format!(" ({step})"),
+            (None, Some(p)) => format!(" (at {:.0}%)", p * 100.0),
+            (None, None) => String::new(),
+        }
+    }
+}
 
 /// The task driving one connection to a backend. Dropping it closes the
 /// connection.

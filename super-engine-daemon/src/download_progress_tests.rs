@@ -329,6 +329,78 @@ async fn a_broadcast_publishes_the_snapshot_on_the_bus() {
     assert!(payload["timestamp"].is_string());
 }
 
+/// While the backend loads, the bar above sits at 100% and the status at
+/// `loading_model`, so the backend's own report is the only thing moving. Each
+/// change to it has to go out, or the card shows "Building kernels 0%" until
+/// the model is ready.
+#[tokio::test]
+async fn each_step_of_a_backends_load_is_published() {
+    let bus = Arc::new(EventBus::new());
+    let mut rx = bus.subscribe(Topic::DownloadProgress);
+    let tracker = stage_tracker("m", 1).with_event_bus(bus.clone());
+    tracker.mark_loading();
+    tracker.broadcast_progress();
+    let (_, first) = rx.recv_json().await.expect("the loading tick");
+    assert!(first.get("load").is_none(), "nothing reported yet");
+
+    let step = |step: &str, progress: f32| LoadProgress {
+        phase: Some("initial_setup".to_string()),
+        step: Some(step.to_string()),
+        progress: Some(progress),
+    };
+    for (name, fraction) in [
+        ("loading_weights", 0.2),
+        ("building_kernels", 0.0),
+        ("building_kernels", 0.5),
+    ] {
+        tracker.set_load_progress(step(name, fraction));
+        tracker.broadcast_progress();
+        let (_, tick) = rx.recv_json().await.expect("a load tick");
+        assert_eq!(tick["status"], "loading_model");
+        assert_eq!(tick["load"]["phase"], "initial_setup");
+        assert_eq!(tick["load"]["step"], name);
+        assert!((tick["load"]["progress"].as_f64().unwrap() - f64::from(fraction)).abs() < 1e-6);
+    }
+}
+
+/// Progress finer than a percentage point waits, as the download bar's does:
+/// a backend reporting every tuning result would otherwise publish hundreds of
+/// ticks nobody can see the difference between.
+#[test]
+fn load_progress_below_a_point_is_not_republished() {
+    let tracker = tracker("m", 1);
+    tracker.mark_loading();
+    let at = |p: f32| LoadProgress {
+        step: Some("building_kernels".to_string()),
+        progress: Some(p),
+        ..LoadProgress::default()
+    };
+    tracker.set_load_progress(at(0.500));
+    tracker.broadcast_progress();
+    tracker.set_load_progress(at(0.505));
+    tracker.broadcast_progress();
+    assert_eq!(
+        tracker
+            .last_broadcast_load
+            .read()
+            .as_ref()
+            .and_then(|l| l.progress),
+        Some(0.500),
+        "half a point is not published"
+    );
+    tracker.set_load_progress(at(0.515));
+    tracker.broadcast_progress();
+    assert_eq!(
+        tracker
+            .last_broadcast_load
+            .read()
+            .as_ref()
+            .and_then(|l| l.progress),
+        Some(0.515),
+        "a full point is"
+    );
+}
+
 /// The stages provision independently, so one slot per stage: a
 /// second stage's download must not evict the first's —
 /// which is what left the evicted one's progress unreportable and its

@@ -23,6 +23,7 @@ use chrono::Utc;
 use log::{info, warn};
 use parking_lot::RwLock;
 use serde::Serialize;
+use super_engine_protocol::models::load_progress::LoadProgress;
 
 use crate::events::CoreEvents;
 
@@ -63,7 +64,8 @@ pub mod status {
     pub const VERIFYING: &str = "verifying";
     /// Bytes coming off the network.
     pub const DOWNLOADING: &str = "downloading";
-    /// Files all present; the backend is loading the weights.
+    /// Files all present; the backend is loading the model. The payload's
+    /// `load` says what the backend reports of it, when it reports anything.
     pub const LOADING_MODEL: &str = "loading_model";
     /// Terminal: the model is loaded.
     pub const COMPLETED: &str = "completed";
@@ -93,6 +95,11 @@ pub struct Progress<S> {
     /// Failure detail, present only when `status` is [`status::ERROR`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The backend's own account of the load, once `status` is
+    /// [`status::LOADING_MODEL`] and the backend has said anything. See
+    /// [`LoadProgress`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<LoadProgress>,
 }
 
 /// Progress of one model load: its files, the bytes of the current one, and
@@ -118,6 +125,9 @@ pub struct DownloadProgressTracker<S> {
     /// Failure detail set by [`Self::mark_error`]; included in the
     /// `download_progress` payload so a client can show why a switch failed.
     pub error: Arc<RwLock<Option<String>>>,
+    /// What the backend last reported of its load. Set by
+    /// [`Self::set_load_progress`].
+    pub load: Arc<RwLock<Option<LoadProgress>>>,
     pub started_at: Instant,
     pub started_at_str: String,
     pub cancelled: Arc<AtomicBool>,
@@ -149,6 +159,9 @@ pub struct DownloadProgressTracker<S> {
     /// (which only fires on increases). Initialized to `usize::MAX`
     /// so the very first broadcast also fires.
     last_broadcast_file_index: AtomicUsize,
+    /// The `load` we most recently broadcast. A backend's report changes while
+    /// the percentage above sits at 100, so it is gated on its own.
+    last_broadcast_load: RwLock<Option<LoadProgress>>,
 }
 
 impl<S: Slot> DownloadProgressTracker<S> {
@@ -173,6 +186,7 @@ impl<S: Slot> DownloadProgressTracker<S> {
             // paint a download bar.
             status: Arc::new(RwLock::new(status::VERIFYING.to_string())),
             error: Arc::new(RwLock::new(None)),
+            load: Arc::new(RwLock::new(None)),
             started_at: Instant::now(),
             started_at_str: Utc::now().to_rfc3339(),
             cancelled,
@@ -181,6 +195,7 @@ impl<S: Slot> DownloadProgressTracker<S> {
             last_broadcast_status: Arc::new(RwLock::new(String::new())),
             last_broadcast_total_bytes: AtomicU64::new(0),
             last_broadcast_file_index: AtomicUsize::new(usize::MAX),
+            last_broadcast_load: RwLock::new(None),
         }
     }
 
@@ -244,6 +259,7 @@ impl<S: Slot> DownloadProgressTracker<S> {
             started_at: self.started_at_str.clone(),
             eta_seconds,
             error: self.error.read().clone(),
+            load: self.load.read().clone(),
         }
     }
 
@@ -278,8 +294,17 @@ impl<S: Slot> DownloadProgressTracker<S> {
         // throttle arm unchanged).
         let file_index_changed =
             self.last_broadcast_file_index.load(Ordering::Relaxed) != progress.file_index;
+        let load_changed = load_moved(
+            self.last_broadcast_load.read().as_ref(),
+            progress.load.as_ref(),
+        );
 
-        if status_changed || percentage_crossed || total_bytes_changed || file_index_changed {
+        if status_changed
+            || percentage_crossed
+            || total_bytes_changed
+            || file_index_changed
+            || load_changed
+        {
             self.last_broadcast_percentage
                 .store(current_percentage, Ordering::Relaxed);
             self.last_broadcast_status
@@ -289,6 +314,7 @@ impl<S: Slot> DownloadProgressTracker<S> {
                 .store(progress.total_bytes, Ordering::Relaxed);
             self.last_broadcast_file_index
                 .store(progress.file_index, Ordering::Relaxed);
+            self.last_broadcast_load.write().clone_from(&progress.load);
 
             if let Some(ref events) = self.events {
                 let mut payload =
@@ -369,6 +395,12 @@ impl<S: Slot> DownloadProgressTracker<S> {
         );
     }
 
+    /// Record what the backend reports of its load, replacing what it
+    /// reported before. The caller broadcasts.
+    pub fn set_load_progress(&self, load: LoadProgress) {
+        *self.load.write() = Some(load);
+    }
+
     pub fn mark_completed(&self) {
         *self.status.write() = status::COMPLETED.to_string();
         info!("Download completed for model: {}", self.model_name);
@@ -378,6 +410,25 @@ impl<S: Slot> DownloadProgressTracker<S> {
         *self.status.write() = status::ERROR.to_string();
         *self.error.write() = Some(error.to_string());
         warn!("Download error for model {}: {}", self.model_name, error);
+    }
+}
+
+/// Whether a backend's load report has changed enough to publish: a new phase
+/// or step, progress appearing or going away, or progress moving by a
+/// percentage point. Finer movement waits for the next point, as the download
+/// bar's does.
+fn load_moved(last: Option<&LoadProgress>, now: Option<&LoadProgress>) -> bool {
+    match (last, now) {
+        (None, None) => false,
+        (Some(last), Some(now)) => {
+            last.phase != now.phase
+                || last.step != now.step
+                || match (last.progress, now.progress) {
+                    (Some(a), Some(b)) => (a - b).abs() >= 0.01,
+                    (a, b) => a.is_some() != b.is_some(),
+                }
+        }
+        _ => true,
     }
 }
 
