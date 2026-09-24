@@ -228,6 +228,64 @@ fn gpu_host_to_wire() -> GpuHostInfo {
     }
 }
 
+/// Turn the user's `cpu`/`gpu` preference into the accelerator the backend is
+/// told to load on.
+///
+/// The daemon knows which it is — it chose the asset — so it sends the
+/// concrete value rather than forwarding the preference. A binary carrying
+/// several runtimes needs this to pick; one carrying a single runtime ignores
+/// it, since the contract has always been "anything that is not `cpu` means
+/// use the accelerator".
+///
+/// A dual-runtime asset (`accel = ["cuda", "rocm"]`) cannot be resolved by
+/// list position: [`compat::select`](crate::registry::compat::select) chose this asset
+/// because the *host* can run one of its declared families, not because of
+/// where that family sits in the list, so resolving here has to ask the same
+/// question rather than default to "first declared". `host` is `None` only
+/// when detection itself failed, or when none of the declared entries match
+/// what it reports (should not happen for an asset `compat::select` already
+/// approved, but a stale or hand-edited `installed.json` should still degrade
+/// rather than panic) — both fall back to the list-order heuristic.
+///
+/// Returns the empty string when a `gpu` preference names no accelerator at
+/// all: an install with no record (a local-directory import, or one predating
+/// the record) or a CPU-only asset. `device` carries the resolved accelerator
+/// and nothing else, so with none to name the daemon omits the key rather
+/// than forwarding the preference — an absent `device` is the contract's
+/// auto-select, which is precisely "this daemon does not know which
+/// accelerator this build targets".
+#[must_use]
+pub fn resolve_accel(preference: &str, installed_accel: &[String], host: Option<&Host>) -> String {
+    if preference == "cpu" {
+        return "cpu".to_string();
+    }
+    if let Some(host) = host
+        && let Some(found) = installed_accel.iter().find(|a| host_can_run(host, a))
+    {
+        return found.clone();
+    }
+    installed_accel
+        .iter()
+        .find(|a| *a != "cpu")
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether the host can run `accel`, mirroring the presence checks
+/// `registry::compat` gates asset selection on. Full
+/// sm/gfx/floor compatibility was already proven when the asset was
+/// selected; this only has to tell apart two host-compatible accelerators
+/// declared by the same installed asset.
+fn host_can_run(host: &Host, accel: &str) -> bool {
+    match accel {
+        "cuda" => host.cuda.is_some(),
+        "rocm" => host.rocm.is_some(),
+        "vulkan" => host.vulkan.is_some(),
+        "metal" => host.metal.is_some(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +570,179 @@ mod tests {
             let rejection = device_rejection(&online, device).expect("refused");
             assert!(rejection.contains("remote service"), "{rejection}");
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_accel_tests {
+    use super::{Host, resolve_accel};
+    use crate::registry::host::{CudaHost, MetalHost, RocmHost, VulkanHost};
+
+    fn nvidia_host() -> Host {
+        Host {
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            cuda: Some(CudaHost {
+                compute_capability: 86,
+                runtime_major: 13,
+                cudnn_present: true,
+            }),
+            rocm: None,
+            vulkan: None,
+            metal: None,
+        }
+    }
+
+    fn amd_host() -> Host {
+        Host {
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            cuda: None,
+            rocm: Some(RocmHost {
+                gfx_targets: vec![gpu_probe::GfxTarget::new(11, 0, 0)],
+                version: None,
+            }),
+            vulkan: None,
+            metal: None,
+        }
+    }
+
+    fn metal_host() -> Host {
+        Host {
+            target_triple: "aarch64-apple-darwin".into(),
+            cuda: None,
+            rocm: None,
+            vulkan: None,
+            metal: Some(MetalHost),
+        }
+    }
+
+    /// An asset declaring `["metal", "cpu"]` on a Mac must resolve to metal,
+    /// not fall through to the cpu entry. `host_can_run` is what decides
+    /// that, and a missing arm there is invisible: the function returns
+    /// `false`, the `find` skips metal, and the model silently loads on the
+    /// CPU on every Mac.
+    #[test]
+    fn a_mac_resolves_a_metal_asset_to_metal() {
+        let installed = vec!["metal".to_string(), "cpu".to_string()];
+        assert_eq!(
+            resolve_accel("gpu", &installed, Some(&metal_host())),
+            "metal"
+        );
+        // An explicit CPU preference still wins — the same rule every other
+        // accelerator follows.
+        assert_eq!(resolve_accel("cpu", &installed, Some(&metal_host())), "cpu");
+    }
+
+    /// The converse: a metal asset on a host without Metal must not resolve
+    /// to it.
+    #[test]
+    fn a_non_mac_does_not_resolve_metal() {
+        let installed = vec!["metal".to_string(), "cpu".to_string()];
+        assert_eq!(
+            resolve_accel("gpu", &installed, Some(&nvidia_host())),
+            "metal",
+            "with no host-runnable accel the first non-cpu entry is the fallback"
+        );
+        assert!(!super::host_can_run(&nvidia_host(), "metal"));
+    }
+
+    fn vulkan_only_host() -> Host {
+        Host {
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            cuda: None,
+            rocm: None,
+            vulkan: Some(VulkanHost {
+                api_version: gpu_probe::VulkanVersion::new(1, 3, 0),
+            }),
+            metal: None,
+        }
+    }
+
+    /// The user picks `cpu` or `gpu`; the backend is told which accelerator,
+    /// because a build carrying several runtimes has to be able to choose.
+    #[test]
+    fn a_gpu_preference_resolves_to_the_accel_the_host_can_run() {
+        assert_eq!(
+            resolve_accel("gpu", &["cuda".into()], Some(&nvidia_host())),
+            "cuda"
+        );
+        assert_eq!(
+            resolve_accel("gpu", &["rocm".into()], Some(&amd_host())),
+            "rocm"
+        );
+        assert_eq!(
+            resolve_accel("gpu", &["vulkan".into()], Some(&vulkan_only_host())),
+            "vulkan"
+        );
+    }
+
+    #[test]
+    fn a_cpu_preference_always_resolves_to_cpu() {
+        assert_eq!(
+            resolve_accel("cpu", &["cuda".into()], Some(&nvidia_host())),
+            "cpu"
+        );
+        assert_eq!(resolve_accel("cpu", &[], None), "cpu");
+    }
+
+    /// The bug this pins: `compat::select` chose this asset because the host
+    /// can run one of its declared families, never because of list position.
+    /// An asset declaring `["cuda", "rocm"]` must resolve to whichever the
+    /// *host* actually has — not to `cuda` just because it was declared
+    /// first — or the daemon tells a ROCm-only host to load a runtime it
+    /// cannot run.
+    #[test]
+    fn a_dual_runtime_asset_resolves_by_host_capability_not_list_position() {
+        assert_eq!(
+            resolve_accel("gpu", &["rocm".into(), "cuda".into()], Some(&nvidia_host())),
+            "cuda"
+        );
+        assert_eq!(
+            resolve_accel("gpu", &["cuda".into(), "rocm".into()], Some(&amd_host())),
+            "rocm"
+        );
+    }
+
+    /// Detection failure (`host: None`) degrades to the list-order heuristic
+    /// rather than blocking the load — a `gpu` preference stays meaningful to
+    /// a backend on its own.
+    #[test]
+    fn an_unknown_host_falls_back_to_list_order() {
+        assert_eq!(
+            resolve_accel("gpu", &["cpu".into(), "rocm".into()], None),
+            "rocm"
+        );
+    }
+
+    /// A host that matches none of the asset's declared entries (a stale or
+    /// hand-edited record) also degrades to list order rather than erroring.
+    #[test]
+    fn a_host_matching_nothing_declared_falls_back_to_list_order() {
+        assert_eq!(
+            resolve_accel("gpu", &["rocm".into()], Some(&nvidia_host())),
+            "rocm"
+        );
+    }
+
+    /// No record — a local-directory import, or every install predating the
+    /// record, which is the whole upgrade path. `gpu` is the user's
+    /// preference, and `docs/protocol/backend/contract.md` says `device`
+    /// carries the *resolved accelerator*, never the preference. When the
+    /// daemon cannot resolve one it says nothing rather than something false:
+    /// an omitted `device` is the documented "auto-select" signal, which is
+    /// exactly what "this daemon does not know which accelerator this build
+    /// targets" means.
+    #[test]
+    fn an_unresolvable_gpu_preference_sends_no_device_at_all() {
+        assert_eq!(resolve_accel("gpu", &[], None), "");
+        assert_eq!(
+            resolve_accel("gpu", &[], Some(&nvidia_host())),
+            "",
+            "a host with a GPU still says nothing about what the asset targets"
+        );
+        assert_eq!(
+            resolve_accel("gpu", &["cpu".into()], Some(&nvidia_host())),
+            "",
+            "a CPU-only asset provides no accelerator to name"
+        );
     }
 }
