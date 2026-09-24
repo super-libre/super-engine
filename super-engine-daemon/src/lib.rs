@@ -15,6 +15,8 @@
 //! - [`keyring`]: the system keyring, which holds the session tokens and each
 //!   backend's API credentials.
 //! - [`resource_management`]: the per-client connection cap and rate limit.
+//! - [`language`]: which language a model is asked to work in, and the tags
+//!   the global setting offers.
 //! - [`load_gate`]: one model load at a time per slot, and the newest
 //!   request wins.
 //! - [`http`]: the Unix socket and loopback TCP listeners, what the daemon
@@ -42,6 +44,7 @@ pub mod download_stream;
 pub mod events;
 pub mod http;
 pub mod keyring;
+pub mod language;
 pub mod load_gate;
 pub mod openapi;
 pub mod registry;
