@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # The shared product workflows and actions live here too, so a bump of the
+  # actions they use lands once, for every product that pins this repo.
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
