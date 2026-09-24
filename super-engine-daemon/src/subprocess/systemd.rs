@@ -158,13 +158,22 @@ pub(super) struct Unit {
 const EXIT_UNIT_NOT_LOADED: i32 = 5;
 
 /// Interpret the result of `systemctl --user stop <unit>` for logging.
-fn report_stop(unit: &str, status: std::process::ExitStatus) {
+///
+/// systemctl's own stderr is captured rather than inherited, and repeated only
+/// for a failure this cannot account for. A unit that is already gone is the
+/// goal state, and its "Failed to stop …: Unit … not loaded" in the daemon's
+/// log would read as a failure.
+fn report_stop(unit: &str, output: &std::process::Output) {
+    let status = output.status;
     if status.success() {
         info!("stopped backend unit {unit}");
     } else if status.code() == Some(EXIT_UNIT_NOT_LOADED) {
         info!("backend unit {unit} was already gone");
     } else {
-        warn!("systemctl --user stop {unit} exited with {status}; subprocess may still be running");
+        warn!(
+            "systemctl --user stop {unit} exited with {status}; subprocess may still be running: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 }
 
@@ -194,10 +203,10 @@ impl Unit {
         }
         match tokio::process::Command::new("systemctl")
             .args(["--user", "stop", &self.name])
-            .status()
+            .output()
             .await
         {
-            Ok(status) => report_stop(&self.name, status),
+            Ok(output) => report_stop(&self.name, &output),
             Err(e) => warn!("failed to invoke systemctl to stop {}: {e}", self.name),
         }
     }
@@ -215,9 +224,9 @@ impl Unit {
         }
         match std::process::Command::new("systemctl")
             .args(["--user", "stop", &self.name])
-            .status()
+            .output()
         {
-            Ok(status) => report_stop(&self.name, status),
+            Ok(output) => report_stop(&self.name, &output),
             Err(e) => warn!("failed to invoke systemctl to stop {}: {e}", self.name),
         }
     }
@@ -244,8 +253,13 @@ impl Drop for Unit {
 /// Failures are logged rather than propagated. Every one of them means the
 /// unit is not running, which is what the caller wanted.
 async fn stop_stale_unit(unit: &str) {
+    // Almost always there is no such unit, and systemctl says so on stderr —
+    // "Failed to stop …: Unit … not loaded" — which would land in the
+    // daemon's log on every spawn, reading as a failure. The exit status says
+    // everything this needs.
     let stopped = tokio::process::Command::new("systemctl")
         .args(["--user", "stop", unit])
+        .stderr(std::process::Stdio::null())
         .status()
         .await;
     match stopped {
