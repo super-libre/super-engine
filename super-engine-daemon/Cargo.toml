@@ -49,6 +49,7 @@
     super-engine-spec = { path = "../super-engine-spec" }
     tar = "0.4.46"
     thiserror.workspace = true
+    toml.workspace = true
     tokio = {
         workspace = true,
         features = [

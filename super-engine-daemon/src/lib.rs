@@ -4,6 +4,7 @@
 //!
 //! - [`auth`]: session tokens, the consent dialog, and the guards every
 //!   route sits behind.
+//! - [`config`]: the daemon's `daemon.toml`, and its HTTP surface settings.
 //! - [`backends`]: installed backends — finding them on disk, the models
 //!   they serve, and the runtime policy a manifest is held to at discovery.
 //! - [`download`]: provisioning a model's files before its backend loads it.
@@ -38,6 +39,7 @@
 
 pub mod auth;
 pub mod backends;
+pub mod config;
 pub mod download;
 pub mod download_progress;
 pub mod download_stream;
