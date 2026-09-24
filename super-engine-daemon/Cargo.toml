@@ -58,6 +58,7 @@
             "net",
             "process",
             "rt-multi-thread",
+            "signal",
             "sync",
             "time",
         ]

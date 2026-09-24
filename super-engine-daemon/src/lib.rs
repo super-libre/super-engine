@@ -22,6 +22,7 @@
 //!   it, and which build of a backend to install.
 //! - [`self_update`]: whether the product has a newer release, and which
 //!   installer to offer for it.
+//! - [`shutdown`]: the signals that stop a daemon.
 //! - [`subprocess`] (feature `subprocess`): running a backend shipped as a
 //!   native binary, in a sandbox, over its `/v1` socket.
 //! - [`wasm`] (feature `wasm`): running a backend shipped as a WASM
@@ -43,6 +44,7 @@ pub mod openapi;
 pub mod registry;
 pub mod resource_management;
 pub mod self_update;
+pub mod shutdown;
 #[cfg(feature = "subprocess")]
 pub mod subprocess;
 #[cfg(feature = "wasm")]
