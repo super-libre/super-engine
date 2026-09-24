@@ -22,6 +22,8 @@
 //!   it, and which build of a backend to install.
 //! - [`self_update`]: whether the product has a newer release, and which
 //!   installer to offer for it.
+//! - [`wasm`] (feature `wasm`): running a backend shipped as a WASM
+//!   component, and its realtime WebSocket host.
 //!
 //! Everything named after the product (the keyring service, the consent
 //! helper, the environment variables) comes from the
@@ -39,3 +41,5 @@ pub mod openapi;
 pub mod registry;
 pub mod resource_management;
 pub mod self_update;
+#[cfg(feature = "wasm")]
+pub mod wasm;
