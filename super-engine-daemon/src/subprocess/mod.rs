@@ -158,7 +158,7 @@ impl SubprocessBackend {
     ///
     /// # Errors
     /// Returns an error if this instance — this backend serving this model —
-    /// is already running in this daemon (unload it first), if the socket or
+    /// is already loading or loaded in this daemon, if the socket or
     /// cache directory cannot be made, the binary is missing, the sandbox
     /// refuses to start, the backend does not answer within 30 seconds, or
     /// the load fails.
@@ -195,9 +195,14 @@ impl SubprocessBackend {
         let instance = instance_key(backend_dir, model, max_instance_key(&socket_dir)?);
         let socket = socket_dir.join(format!("{instance}.sock"));
         // Before anything is touched: the socket and the sandbox name are the
-        // running instance's until it is released.
+        // running instance's until it is released. "Loading or loaded",
+        // because a second request for a model whose first load is still in
+        // flight lands here too, and the answer then is to wait.
         let claim = Claim::take(&instance).with_context(|| {
-            format!("{model} is already running as {instance}; unload it before loading it again")
+            format!(
+                "{model} is already loading or loaded as {instance}. Wait for it, or unload it \
+                 before loading it again."
+            )
         })?;
 
         let binary = backend_dir.join(entrypoint);
