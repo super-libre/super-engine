@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: GPL-3.0-only
+name: Install E2E
+description: >
+  Install a product's published release for real, check the installed tree,
+  then uninstall it and check nothing is left. Destructive: run it only on a
+  disposable runner.
+
+# Real installs of real published releases. What actually runs is
+# test-install-e2e.sh next to this file; see its header for the two passes and
+# why the fixture is a published release rather than a tarball built here.
+#
+# A product calls this from its own install-e2e.yml, after checking itself
+# out, since the script runs the product's install.sh and uninstall.sh. That
+# workflow owns the triggers and the channel matrix:
+#
+#   steps:
+#     - uses: actions/checkout@v7
+#     - uses: super-libre/super-engine/.github/actions/install-e2e@<rev>
+#       with:
+#         slug: super-stt
+#         short-name: stt
+#         channel: ${{ matrix.channel }}
+#
+# Pin <rev> to the same super-engine rev as the product's Cargo.toml.
+
+inputs:
+  slug:
+    description: The product's slug, as in super-engine-protocol's Product (super-stt).
+    required: true
+  short-name:
+    description: The product's short name (stt), which names the wrapper the install generates.
+    required: true
+  channel:
+    description: The release channel to install, stable or beta.
+    required: true
+  github-token:
+    description: >
+      Token for the GitHub API. api.github.com allows 60 unauthenticated
+      requests an hour per source IP and runners share addresses. The token
+      lifts that for all three readers of it: the script's own release
+      resolution, install.sh, and the installer itself
+      (super_engine_forge::Github::from_env).
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache dependencies
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-install-e2e-${{ hashFiles('**/Cargo.lock') }}
+
+    # Only the installer is built — the release tarball it installs is the
+    # published one. This needs no apt step: the installer's dependency tree is
+    # reqwest/tokio/clap/tar, with none of the Wayland/xkbcommon/alsa/dbus
+    # libraries the GUI crates pull.
+    - name: Build the installer
+      shell: bash
+      env:
+        SLUG: ${{ inputs.slug }}
+      run: cargo build -p "$SLUG-install"
+
+    # curl, jq, tar, sudo, and `script` (the pty wrapper the harness needs to
+    # put the installer on its sudo escalation path) all ship on the runner.
+    - name: Install, verify, uninstall (${{ inputs.channel }})
+      shell: bash
+      env:
+        SLUG: ${{ inputs.slug }}
+        SHORT_NAME: ${{ inputs.short-name }}
+        CHANNEL: ${{ inputs.channel }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        prefix="${SLUG^^}"
+        prefix="${prefix//-/_}"
+        export "${prefix}_INSTALL_E2E_YES=1"
+        export "${prefix}_INSTALLER_BIN=$GITHUB_WORKSPACE/target/debug/$SLUG-install"
+        bash "$GITHUB_ACTION_PATH/test-install-e2e.sh" "$SLUG" "$SHORT_NAME" "$CHANNEL"
