@@ -49,6 +49,10 @@ const READY_TIMEOUT: Duration = Duration::from_mins(2);
 /// How often to try the socket while waiting for it.
 const READY_POLL: Duration = Duration::from_millis(100);
 
+/// The longest path a Unix socket can be bound at: `sun_path` less its
+/// terminating NUL.
+const SOCKET_PATH_MAX: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
 /// How long a daemon gets to finish its graceful shutdown before it is sent
 /// `SIGKILL`, so a wedged child cannot hang the suite.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -80,7 +84,7 @@ pub struct Home {
 impl Home {
     fn new(product: &ProductSpec, label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
+        let root = temp_base().join(format!(
             "{}-{label}-{}-{}",
             product.slug,
             std::process::id(),
@@ -102,6 +106,20 @@ impl Home {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+}
+
+/// Where test homes go: the system temp directory, except on macOS.
+///
+/// A Unix socket's path holds at most 103 bytes there, and the per-user temp
+/// directory (`/var/folders/xx/…/T/`) spends about 49 of them before a test
+/// adds anything, which leaves [`Builder::default_socket`]'s path a byte too
+/// long for the daemon to bind. `/tmp` is short on every Mac.
+fn temp_base() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
     }
 }
 
@@ -184,6 +202,16 @@ impl Builder {
     /// If the binary cannot be spawned, or its socket does not answer within
     /// two minutes. The daemon is stopped and its home removed either way.
     pub async fn start(self) -> TestDaemon {
+        // A daemon cannot bind a longer path, and would leave the wait below
+        // to time out with no word of why.
+        let length = self.socket.as_os_str().len();
+        assert!(
+            length <= SOCKET_PATH_MAX,
+            "{}'s socket path is {length} bytes, and a Unix socket takes at most \
+             {SOCKET_PATH_MAX} here: {}",
+            self.product.display_name,
+            self.socket.display()
+        );
         let mut command = Command::new(&self.bin);
         for (key, value) in &self.env {
             match value {
@@ -521,6 +549,27 @@ mod tests {
         let builder = builder.without("SUPER_TEST_AUTO_APPROVE");
         assert_eq!(value_of(&builder, "SUPER_TEST_AUTO_APPROVE"), None);
         let _ = std::fs::remove_dir_all(home.root());
+    }
+
+    /// A socket path the daemon could not bind fails the start at once,
+    /// saying so, instead of after the wait for an answer that cannot come.
+    #[tokio::test]
+    #[should_panic(expected = "and a Unix socket takes at most")]
+    async fn a_socket_path_too_long_to_bind_fails_the_start() {
+        let long = Path::new("/tmp").join("s".repeat(SOCKET_PATH_MAX));
+        let builder = TestDaemon::build(&TEST, "/bin/true", "unit").socket_at(&long);
+        let _ = std::fs::remove_dir_all(builder.home().root());
+        builder.start().await;
+    }
+
+    /// The default socket fits wherever the tests run, macOS included, where
+    /// the per-user temp directory is long.
+    #[test]
+    fn the_default_socket_path_can_be_bound() {
+        let builder = TestDaemon::build(&TEST, "/bin/true", "a-long-test-label").default_socket();
+        let length = builder.socket().as_os_str().len();
+        let _ = std::fs::remove_dir_all(builder.home().root());
+        assert!(length <= SOCKET_PATH_MAX, "{}", builder.socket().display());
     }
 
     fn value_of(builder: &Builder, key: &str) -> Option<OsString> {
