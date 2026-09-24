@@ -5,6 +5,7 @@
 //! - [`auth`]: session tokens, the consent dialog, and the guards every
 //!   route sits behind.
 //! - [`config`]: the daemon's `daemon.toml`, and its HTTP surface settings.
+//! - [`beeper`] (feature `beeper`): the tones a daemon plays as audio cues.
 //! - [`backends`]: installed backends — finding them on disk, the models
 //!   they serve, and the runtime policy a manifest is held to at discovery.
 //! - [`devices`]: which device a model runs on, and the host's GPUs.
@@ -40,6 +41,8 @@
 
 pub mod auth;
 pub mod backends;
+#[cfg(feature = "beeper")]
+pub mod beeper;
 pub mod config;
 pub mod devices;
 pub mod download;
@@ -50,6 +53,8 @@ pub mod http;
 pub mod keyring;
 pub mod language;
 pub mod load_gate;
+#[cfg(feature = "beeper")]
+mod num_cast;
 pub mod openapi;
 pub mod registry;
 pub mod resource_management;

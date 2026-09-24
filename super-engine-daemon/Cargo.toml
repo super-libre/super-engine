@@ -19,6 +19,7 @@
     # Frequency bands ride base64-encoded in their event.
     base64 = "0.22.1"
     bytes = { version = "1", optional = true }
+    cpal = { version = "0.17.3", optional = true }
     # Unpacking a subprocess backend's release tarball.
     flate2 = "1.1.9"
     chrono.workspace = true
@@ -83,6 +84,8 @@
     wasmtime-wasi-http = { version = "45.0.0", optional = true }
 
 [features]
+    # The tones a daemon plays as audio cues. Needs an audio output library.
+    beeper = ["dep:cpal"]
     # Run backends shipped as sandboxed native subprocesses.
     subprocess = ["dep:bytes", "hyper/client"]
     # Run backends shipped as WASM components.
