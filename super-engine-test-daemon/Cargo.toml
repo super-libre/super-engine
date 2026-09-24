@@ -1,0 +1,27 @@
+[package]
+    name = "super-engine-test-daemon"
+    version.workspace = true
+    authors.workspace = true
+    edition.workspace = true
+    description = "A product's daemon spawned for an integration test"
+    license.workspace = true
+    repository.workspace = true
+
+[dependencies]
+    http-body-util = "0.1"
+    hyper = { version = "1", features = ["client", "http1"] }
+    hyper-util = { version = "0.1", features = ["tokio"] }
+    libc.workspace = true
+    serde_json.workspace = true
+    super-engine-client = { path = "../super-engine-client" }
+    super-engine-protocol = { path = "../super-engine-protocol" }
+    tokio = { workspace = true, features = ["net", "time"] }
+
+[dev-dependencies]
+    super-engine-protocol = {
+        path = "../super-engine-protocol",
+        features = ["test-product"]
+    }
+
+[lints]
+    workspace = true

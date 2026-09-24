@@ -8,6 +8,7 @@
     "super-engine-installer",
     "super-engine-protocol",
     "super-engine-spec",
+    "super-engine-test-daemon",
   ]
 
   [workspace.package]
