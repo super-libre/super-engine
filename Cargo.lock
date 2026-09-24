@@ -3084,6 +3084,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "super-engine-installer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dirs",
+ "env_logger",
+ "flate2",
+ "hex",
+ "log",
+ "mockito",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "super-engine-forge",
+ "super-engine-protocol",
+ "super-engine-spec",
+ "tar",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "super-engine-protocol"
 version = "0.1.0"
 dependencies = [

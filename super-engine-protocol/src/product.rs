@@ -87,6 +87,13 @@ impl ProductSpec {
     pub fn daemon_binary(&self) -> String {
         format!("{}-daemon", self.slug)
     }
+
+    /// The file name of the installer and self-updater, `<slug>-install`,
+    /// which also installs a copy of itself under that name.
+    #[must_use]
+    pub fn installer_binary(&self) -> String {
+        format!("{}-install", self.slug)
+    }
 }
 
 #[cfg(test)]
@@ -95,7 +102,7 @@ mod tests {
 
     /// Every name a daemon and its clients meet on follows from the spec:
     /// the socket, the keyring entry, the host header, the override
-    /// variables, the consent helper and the daemon itself.
+    /// variables, the consent helper, the daemon and the installer.
     #[test]
     fn the_names_follow_from_the_spec() {
         assert_eq!(TEST.socket_file(), "super-test-http.sock");
@@ -104,5 +111,6 @@ mod tests {
         assert_eq!(TEST.env("HTTP_SOCKET"), "SUPER_TEST_HTTP_SOCKET");
         assert_eq!(TEST.consent_helper(), "super-test-consent");
         assert_eq!(TEST.daemon_binary(), "super-test-daemon");
+        assert_eq!(TEST.installer_binary(), "super-test-install");
     }
 }

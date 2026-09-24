@@ -1,0 +1,49 @@
+[package]
+    name = "super-engine-installer"
+    version.workspace = true
+    authors.workspace = true
+    edition.workspace = true
+    description = "Installs and updates a product's release on Linux: the curl bootstrap, in-app updates and the root phase"
+    license.workspace = true
+    repository.workspace = true
+
+[dependencies]
+    # `string`: the command is named after the product at run time.
+    clap = { version = "4.5.54", features = ["string"] }
+    dirs.workspace = true
+    env_logger.workspace = true
+    flate2 = "1"
+    log.workspace = true
+    reqwest.workspace = true
+    serde.workspace = true
+    serde_json.workspace = true
+    super-engine-forge = { path = "../super-engine-forge" }
+    super-engine-protocol = { path = "../super-engine-protocol" }
+    super-engine-spec = { path = "../super-engine-spec" }
+    tar = "0.4"
+    thiserror.workspace = true
+    tokio.workspace = true
+
+[dev-dependencies]
+    hex = "0.4"
+    mockito = "1"
+    ring = "0.17"
+    # The made-up product the tests install.
+    super-engine-protocol = { path = "../super-engine-protocol", features = ["test-product"] }
+
+[features]
+    # Builds `super-test-install`, the installer for the made-up product,
+    # which the end-to-end test drives.
+    test-product = ["super-engine-protocol/test-product"]
+
+[[bin]]
+    name = "super-test-install"
+    path = "src/bin/super_test_install.rs"
+    required-features = ["test-product"]
+
+[[test]]
+    name = "e2e_dry_run"
+    required-features = ["test-product"]
+
+[lints]
+    workspace = true
