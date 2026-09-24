@@ -14,11 +14,15 @@
     log.workspace = true
     serde.workspace = true
     serde_json.workspace = true
+    spectrum-analyzer = { version = "1.7.0", optional = true }
     strum.workspace = true
     strum_macros.workspace = true
     utoipa = { workspace = true, optional = true }
 
 [features]
+    # `audio::analysis`: the FFT that turns samples into `FrequencyData`.
+    # Only what produces the bands needs it; what renders them does not.
+    analysis = ["dep:spectrum-analyzer"]
     # Derive `utoipa::ToSchema` on the wire types the daemons document.
     openapi = ["dep:utoipa"]
     # Two made-up products, for tests in the crates built on this one.

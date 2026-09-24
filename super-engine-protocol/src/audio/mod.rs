@@ -5,7 +5,11 @@
 //! is deliberately free of any analysis dependency (no `spectrum-analyzer`),
 //! so consumers that only *render* bands — e.g. the applet, which receives
 //! pre-computed bands from the daemon over SSE — can use it without pulling
-//! in the FFT stack. The analyzer that *produces* it is the daemon's.
+//! in the FFT stack. The analyzer that *produces* it, `analysis`, needs
+//! that stack, so it is behind the `analysis` feature.
+
+#[cfg(feature = "analysis")]
+pub mod analysis;
 
 /// Audio frequency data for wave visualization.
 #[derive(Debug, Clone)]
