@@ -161,23 +161,34 @@ note() { echo "  note  - $1"; }
 # release.
 UNIT="/usr/lib/systemd/user/$SLUG.service"
 
-INSTALLED_FILES=(
+CORE_FILES=(
     "755:/usr/local/bin/$SLUG-daemon"
     "755:/usr/local/bin/$SLUG-cli"
     "755:/usr/local/bin/$SLUG-consent"
     "755:/usr/local/bin/$SLUG-app"
-    "755:/usr/local/bin/$SLUG-cosmic-applet"
     "755:/usr/local/bin/$SLUG-install"
     "755:/usr/local/bin/$SHORT_NAME"
     "644:$UNIT"
     "644:/usr/local/share/applications/$SLUG-app.desktop"
-    "644:/usr/local/share/applications/$SLUG-cosmic-applet-full.desktop"
-    "644:/usr/local/share/applications/$SLUG-cosmic-applet-left.desktop"
-    "644:/usr/local/share/applications/$SLUG-cosmic-applet-right.desktop"
     "644:/usr/local/share/icons/hicolor/scalable/apps/$SLUG-app.svg"
-    "644:/usr/local/share/icons/hicolor/scalable/apps/$SLUG-cosmic-applet.svg"
     "644:/usr/local/share/metainfo/$SLUG-app.metainfo.xml"
 )
+
+# The COSMIC applet's files, `$1` being its binary's name: the product's own
+# (`<slug>-cosmic-applet`) in a release from before the shared applet, the
+# shared one (super-cosmic-applet) after. A release installs one or the
+# other, and the shared one replaces the product's own.
+applet_files() {
+    printf '%s\n' \
+        "755:/usr/local/bin/$1" \
+        "644:/usr/local/share/applications/$1-full.desktop" \
+        "644:/usr/local/share/applications/$1-left.desktop" \
+        "644:/usr/local/share/applications/$1-right.desktop" \
+        "644:/usr/local/share/icons/hicolor/scalable/apps/$1.svg"
+}
+SHARED_APPLET=super-cosmic-applet
+mapfile -t PRODUCT_APPLET_FILES < <(applet_files "$SLUG-cosmic-applet")
+mapfile -t SHARED_APPLET_FILES < <(applet_files "$SHARED_APPLET")
 
 path_of() { echo "${1#*:}"; }
 mode_of() { echo "${1%%:*}"; }
@@ -297,8 +308,27 @@ assert_install_outcome() {
 # $1 accepted tags, $2 label.
 assert_installed_tree() {
     local accepted="$1" label="$2" entry path mode actual missing=0 wrong_mode=0
+    local installed_files replaced_files
 
-    for entry in "${INSTALLED_FILES[@]}"; do
+    # Which applet the release carried decides which files a complete install
+    # has: the shared one, with the product's own gone, or the product's own.
+    if [ -e "/usr/local/bin/$SHARED_APPLET" ]; then
+        installed_files=("${CORE_FILES[@]}" "${SHARED_APPLET_FILES[@]}")
+        replaced_files=("${PRODUCT_APPLET_FILES[@]}")
+        note "$label: the release carries the shared applet"
+    else
+        installed_files=("${CORE_FILES[@]}" "${PRODUCT_APPLET_FILES[@]}")
+        replaced_files=()
+    fi
+
+    for entry in "${replaced_files[@]}"; do
+        path="$(path_of "$entry")"
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            fail "$label: $path is replaced by the shared applet" "absent" "still present"
+        fi
+    done
+
+    for entry in "${installed_files[@]}"; do
         path="$(path_of "$entry")"
         mode="$(mode_of "$entry")"
         if [ ! -f "$path" ]; then
@@ -313,7 +343,7 @@ assert_installed_tree() {
         fi
     done
     if [ "$missing" -eq 0 ]; then
-        pass "$label: every file of a complete install is present (${#INSTALLED_FILES[@]} files)"
+        pass "$label: every file of a complete install is present (${#installed_files[@]} files)"
     fi
     if [ "$wrong_mode" -eq 0 ]; then
         pass "$label: every installed file carries its manifest mode"
@@ -357,7 +387,7 @@ assert_installed_tree() {
 assert_clean_tree() {
     local label="$1" entry path leftovers=0
 
-    for entry in "${INSTALLED_FILES[@]}"; do
+    for entry in "${CORE_FILES[@]}" "${PRODUCT_APPLET_FILES[@]}" "${SHARED_APPLET_FILES[@]}"; do
         path="$(path_of "$entry")"
         if [ -e "$path" ] || [ -L "$path" ]; then
             fail "$label: $path is removed" "absent" "still present"
@@ -440,7 +470,7 @@ local_pass() {
 # Starting dirty would make a leftover file read as a successful install (or
 # an uninstall failure), so refuse rather than clobber whatever is here.
 PREEXISTING=()
-for entry in "${INSTALLED_FILES[@]}"; do
+for entry in "${CORE_FILES[@]}" "${PRODUCT_APPLET_FILES[@]}" "${SHARED_APPLET_FILES[@]}"; do
     path="$(path_of "$entry")"
     [ -e "$path" ] && PREEXISTING+=("$path")
 done
