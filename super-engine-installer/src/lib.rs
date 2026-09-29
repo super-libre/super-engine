@@ -7,8 +7,10 @@
 //! A product's installer is a `main` that hands [`main`] its [`Installer`].
 //! Everything it installs is named after the product: `<slug>-daemon`,
 //! `<slug>-cli`, `<slug>-consent`, the `<short_name>` wrapper and the
-//! `<slug>.service` user unit; `<slug>-app`; `<slug>-cosmic-applet`; and the
-//! installer itself as `<slug>-install`. Releases come from the product's
+//! `<slug>.service` user unit; `<slug>-app`; and the installer itself as
+//! `<slug>-install`. The exception is the COSMIC applet the products share,
+//! [`SHARED_APPLET`](super_engine_protocol::SHARED_APPLET), which replaces the
+//! `<slug>-cosmic-applet` a release from before it installs. Releases come from the product's
 //! `repo`, as `<slug>-<triple>[-beta].tar.gz` with a `SHA256SUMS`.
 
 mod cli;
@@ -324,9 +326,12 @@ async fn run(
     // Captured before the root phase runs: whether the applet was already
     // installed decides whether the panel needs restarting to pick up a
     // *changed* binary, not whether it's present after this run.
-    let applet_was_installed = prefix
-        .join(format!("bin/{}-cosmic-applet", product.slug))
-        .exists();
+    let applet_was_installed = [
+        format!("bin/{}-cosmic-applet", product.slug),
+        format!("bin/{}", super_engine_protocol::SHARED_APPLET),
+    ]
+    .iter()
+    .any(|bin| prefix.join(bin).exists());
     let self_exe = std::env::current_exe()
         .map_err(|e| InstallError::InstallFailed(format!("current_exe: {e}")))?;
     let manifest = stage::build_manifest(

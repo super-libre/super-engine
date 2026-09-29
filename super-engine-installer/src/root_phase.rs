@@ -193,6 +193,9 @@ pub fn apply_manifest(
         validate_mode(entry.mode)?;
         validate_source(&entry.source, staging_root)?;
     }
+    for removal in &manifest.removals {
+        validate_dest(removal, roots)?;
+    }
     for entry in &manifest.entries {
         let parent = entry.dest.parent().ok_or_else(|| {
             InstallError::InstallFailed(format!(
@@ -247,7 +250,43 @@ pub fn apply_manifest(
         }
         write_result?;
     }
+    // Only now, with every replacement in place, do the files they replace go.
+    for removal in &manifest.removals {
+        remove_replaced(removal)?;
+    }
     Ok(())
+}
+
+/// Remove `path`, a file an entry of this manifest replaces.
+///
+/// `path` itself may be a symlink, which is unlinked, never followed. An
+/// ancestor may not be: under a symlinked directory the lexically validated
+/// path would name a file somewhere else. A directory is refused, since no
+/// entry replaces one, and a path already gone is fine.
+fn remove_replaced(path: &Path) -> Result<(), InstallError> {
+    let Some(parent) = path.parent() else {
+        return Err(InstallError::InstallFailed(format!(
+            "{}: has no parent directory",
+            path.display()
+        )));
+    };
+    if !parent.exists() {
+        return Ok(());
+    }
+    ensure_no_symlinked_ancestor(parent)?;
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(InstallError::InstallFailed(format!(
+            "stat {}: {e}",
+            path.display()
+        ))),
+        Ok(meta) if meta.is_dir() => Err(InstallError::InstallFailed(format!(
+            "{}: is a directory, refusing to remove it",
+            path.display()
+        ))),
+        Ok(_) => std::fs::remove_file(path)
+            .map_err(|e| InstallError::InstallFailed(format!("remove {}: {e}", path.display()))),
+    }
 }
 
 /// Read the manifest at `manifest_path`, capped at
@@ -418,6 +457,7 @@ mod tests {
                 dest: dest.clone(),
                 mode: 0o755,
             }],
+            removals: vec![],
         };
         apply_manifest(&manifest, &[roots_owned.as_str()], &tmp).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new-binary");
@@ -441,6 +481,7 @@ mod tests {
                 dest: victim.clone(),
                 mode: 0o644,
             }],
+            removals: vec![],
         };
         assert!(apply_manifest(&manifest, &["/usr/local/"], &tmp).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
@@ -468,6 +509,7 @@ mod tests {
                 dest: dest.clone(),
                 mode: 0o755,
             }],
+            removals: vec![],
         };
         apply_manifest(&manifest, &[roots_owned.as_str()], &tmp).unwrap();
         assert!(
@@ -506,6 +548,7 @@ mod tests {
                 dest: dest.clone(),
                 mode: 0o644,
             }],
+            removals: vec![],
         };
         assert!(apply_manifest(&manifest, &[roots_owned.as_str()], &tmp).is_err());
         assert!(!outside_dir.join("tool").exists());
@@ -526,6 +569,7 @@ mod tests {
                 dest: dest.clone(),
                 mode: 0o4755, // setuid
             }],
+            removals: vec![],
         };
         assert!(apply_manifest(&manifest, &[roots_owned.as_str()], &tmp).is_err());
         assert!(!dest.exists());
@@ -551,6 +595,7 @@ mod tests {
                 dest: dest.clone(),
                 mode: 0o755,
             }],
+            removals: vec![],
         };
         assert!(apply_manifest(&manifest, &[roots_owned.as_str()], &staging).is_err());
         assert!(!dest.exists());
@@ -575,6 +620,7 @@ mod tests {
                 dest: dest.clone(),
                 mode: 0o755,
             }],
+            removals: vec![],
         };
         assert!(apply_manifest(&manifest, &[roots_owned.as_str()], &staging).is_err());
         assert!(!dest.exists());
@@ -601,6 +647,7 @@ mod tests {
                 dest: dest.clone(),
                 mode: 0o755,
             }],
+            removals: vec![],
         };
         apply_manifest(&manifest, &[roots_owned.as_str()], &staging).unwrap();
         assert_eq!(
@@ -720,5 +767,92 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         let self_exe = std::env::current_exe().unwrap();
         assert!(validate_source(&self_exe, &staging).is_ok());
+    }
+
+    /// A replaced file goes only after every entry is in place, a missing one
+    /// is fine, and a symlink is unlinked, never followed.
+    #[test]
+    fn apply_manifest_removes_what_the_entries_replace() {
+        let root = test_dir();
+        let staging = root.join("staging");
+        let dest_root = root.join("dest");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(dest_root.join("bin")).unwrap();
+        let src = staging.join("new");
+        std::fs::write(&src, b"new").unwrap();
+        let old = dest_root.join("bin/old");
+        std::fs::write(&old, b"old").unwrap();
+        let target = root.join("elsewhere");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dest_root.join("bin/old-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let manifest = Manifest {
+            entries: vec![ManifestEntry {
+                source: src,
+                dest: dest_root.join("bin/new"),
+                mode: 0o755,
+            }],
+            removals: vec![old.clone(), link.clone(), dest_root.join("bin/never-there")],
+        };
+        let roots = [dest_root.to_str().unwrap()];
+        apply_manifest(&manifest, &roots, &staging).expect("apply");
+
+        assert!(dest_root.join("bin/new").exists());
+        assert!(!old.exists());
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link itself goes"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep", "its target stays");
+    }
+
+    /// A removal outside the allowed roots fails the whole manifest before
+    /// anything is installed or removed.
+    #[test]
+    fn apply_manifest_refuses_a_removal_outside_the_roots_without_touching_anything() {
+        let root = test_dir();
+        let staging = root.join("staging");
+        let dest_root = root.join("dest");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&dest_root).unwrap();
+        let src = staging.join("new");
+        std::fs::write(&src, b"new").unwrap();
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+
+        let manifest = Manifest {
+            entries: vec![ManifestEntry {
+                source: src,
+                dest: dest_root.join("new"),
+                mode: 0o755,
+            }],
+            removals: vec![outside.clone()],
+        };
+        let roots = [dest_root.to_str().unwrap()];
+        assert!(apply_manifest(&manifest, &roots, &staging).is_err());
+        assert!(outside.exists());
+        assert!(
+            !dest_root.join("new").exists(),
+            "nothing is installed either"
+        );
+    }
+
+    /// No entry replaces a directory, so a removal naming one is refused.
+    #[test]
+    fn apply_manifest_refuses_to_remove_a_directory() {
+        let root = test_dir();
+        let staging = root.join("staging");
+        let dest_root = root.join("dest");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(dest_root.join("bin/a-dir")).unwrap();
+
+        let manifest = Manifest {
+            entries: vec![],
+            removals: vec![dest_root.join("bin/a-dir")],
+        };
+        let roots = [dest_root.to_str().unwrap()];
+        assert!(apply_manifest(&manifest, &roots, &staging).is_err());
+        assert!(dest_root.join("bin/a-dir").is_dir());
     }
 }
