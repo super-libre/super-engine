@@ -96,6 +96,13 @@ impl ProductSpec {
     }
 }
 
+/// The COSMIC panel applet the products share, by its binary name.
+///
+/// One applet serves every product. Each product's installer installs it
+/// beside the product's daemon, each daemon trusts it there as one of its own
+/// clients, and the applet holds a session with each daemon under this name.
+pub const SHARED_APPLET: &str = "super-cosmic-applet";
+
 #[cfg(test)]
 mod tests {
     use crate::test_product::TEST;

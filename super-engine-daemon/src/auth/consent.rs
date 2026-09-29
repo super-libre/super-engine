@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use super_engine_protocol::{ProductSpec, consent};
+use super_engine_protocol::{ProductSpec, SHARED_APPLET, consent};
 
 /// Global cap of one on-screen consent popup at a time. See
 /// [`ask_user_for_consent`] — without it a same-uid client could drive hundreds
@@ -437,10 +437,14 @@ pub async fn ask_user_for_consent(
 
 /// Basenames of the first-party client binaries that skip the consent
 /// popup when co-located with the daemon binary: the product's app, CLI and
-/// COSMIC applet (`<slug>-app`, `<slug>-cli`, `<slug>-cosmic-applet`).
+/// COSMIC applet (`<slug>-app`, `<slug>-cli`, `<slug>-cosmic-applet`), and the
+/// COSMIC applet every product shares ([`SHARED_APPLET`]). The product's own
+/// applet stays trusted until its installs have all been replaced.
 /// See [`is_official_client`] for the full trust check.
-fn official_client_names(product: &ProductSpec) -> [String; 3] {
-    ["app", "cli", "cosmic-applet"].map(|client| format!("{}-{client}", product.slug))
+fn official_client_names(product: &ProductSpec) -> [String; 4] {
+    let [app, cli, applet] =
+        ["app", "cli", "cosmic-applet"].map(|client| format!("{}-{client}", product.slug));
+    [app, cli, applet, SHARED_APPLET.to_string()]
 }
 
 /// First-party trust check: does `exe_path` denote one of our own
@@ -800,6 +804,17 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let app = write_executable(dir.path(), "super-test-app", 0o755);
             assert!(is_official_client_in(dir.path(), &app));
+        }
+
+        /// The COSMIC applet the products share is one of each daemon's
+        /// own clients, however many products it serves.
+        #[test]
+        fn the_shared_applet_co_located_is_trusted_by_every_product() {
+            let dir = tempfile::tempdir().unwrap();
+            let applet = write_executable(dir.path(), super_engine_protocol::SHARED_APPLET, 0o755);
+            for product in [&TEST, &OTHER] {
+                assert!(in_dir(product, dir.path(), &applet));
+            }
         }
 
         #[test]

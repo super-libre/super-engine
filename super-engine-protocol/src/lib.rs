@@ -17,4 +17,4 @@ pub mod serde_helpers;
 pub mod test_product;
 
 pub use audio::FrequencyData;
-pub use product::ProductSpec;
+pub use product::{ProductSpec, SHARED_APPLET};
