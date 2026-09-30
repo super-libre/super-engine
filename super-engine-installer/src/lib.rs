@@ -11,8 +11,10 @@
 //! `<slug>-install`. The exception is the COSMIC applet the products share,
 //! [`SHARED_APPLET`](super_engine_protocol::SHARED_APPLET), which replaces the
 //! `<slug>-cosmic-applet` a release from before it installs. Releases come from the product's
-//! `repo`, as `<slug>-<triple>[-beta].tar.gz` with a `SHA256SUMS`.
+//! `repo`, as `<slug>-<triple>[-beta].tar.gz` with a `SHA256SUMS`, and the
+//! applet's from its own repo, [`applet::REPO`], named the same way.
 
+mod applet;
 mod cli;
 mod download;
 mod errors;
@@ -242,6 +244,49 @@ async fn resolve_release(
     .await
 }
 
+/// Pick the applet release to install, from the applet's own repo, on the
+/// same channel as the product. `None` when the applet installed under
+/// `prefix` is already as new, or newer: see [`applet::should_install`].
+async fn resolve_applet(
+    installer: &Installer,
+    cli: &cli::Cli,
+    triple: &str,
+    prefix: &Path,
+) -> Result<Option<resolve::ResolvedTarget>, InstallError> {
+    let repo = super_engine_forge::RepoRef::parse(applet::REPO)
+        .map_err(|e| InstallError::InstallFailed(format!("applet repo {}: {e}", applet::REPO)))?;
+    let client = super_engine_forge::Github::from_env(installer.user_agent);
+    let target = resolve::resolve_target(
+        &client,
+        &repo,
+        super_engine_protocol::SHARED_APPLET,
+        None,
+        cli.beta,
+        triple,
+    )
+    .await
+    .map_err(|e| match e {
+        InstallError::NoReleaseFound(m) => {
+            InstallError::NoReleaseFound(format!("the COSMIC applet: {m}"))
+        }
+        InstallError::DownloadFailed(m) => {
+            InstallError::DownloadFailed(format!("the COSMIC applet: {m}"))
+        }
+        other => other,
+    })?;
+    let current = applet::installed_version(prefix).await;
+    if applet::should_install(current.as_deref(), &target.release.tag) {
+        Ok(Some(target))
+    } else {
+        log::info!(
+            "COSMIC applet {} is installed, as new as {} or newer; keeping it",
+            current.as_deref().unwrap_or("?"),
+            target.release.tag
+        );
+        Ok(None)
+    }
+}
+
 /// Download `target`'s tarball into `staging` and check it against the
 /// release's `SHA256SUMS`, returning where it landed.
 async fn download_verified(
@@ -298,6 +343,8 @@ async fn run(
 
     let path_env = std::env::var("PATH").unwrap_or_default();
     let cosmic_available = escalate::which("cosmic-panel", &path_env).is_some();
+    let prefix = Path::new("/usr/local");
+    let unit_dir = Path::new("/usr/lib/systemd/user");
 
     let mut explicit = cli.components;
     if explicit.is_none() && !cli.non_interactive && std::io::stderr().is_terminal() {
@@ -307,11 +354,22 @@ async fn run(
         }
     }
 
+    let components = stage::plan_components(explicit, prefix, cosmic_available, product);
+    let applet_target = if components.applet {
+        resolve_applet(installer, cli, triple, prefix).await?
+    } else {
+        None
+    };
+
     // Staging dir: 0700, unpredictable name, canonicalized — see
     // `StagingGuard`'s doc comment (obligation (b)). RAII-cleaned on every
     // exit path, including an early `?` return.
     let staging = StagingGuard::new(product)?;
     let tarball_path = download_verified(installer, &target, staging.path(), reporter).await?;
+    let applet_tarball_path = match &applet_target {
+        Some(applet) => Some(download_verified(installer, applet, staging.path(), reporter).await?),
+        None => None,
+    };
 
     reporter.emit(&Event::Phase {
         phase: Phase::Stage,
@@ -319,23 +377,28 @@ async fn run(
     });
     let extracted = staging.path().join("extracted");
     stage::extract_tarball(&tarball_path, &extracted)?;
+    let applet_extracted = match &applet_tarball_path {
+        Some(tarball) => {
+            let dir = staging.path().join("applet");
+            stage::extract_tarball(tarball, &dir)?;
+            Some(dir)
+        }
+        None => None,
+    };
 
-    let prefix = Path::new("/usr/local");
-    let unit_dir = Path::new("/usr/lib/systemd/user");
-    let components = stage::plan_components(explicit, prefix, cosmic_available, product);
-    // Captured before the root phase runs: whether the applet was already
-    // installed decides whether the panel needs restarting to pick up a
-    // *changed* binary, not whether it's present after this run.
-    let applet_was_installed = [
-        format!("bin/{}-cosmic-applet", product.slug),
-        format!("bin/{}", super_engine_protocol::SHARED_APPLET),
-    ]
-    .iter()
-    .any(|bin| prefix.join(bin).exists());
+    // Captured before the root phase runs: whether a running applet's binary
+    // changes under it, which the panel needs restarting to pick up. That is
+    // the shared applet replaced by a newer release, or the product's own
+    // removed in its favor.
+    let product_applet_bin = prefix.join(format!("bin/{}-cosmic-applet", product.slug));
+    let shared_applet_bin = prefix.join(format!("bin/{}", super_engine_protocol::SHARED_APPLET));
+    let applet_changes =
+        (applet_extracted.is_some() && shared_applet_bin.exists()) || product_applet_bin.exists();
     let self_exe = std::env::current_exe()
         .map_err(|e| InstallError::InstallFailed(format!("current_exe: {e}")))?;
     let manifest = stage::build_manifest(
         &extracted,
+        applet_extracted.as_deref(),
         prefix,
         unit_dir,
         &components,
@@ -376,14 +439,7 @@ async fn run(
         message: "finishing installation",
     });
     let interactive = !cli.non_interactive && std::io::stderr().is_terminal();
-    post_install::run(
-        installer,
-        &components,
-        applet_was_installed,
-        interactive,
-        prefix,
-    )
-    .await?;
+    post_install::run(installer, &components, applet_changes, interactive, prefix).await?;
 
     reporter.emit(&Event::Complete {
         installed_version: &target.release.tag,

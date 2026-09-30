@@ -28,6 +28,10 @@
 # product's release.yml that stage::build_manifest starts requiring) fails this
 # test until that release actually ships.
 #
+# The COSMIC applet comes from its own releases, in
+# super-libre/super-cosmic-applet, which the local pass's installer installs
+# the newest of. So that pass also needs one published there.
+#
 # Usage, from the root of the product's checkout:
 #
 #   <PREFIX>_INSTALL_E2E_YES=1 GITHUB_REPOSITORY=<owner>/<repo> \
@@ -175,9 +179,10 @@ CORE_FILES=(
 )
 
 # The COSMIC applet's files, `$1` being its binary's name: the product's own
-# (`<slug>-cosmic-applet`) in a release from before the shared applet, the
-# shared one (super-cosmic-applet) after. A release installs one or the
-# other, and the shared one replaces the product's own.
+# (`<slug>-cosmic-applet`), or the shared one (super-cosmic-applet) that
+# replaces it. An installer from before the applet had releases installs the
+# applet its product's tarball carries, which may be either. One from after
+# installs the shared one from the applet's own releases, always.
 applet_files() {
     printf '%s\n' \
         "755:/usr/local/bin/$1" \
@@ -305,17 +310,17 @@ assert_install_outcome() {
 
 # ---- Assertions on the installed tree -------------------------------------
 
-# $1 accepted tags, $2 label.
+# $1 accepted tags, $2 label, $3 the applet the install must have: `shared`,
+# or `either` for a released installer that may predate the applet's releases.
 assert_installed_tree() {
-    local accepted="$1" label="$2" entry path mode actual missing=0 wrong_mode=0
+    local accepted="$1" label="$2" applet="$3" entry path mode actual missing=0 wrong_mode=0
     local installed_files replaced_files
 
-    # Which applet the release carried decides which files a complete install
-    # has: the shared one, with the product's own gone, or the product's own.
-    if [ -e "/usr/local/bin/$SHARED_APPLET" ]; then
+    # The shared applet, with the product's own gone, or the product's own.
+    if [ "$applet" = shared ] || [ -e "/usr/local/bin/$SHARED_APPLET" ]; then
         installed_files=("${CORE_FILES[@]}" "${SHARED_APPLET_FILES[@]}")
         replaced_files=("${PRODUCT_APPLET_FILES[@]}")
-        note "$label: the release carries the shared applet"
+        note "$label: installs the shared applet"
     else
         installed_files=("${CORE_FILES[@]}" "${PRODUCT_APPLET_FILES[@]}")
         replaced_files=()
@@ -426,7 +431,7 @@ bootstrap_pass() {
         "$log"
     status=$?
     assert_install_outcome "$status" "$log" "$accepted" "bootstrap"
-    assert_installed_tree "$accepted" "bootstrap"
+    assert_installed_tree "$accepted" "bootstrap" either
     run_uninstall "bootstrap"
     assert_clean_tree "bootstrap"
 }
@@ -460,7 +465,7 @@ local_pass() {
         "$log"
     status=$?
     assert_install_outcome "$status" "$log" "$accepted" "local"
-    assert_installed_tree "$accepted" "local"
+    assert_installed_tree "$accepted" "local" shared
     run_uninstall "local"
     assert_clean_tree "local"
 }

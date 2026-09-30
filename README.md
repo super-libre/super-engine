@@ -11,7 +11,7 @@ by their clients, so a fix lands once instead of in every product.
 | `super-engine-client` | A daemon client: the HTTP transport over the Unix socket, session tokens in the keyring, and the self-healing `/events` subscription. | Settings apps, CLIs, applets |
 | `super-engine-daemon` | What a daemon runs beside its own endpoints. Auth: session tokens, the consent dialog, the guards every route sits behind, the keyring and per-client rate limits. The Unix socket and TCP listeners, the event bus and `/events`, and self-update. Backends: the registry client, install pipeline and the logic behind the registry endpoints, discovery, downloads and their progress, and the WASM and subprocess runtimes. Also config loading, devices, language resolution, audio cues, the load gate and the shutdown signal. | Daemons |
 | `super-engine-indexer` | Builds a product's `index.json` from its `registry.toml` and the backends' releases, and refuses what the contract does not allow to be published. | Each product's indexer |
-| `super-engine-installer` | The installer and self-updater: resolve a release, stage it, install it with privilege escalation, and uninstall it. | Each product's installer |
+| `super-engine-installer` | The installer and self-updater: resolve a release, stage it, install it with privilege escalation, and uninstall it. It installs the COSMIC applet the products share from the applet's own releases. | Each product's installer |
 | `super-engine-test-daemon` | Starts a product's daemon for an integration test, in a home of its own with the test switches set, and sends it requests. | Each product's integration tests |
 
 Each product keeps what is its own: its `ProductSpec`, its contract

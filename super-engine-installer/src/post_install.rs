@@ -68,11 +68,12 @@ pub enum Step {
 
 /// Decide which [`Step`]s to run, and in what order, from facts already known
 /// before any post-install I/O: `components` (what was just installed or
-/// updated), `applet_was_installed` (captured *before* the root phase ran —
-/// the script's `is_update` check), and two environment probes the caller
+/// updated), `applet_changes` (captured *before* the root phase ran: whether
+/// an applet binary the panel may be running is replaced or removed), and two
+/// environment probes the caller
 /// (`run`) is expected to have already made: `systemctl_available` (a `$PATH`
 /// lookup) and `panel_running` (a `pgrep` check). `panel_running` only matters
-/// when `components.applet && applet_was_installed` — a caller may cheaply
+/// when `components.applet && applet_changes` — a caller may cheaply
 /// pass `true` unconditionally for any other combination and it's simply
 /// ignored.
 ///
@@ -86,7 +87,7 @@ pub enum Step {
 #[allow(clippy::fn_params_excessive_bools)] // interface fixed by the design doc: the booleans are the planner's whole point
 pub fn plan(
     components: Components,
-    applet_was_installed: bool,
+    applet_changes: bool,
     systemctl_available: bool,
     panel_running: bool,
 ) -> Vec<Step> {
@@ -99,7 +100,7 @@ pub fn plan(
         steps.push(Step::RestartOrStart);
     }
 
-    if components.applet && applet_was_installed && panel_running {
+    if components.applet && applet_changes && panel_running {
         steps.push(Step::RestartPanel);
     }
 
@@ -235,10 +236,11 @@ fn legacy_paths(product: &ProductSpec) -> Vec<String> {
 /// unit tests) testable without ever touching the filesystem or a real
 /// shell-out.
 ///
-/// `applet_was_installed` must be captured *before* the root phase ran (the
-/// script's `is_update` check) — it decides whether the panel needs
-/// restarting to pick up a *changed* applet binary, not whether the applet
-/// is present now.
+/// `applet_changes` must be captured *before* the root phase ran — it decides
+/// whether the panel needs restarting to pick up a *changed* applet binary:
+/// the shared applet replaced by a newer release, or the product's own
+/// removed in its favor. An applet installed fresh, or kept because it is
+/// already current, needs no restart.
 ///
 /// The product's own steps ([`Installer::after_install`]) run last, and only
 /// once the shared ones have succeeded.
@@ -250,7 +252,7 @@ fn legacy_paths(product: &ProductSpec) -> Vec<String> {
 pub async fn run(
     installer: &Installer,
     components: &Components,
-    applet_was_installed: bool,
+    applet_changes: bool,
     interactive: bool,
     prefix: &Path,
 ) -> Result<(), InstallError> {
@@ -261,14 +263,14 @@ pub async fn run(
         log::warn!("systemctl not found on PATH; skipping daemon service setup");
     }
     // Only worth the `pgrep` shell-out when it could actually matter —
-    // `plan` re-checks the same `components.applet && applet_was_installed`
+    // `plan` re-checks the same `components.applet && applet_changes`
     // guard itself, so passing `false` when it doesn't apply is equivalent.
     let panel_running =
-        components.applet && applet_was_installed && cmd_ok("pgrep", &["-f", "cosmic-panel"]).await;
+        components.applet && applet_changes && cmd_ok("pgrep", &["-f", "cosmic-panel"]).await;
 
     for step in plan(
         *components,
-        applet_was_installed,
+        applet_changes,
         systemctl_available,
         panel_running,
     ) {
@@ -389,17 +391,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_applet_restart_requires_selected_installed_and_running_all_three() {
+    fn plan_applet_restart_requires_selected_changed_and_running_all_three() {
         let applet_only = Components {
             daemon: false,
             app: false,
             applet: true,
         };
         assert!(plan(applet_only, true, false, true).contains(&Step::RestartPanel));
-        // Not previously installed (a fresh applet install, not an update):
-        // no restart even if the panel happens to be running.
+        // No running applet's binary changes (a fresh install, or an applet
+        // already current): no restart even if the panel is running.
         assert!(!plan(applet_only, false, false, true).contains(&Step::RestartPanel));
-        // Previously installed, but the panel isn't currently running:
+        // An applet's binary changes, but the panel isn't currently running:
         // nothing to restart.
         assert!(!plan(applet_only, true, false, false).contains(&Step::RestartPanel));
         // Applet not selected THIS run (e.g. a daemon-only update), even

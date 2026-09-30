@@ -316,7 +316,16 @@ fn required_entry(
 
 /// Build the manifest for `components`, resolving every source against
 /// `staging` and every destination against `prefix` (`unit_dir` for the
-/// systemd unit). `self_exe` is the running installer's own binary — every
+/// systemd unit).
+///
+/// The applet's sources are in `applet`, the extracted tarball of the
+/// applet's own release (see [`crate::applet`]), never in the product's
+/// tarball: a product's release may still carry an applet, and it is
+/// ignored. With the applet component selected, the product's own
+/// `<slug>-cosmic-applet` goes, and `applet` is `None` when the installed
+/// shared applet is already as new as the release, which then stays.
+///
+/// `self_exe` is the running installer's own binary — every
 /// install/update re-stages a copy of itself at `<prefix>/bin/<slug>-install`
 /// so a later `--root-phase` re-run and in-app updates keep working. The root
 /// phase recognizes this entry by comparing its `source` against its own
@@ -330,6 +339,7 @@ fn required_entry(
 #[allow(clippy::trivially_copy_pass_by_ref)] // interface fixed by the design doc: `&Components`
 pub fn build_manifest(
     staging: &Path,
+    applet: Option<&Path>,
     prefix: &Path,
     unit_dir: &Path,
     components: &Components,
@@ -408,35 +418,39 @@ pub fn build_manifest(
 
     let mut removals = Vec::new();
     if components.applet {
-        // The COSMIC applet every product shares, when the release carries
-        // it, and then the product's own applet it replaces goes. A release
-        // from before the shared applet still installs its own, which is what
-        // a newer installer does when told to install an older version.
-        let product_applet = format!("{slug}-cosmic-applet");
-        let applet = if staging.join(SHARED_APPLET).exists() {
-            removals.extend(product_applet_files(prefix, &product_applet));
-            SHARED_APPLET
-        } else {
-            product_applet.as_str()
-        };
-        entries.push(required_entry(staging, applet, bin.join(applet), 0o755)?);
-        for path in applet_desktop_files(staging, applet)? {
-            let name = path
-                .file_name()
-                .expect("filtered on file_name above")
-                .to_owned();
-            entries.push(ManifestEntry {
-                source: path,
-                dest: prefix.join("share/applications").join(name),
-                mode: 0o644,
-            });
+        // The shared applet replaces the product's own, whether this run
+        // installs it or finds it already current.
+        removals.extend(product_applet_files(
+            prefix,
+            &format!("{slug}-cosmic-applet"),
+        ));
+        if let Some(applet) = applet {
+            entries.push(required_entry(
+                applet,
+                SHARED_APPLET,
+                bin.join(SHARED_APPLET),
+                0o755,
+            )?);
+            for path in applet_desktop_files(applet, SHARED_APPLET)? {
+                let name = path
+                    .file_name()
+                    .expect("filtered on file_name above")
+                    .to_owned();
+                entries.push(ManifestEntry {
+                    source: path,
+                    dest: prefix.join("share/applications").join(name),
+                    mode: 0o644,
+                });
+            }
+            entries.push(required_entry(
+                applet,
+                &format!("resources/icons/hicolor/scalable/apps/{SHARED_APPLET}.svg"),
+                prefix.join(format!(
+                    "share/icons/hicolor/scalable/apps/{SHARED_APPLET}.svg"
+                )),
+                0o644,
+            )?);
         }
-        entries.push(required_entry(
-            staging,
-            &format!("resources/icons/hicolor/scalable/apps/{applet}.svg"),
-            prefix.join(format!("share/icons/hicolor/scalable/apps/{applet}.svg")),
-            0o644,
-        )?);
     }
 
     Ok(Manifest { entries, removals })
@@ -527,9 +541,10 @@ mod tests {
         dir
     }
 
-    /// Add the shared applet's files to a fake staging tree, as a release
-    /// that carries it has them.
-    fn with_shared_applet(staging: &Path) {
+    /// The extracted tarball of an applet release: the binary, its launcher
+    /// entries and its icon, less any whose basename is in `missing`.
+    fn fake_applet_release_without(missing: &[&str]) -> PathBuf {
+        let dir = test_dir();
         for f in [
             SHARED_APPLET.to_string(),
             format!("resources/{SHARED_APPLET}-full.desktop"),
@@ -537,15 +552,27 @@ mod tests {
             format!("resources/{SHARED_APPLET}-right.desktop"),
             format!("resources/icons/hicolor/scalable/apps/{SHARED_APPLET}.svg"),
         ] {
-            let full = staging.join(f);
+            if missing
+                .iter()
+                .any(|m| Path::new(&f).file_name().unwrap() == *m)
+            {
+                continue;
+            }
+            let full = dir.join(f);
             std::fs::create_dir_all(full.parent().unwrap()).unwrap();
             std::fs::write(&full, b"").unwrap();
         }
+        dir
     }
 
-    fn applet_only_manifest(staging: &Path) -> Manifest {
+    fn fake_applet_release() -> PathBuf {
+        fake_applet_release_without(&[])
+    }
+
+    fn applet_only_manifest(staging: &Path, applet: Option<&Path>) -> Manifest {
         build_manifest(
             staging,
+            applet,
             Path::new("/usr/local"),
             Path::new("/usr/lib/systemd/user"),
             &Components {
@@ -559,20 +586,21 @@ mod tests {
         .expect("an applet-only manifest")
     }
 
-    /// A release that carries the shared applet installs it in place of the
-    /// product's own, and removes what the product's own applet installed,
-    /// once the shared one is in place.
-    #[test]
-    fn a_release_with_the_shared_applet_replaces_the_products_own() {
-        let staging = fake_staging();
-        with_shared_applet(&staging);
-        let m = applet_only_manifest(&staging);
+    const PRODUCT_APPLET_FILES: [&str; 5] = [
+        "/usr/local/bin/super-test-cosmic-applet",
+        "/usr/local/share/applications/super-test-cosmic-applet-full.desktop",
+        "/usr/local/share/applications/super-test-cosmic-applet-left.desktop",
+        "/usr/local/share/applications/super-test-cosmic-applet-right.desktop",
+        "/usr/local/share/icons/hicolor/scalable/apps/super-test-cosmic-applet.svg",
+    ];
 
-        let dests: Vec<String> = m
-            .entries
-            .iter()
-            .map(|e| e.dest.to_string_lossy().into_owned())
-            .collect();
+    /// The applet's release installs in place of the product's own applet,
+    /// which goes once the shared one is in place.
+    #[test]
+    fn the_applet_release_replaces_the_products_own_applet() {
+        let applet = fake_applet_release();
+        let m = applet_only_manifest(&fake_staging(), Some(&applet));
+
         for expected in [
             "/usr/local/bin/super-cosmic-applet",
             "/usr/local/share/applications/super-cosmic-applet-full.desktop",
@@ -580,50 +608,74 @@ mod tests {
             "/usr/local/share/applications/super-cosmic-applet-right.desktop",
             "/usr/local/share/icons/hicolor/scalable/apps/super-cosmic-applet.svg",
         ] {
+            let entry = m
+                .entries
+                .iter()
+                .find(|e| e.dest == Path::new(expected))
+                .unwrap_or_else(|| panic!("{expected} missing from {:?}", m.entries));
             assert!(
-                dests.iter().any(|d| d == expected),
-                "{expected} missing from {dests:?}"
+                entry.source.starts_with(&applet),
+                "{expected} must come from the applet's release, not {}",
+                entry.source.display()
             );
         }
         assert!(
-            !dests.iter().any(|d| d.contains("super-test-cosmic-applet")),
-            "the product's own applet must not be installed beside the shared one: {dests:?}"
+            !m.entries.iter().any(|e| e
+                .dest
+                .to_string_lossy()
+                .contains("super-test-cosmic-applet")),
+            "the product's own applet must not be installed beside the shared one: {:?}",
+            m.entries
         );
-        assert_eq!(
-            m.removals,
-            [
-                "/usr/local/bin/super-test-cosmic-applet",
-                "/usr/local/share/applications/super-test-cosmic-applet-full.desktop",
-                "/usr/local/share/applications/super-test-cosmic-applet-left.desktop",
-                "/usr/local/share/applications/super-test-cosmic-applet-right.desktop",
-                "/usr/local/share/icons/hicolor/scalable/apps/super-test-cosmic-applet.svg",
-            ]
-            .map(PathBuf::from)
-        );
+        assert_eq!(m.removals, PRODUCT_APPLET_FILES.map(PathBuf::from));
     }
 
-    /// A release from before the shared applet, as a newer installer meets
-    /// when told to install an older version, still installs the product's
-    /// own applet, and removes nothing.
+    /// A product release that bundles an applet, the shared one or its own,
+    /// still takes the applet from the applet's release.
     #[test]
-    fn a_release_without_the_shared_applet_installs_the_products_own() {
-        let m = applet_only_manifest(&fake_staging());
+    fn an_applet_in_the_products_tarball_is_ignored() {
+        let staging = fake_staging();
+        let bundled = fake_applet_release();
+        for f in ["", "resources"] {
+            for entry in std::fs::read_dir(bundled.join(f)).unwrap() {
+                let entry = entry.unwrap();
+                if entry.path().is_file() {
+                    std::fs::copy(entry.path(), staging.join(f).join(entry.file_name())).unwrap();
+                }
+            }
+        }
+        let applet = fake_applet_release();
+        let m = applet_only_manifest(&staging, Some(&applet));
+        for e in &m.entries {
+            if e.dest.to_string_lossy().contains("cosmic-applet") {
+                assert!(e.source.starts_with(&applet), "{e:?}");
+            }
+        }
+    }
+
+    /// With the installed applet already as new as the release, nothing of
+    /// the applet is copied, and the product's own applet still goes.
+    #[test]
+    fn an_applet_already_current_stays_and_the_products_own_still_goes() {
+        let m = applet_only_manifest(&fake_staging(), None);
         assert!(
-            m.entries
+            !m.entries
                 .iter()
-                .any(|e| e.dest == Path::new("/usr/local/bin/super-test-cosmic-applet"))
+                .any(|e| e.dest.to_string_lossy().contains("cosmic-applet")),
+            "{:?}",
+            m.entries
         );
-        assert!(m.removals.is_empty(), "{:?}", m.removals);
+        assert_eq!(m.removals, PRODUCT_APPLET_FILES.map(PathBuf::from));
     }
 
     /// An applet deselected removes nothing: the product's own applet only
     /// goes when the shared one takes its place.
     #[test]
     fn no_applet_component_removes_nothing() {
-        let staging = fake_staging();
-        with_shared_applet(&staging);
+        let applet = fake_applet_release();
         let m = build_manifest(
-            &staging,
+            &fake_staging(),
+            Some(&applet),
             Path::new("/usr/local"),
             Path::new("/usr/lib/systemd/user"),
             &Components {
@@ -636,6 +688,11 @@ mod tests {
         )
         .unwrap();
         assert!(m.removals.is_empty(), "{:?}", m.removals);
+        assert!(
+            !m.entries
+                .iter()
+                .any(|e| e.dest.to_string_lossy().contains("cosmic-applet"))
+        );
     }
 
     /// On an update, an installed shared applet keeps the applet component,
@@ -749,6 +806,7 @@ mod tests {
         let staging = fake_staging(); // helper: full tarball layout in a temp dir
         let m = build_manifest(
             &staging,
+            None,
             std::path::Path::new("/usr/local"),
             std::path::Path::new("/usr/lib/systemd/user"),
             &Components {
@@ -796,6 +854,7 @@ mod tests {
         let staging = fake_staging_without(&["super-test-app"]);
         let err = build_manifest(
             &staging,
+            None,
             std::path::Path::new("/usr/local"),
             std::path::Path::new("/usr/lib/systemd/user"),
             &Components {
@@ -812,20 +871,21 @@ mod tests {
 
     #[test]
     fn manifest_errors_when_applet_desktop_glob_is_empty() {
-        // F5: if `resources/` is missing or renamed so the
-        // `super-test-cosmic-applet-*.desktop` glob yields zero entries, the
+        // F5: if the applet release's `resources/` is missing or renamed so
+        // the `super-cosmic-applet-*.desktop` glob yields zero entries, the
         // applet binary would otherwise get installed with no launcher
         // entry at all — silently, since a `for` loop over an empty `Vec`
         // just does nothing. That must be a hard error for a selected
         // applet component, exactly like the sibling `required_entry` icon
         // check just below it.
-        let staging = fake_staging_without(&[
-            "super-test-cosmic-applet-full.desktop",
-            "super-test-cosmic-applet-left.desktop",
-            "super-test-cosmic-applet-right.desktop",
+        let applet = fake_applet_release_without(&[
+            "super-cosmic-applet-full.desktop",
+            "super-cosmic-applet-left.desktop",
+            "super-cosmic-applet-right.desktop",
         ]);
         let err = build_manifest(
-            &staging,
+            &fake_staging(),
+            Some(&applet),
             std::path::Path::new("/usr/local"),
             std::path::Path::new("/usr/lib/systemd/user"),
             &Components {
@@ -845,6 +905,7 @@ mod tests {
         let staging = fake_staging_without(&["super-test-app.metainfo.xml"]);
         let m = build_manifest(
             &staging,
+            None,
             std::path::Path::new("/usr/local"),
             std::path::Path::new("/usr/lib/systemd/user"),
             &Components {
@@ -868,6 +929,7 @@ mod tests {
         let staging = fake_staging();
         let m = build_manifest(
             &staging,
+            None,
             std::path::Path::new("/usr/local"),
             std::path::Path::new("/usr/lib/systemd/user"),
             &Components::default(),
