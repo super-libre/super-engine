@@ -393,14 +393,10 @@ pub fn run(manifest_path: &Path) -> u8 {
 mod tests {
     use super::*;
     use crate::stage::ManifestEntry;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_dir::TestDir;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A fresh, empty per-test temp directory (per-pid, plus a per-call
-    /// counter so parallel tests in this binary never collide).
-    fn test_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    /// A fresh, empty temp directory for one test, removed when it ends.
+    fn test_dir() -> TestDir {
         // Canonicalized, because `apply_manifest` refuses a destination whose
         // ancestors are not already canonical — that is the symlinked-ancestor
         // guard doing its job, and it fires on the *fixture* here rather than
@@ -410,22 +406,11 @@ mod tests {
         // symlink to `/private/var`, so every destination built from it
         // resolves elsewhere and every such test failed.
         //
-        // Canonicalizing the *parent* and then joining is deliberate: the
-        // directory itself must not exist yet for `remove_dir_all` below to
-        // mean what it says.
+        // The directory is made under the canonical base, so its own path is
+        // canonical too.
         let base = std::env::temp_dir();
         let base = std::fs::canonicalize(&base).unwrap_or(base);
-        let dir = base.join(format!(
-            "super-engine-installer-root-{}-{n}",
-            std::process::id()
-        ));
-        // F6: clear a pre-existing directory first — the pid+counter name
-        // is only unique within one process run, so PID reuse across
-        // separate test-binary invocations could otherwise leak files from
-        // a previous run into this one.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TestDir::new_in("super-engine-installer-root-", &base)
     }
 
     #[test]

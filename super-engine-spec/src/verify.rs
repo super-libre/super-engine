@@ -266,9 +266,8 @@ mod tests {
     #[test]
     fn file_sha256_hex_matches_known_vector() {
         // sha256("hello world\n") — a standard test vector.
-        let dir =
-            std::env::temp_dir().join(format!("sstt-registry-verify-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let f = dir.join("hello.txt");
         std::fs::write(&f, "hello world\n").unwrap();
         assert_eq!(
@@ -280,9 +279,8 @@ mod tests {
 
     #[test]
     fn file_sha256_hex_of_empty_file() {
-        let dir =
-            std::env::temp_dir().join(format!("sstt-registry-verify-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let f = dir.join("empty.txt");
         std::fs::write(&f, []).unwrap();
         assert_eq!(
@@ -300,9 +298,8 @@ mod tests {
     /// with this crate's own hasher, so it actually catches that slip.
     #[test]
     fn file_sha256_hex_multi_read_loop_over_1mib_buffer() {
-        let dir =
-            std::env::temp_dir().join(format!("sstt-registry-verify-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let f = dir.join("big.bin");
         let size: usize = 1024 * 1024 + 777; // > 1 MiB buffer, not a multiple of it
         let data: Vec<u8> = (0..size)

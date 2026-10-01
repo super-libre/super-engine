@@ -301,10 +301,8 @@ mod tests {
     /// over one that did not parse.
     #[test]
     fn load_rewrites_what_it_repaired() {
-        let dir =
-            std::env::temp_dir().join(format!("super-engine-config-test-{}", std::process::id()));
-        let path = dir.join("daemon.toml");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.toml");
 
         std::fs::write(&path, "device = \"cuda\"\n").unwrap();
         let settings: Settings = load(&path);
@@ -318,7 +316,5 @@ mod tests {
         let settings: Settings = load(&path);
         assert_eq!(settings, Settings::default());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "device = \"\"\n");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

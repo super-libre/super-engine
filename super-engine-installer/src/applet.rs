@@ -69,6 +69,7 @@ pub fn should_install(installed: Option<&str>, candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TestDir;
 
     #[test]
     fn the_version_is_the_last_word_of_the_line() {
@@ -115,10 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_installed_applet_has_no_version() {
-        let prefix = std::env::temp_dir().join(format!(
-            "super-engine-installer-applet-{}",
-            std::process::id()
-        ));
+        let prefix = TestDir::new("super-engine-installer-applet-");
         assert_eq!(installed_version(&prefix).await, None);
     }
 
@@ -126,11 +124,7 @@ mod tests {
     #[tokio::test]
     async fn the_installed_version_comes_from_the_binary() {
         use std::os::unix::fs::PermissionsExt;
-        let prefix = std::env::temp_dir().join(format!(
-            "super-engine-installer-applet-bin-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&prefix);
+        let prefix = TestDir::new("super-engine-installer-applet-bin-");
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
         let bin = prefix.join("bin").join(SHARED_APPLET);
         std::fs::write(
@@ -150,6 +144,5 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(version.as_deref(), Some("0.4.2"));
-        let _ = std::fs::remove_dir_all(&prefix);
     }
 }

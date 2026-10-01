@@ -30,6 +30,8 @@
     ring = "0.17"
     # The made-up product the tests install.
     super-engine-protocol = { path = "../super-engine-protocol", features = ["test-product"] }
+    # Test directories that remove themselves.
+    tempfile = "3.27.0"
 
 [features]
     # Builds `super-test-install`, the installer for the made-up product,

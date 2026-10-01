@@ -2010,10 +2010,10 @@ mod tests {
 
     #[test]
     fn load_errors_carry_the_file_path() {
-        let dir = std::env::temp_dir().join("sstt-manifest-err-test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::write(dir.join("backend.toml"), "not [ valid toml").unwrap();
-        let err = Manifest::load(&dir).unwrap_err();
+        let err = Manifest::load(dir).unwrap_err();
         let chain = format!(
             "{err}: {}",
             std::error::Error::source(&err)
@@ -2021,7 +2021,6 @@ mod tests {
                 .unwrap_or_default()
         );
         assert!(chain.contains("backend.toml"), "got: {chain}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Untagged `OptionDefault` must bind TOML primitives by their actual type —

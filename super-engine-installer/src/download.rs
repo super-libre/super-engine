@@ -127,6 +127,7 @@ pub async fn download_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TestDir;
 
     const UA: &str = "super-engine-installer-tests";
 
@@ -139,9 +140,7 @@ mod tests {
             .with_body(vec![7u8; 4096])
             .create_async()
             .await;
-        let dir =
-            std::env::temp_dir().join(format!("super-engine-installer-dl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-dl-");
         let dest = dir.join("blob");
         let mut calls: Vec<(u64, u64)> = Vec::new();
         download_to_file(UA, &format!("{}/blob", s.url()), &dest, |d, t| {
@@ -172,11 +171,7 @@ mod tests {
             .with_body(vec![9u8; size])
             .create_async()
             .await;
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-dl-throttle-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-dl-throttle-");
         let dest = dir.join("blob");
         let mut calls: Vec<(u64, u64)> = Vec::new();
         download_to_file(UA, &format!("{}/blob", s.url()), &dest, |d, t| {
@@ -225,11 +220,7 @@ mod tests {
             .with_chunked_body(|w| w.write_all(&[3u8; 1000]))
             .create_async()
             .await;
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-dl-nolen-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-dl-nolen-");
         let dest = dir.join("blob");
         let mut calls: Vec<(u64, u64)> = Vec::new();
         download_to_file(UA, &format!("{}/blob", s.url()), &dest, |d, t| {
@@ -255,11 +246,7 @@ mod tests {
             .with_status(404)
             .create_async()
             .await;
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-dl-404-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-dl-404-");
         let dest = dir.join("blob");
         let err = download_to_file(UA, &format!("{}/missing", s.url()), &dest, |_, _| {})
             .await
@@ -278,11 +265,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-dl-refused-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-dl-refused-");
         let dest = dir.join("blob");
         let err = download_to_file(
             UA,

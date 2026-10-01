@@ -46,10 +46,8 @@ mod tests {
 
     #[test]
     fn writes_and_overwrites_atomically() {
-        let dir =
-            std::env::temp_dir().join(format!("super-engine-write-atomic-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("index.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
 
         write_atomic(&path, b"first").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
@@ -62,7 +60,5 @@ mod tests {
             !std::path::Path::new(&tmp).exists(),
             "temp file must be gone"
         );
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

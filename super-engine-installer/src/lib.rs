@@ -24,6 +24,8 @@ mod progress;
 mod resolve;
 mod root_phase;
 mod stage;
+#[cfg(test)]
+mod test_dir;
 mod verify;
 
 use std::io::IsTerminal;

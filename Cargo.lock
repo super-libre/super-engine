@@ -3434,6 +3434,7 @@ dependencies = [
  "super-engine-protocol",
  "super-engine-spec",
  "tar",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -3467,6 +3468,7 @@ dependencies = [
  "serde_json",
  "spdx",
  "super-engine-spec",
+ "tempfile",
  "thiserror 2.0.20",
  "toml 1.1.6+spec-1.1.0",
  "utoipa",

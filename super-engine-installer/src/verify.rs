@@ -36,15 +36,12 @@ pub fn verify_file(path: &Path, filename: &str, sums_text: &str) -> Result<(), I
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TestDir;
 
     #[test]
     fn verify_file_matches_known_vector() {
         // sha256("hello world\n") — a standard test vector.
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-test-");
         let f = dir.join("hello.txt");
         std::fs::write(&f, "hello world\n").unwrap();
         let sums = "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447  hello.txt\n";
@@ -68,11 +65,7 @@ mod tests {
         // The daemon's and app's own checksum lookups rely on this
         // case-insensitivity too (`sha256_matches`) — an `index.json`/manifest
         // pin may be upper- or mixed-case.
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-test-upper-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-test-upper-");
         let f = dir.join("hello.txt");
         std::fs::write(&f, "hello world\n").unwrap();
         let sums = "A948904F2F0F479B8F8197694B30184B0D2ED1C1CD2A1EC0FB85D299A192A447  hello.txt\n";
@@ -86,11 +79,7 @@ mod tests {
         // or corrupted digest as if it were real. From `verify_file`'s side
         // that must surface as "not listed", not a checksum-mismatch bug
         // report about a digest nobody actually published.
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-test-malformed-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("super-engine-installer-test-malformed-");
         let f = dir.join("hello.txt");
         std::fs::write(&f, "hello world\n").unwrap();
         // Truncated digest (63 hex chars) — not shape-valid, so it's skipped

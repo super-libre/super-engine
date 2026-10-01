@@ -459,28 +459,14 @@ pub fn build_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TestDir;
     use crate::tests::INSTALLER;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use super_engine_protocol::test_product::TEST;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A fresh, empty per-test temp directory (per-pid, plus a per-call
-    /// counter so parallel tests in this binary never collide).
-    fn test_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-stage-{}-{n}",
-            std::process::id()
-        ));
-        // F6: clear a pre-existing directory first — the pid+counter name
-        // is only unique within one process run, so PID reuse across
-        // separate test-binary invocations could otherwise leak files from
-        // a previous run into this one.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh, empty temp directory for one test, removed when it ends.
+    fn test_dir() -> TestDir {
+        TestDir::new("super-engine-installer-stage-")
     }
 
     /// A temp dir with an (always-created, possibly empty) `bin/` and each of
@@ -491,7 +477,7 @@ mod tests {
     /// `detection_fresh_install_with_no_bin_directory_at_all` below for the
     /// sibling case where `bin/` doesn't exist at all (the `read_dir` `Err`
     /// path `.into_iter().flatten()` also has to handle).
-    fn mktree(paths: &[&str]) -> PathBuf {
+    fn mktree(paths: &[&str]) -> TestDir {
         let dir = test_dir();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         for p in paths {
@@ -504,13 +490,13 @@ mod tests {
 
     /// The full tarball layout (binaries at root, `systemd/`, `resources/**`)
     /// in a temp dir, as a fake `staging` tree.
-    fn fake_staging() -> PathBuf {
+    fn fake_staging() -> TestDir {
         fake_staging_without(&[])
     }
 
     /// Like [`fake_staging`], but omits every entry whose basename is in
     /// `missing`.
-    fn fake_staging_without(missing: &[&str]) -> PathBuf {
+    fn fake_staging_without(missing: &[&str]) -> TestDir {
         let dir = test_dir();
         let files = [
             "super-test-daemon",
@@ -543,7 +529,7 @@ mod tests {
 
     /// The extracted tarball of an applet release: the binary, its launcher
     /// entries and its icon, less any whose basename is in `missing`.
-    fn fake_applet_release_without(missing: &[&str]) -> PathBuf {
+    fn fake_applet_release_without(missing: &[&str]) -> TestDir {
         let dir = test_dir();
         for f in [
             SHARED_APPLET.to_string(),
@@ -565,7 +551,7 @@ mod tests {
         dir
     }
 
-    fn fake_applet_release() -> PathBuf {
+    fn fake_applet_release() -> TestDir {
         fake_applet_release_without(&[])
     }
 
@@ -599,7 +585,7 @@ mod tests {
     #[test]
     fn the_applet_release_replaces_the_products_own_applet() {
         let applet = fake_applet_release();
-        let m = applet_only_manifest(&fake_staging(), Some(&applet));
+        let m = applet_only_manifest(&fake_staging(), Some(&*applet));
 
         for expected in [
             "/usr/local/bin/super-cosmic-applet",
@@ -645,7 +631,7 @@ mod tests {
             }
         }
         let applet = fake_applet_release();
-        let m = applet_only_manifest(&staging, Some(&applet));
+        let m = applet_only_manifest(&staging, Some(&*applet));
         for e in &m.entries {
             if e.dest.to_string_lossy().contains("cosmic-applet") {
                 assert!(e.source.starts_with(&applet), "{e:?}");
@@ -675,7 +661,7 @@ mod tests {
         let applet = fake_applet_release();
         let m = build_manifest(
             &fake_staging(),
-            Some(&applet),
+            Some(&*applet),
             Path::new("/usr/local"),
             Path::new("/usr/lib/systemd/user"),
             &Components {
@@ -885,7 +871,7 @@ mod tests {
         ]);
         let err = build_manifest(
             &fake_staging(),
-            Some(&applet),
+            Some(&*applet),
             std::path::Path::new("/usr/local"),
             std::path::Path::new("/usr/lib/systemd/user"),
             &Components {

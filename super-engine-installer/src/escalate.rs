@@ -213,25 +213,11 @@ pub async fn run_root_phase(method: Method, manifest_path: &Path) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_dir::TestDir;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A fresh, empty per-test temp directory (per-pid, plus a per-call
-    /// counter so parallel tests in this binary never collide).
-    fn test_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "super-engine-installer-escalate-{}-{n}",
-            std::process::id()
-        ));
-        // F6: clear a pre-existing directory first — the pid+counter name
-        // is only unique within one process run, so PID reuse across
-        // separate test-binary invocations could otherwise leak files from
-        // a previous run into this one.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh, empty temp directory for one test, removed when it ends.
+    fn test_dir() -> TestDir {
+        TestDir::new("super-engine-installer-escalate-")
     }
 
     #[test]
