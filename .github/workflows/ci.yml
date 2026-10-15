@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: taiki-e/install-action@v2.87.25
+      - uses: taiki-e/install-action@v2.87.28
         with:
           tool: just
 
@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: taiki-e/install-action@v2.87.25
+      - uses: taiki-e/install-action@v2.87.28
         with:
           tool: just
 
