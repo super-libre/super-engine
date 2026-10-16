@@ -7,7 +7,7 @@
 //! transcription, a synthesis — is the product's. This module knows only the
 //! part of the contract every product shares: `/v1/ping`, `/v1/load`,
 //! `/v1/status`, and the secret/option headers every request carries. The
-//! model's files are provisioned before any of this, by the product (see
+//! model's files are provisioned by the product before the load (see
 //! [`crate::download`]); the backend itself shares no code with the daemon.
 //!
 //! The sandbox is the one genuinely per-platform part: a hardened
@@ -21,11 +21,12 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use log::info;
@@ -50,12 +51,16 @@ use sandbox_exec::spawn_sandboxed;
 #[cfg(target_os = "linux")]
 use systemd::spawn_sandboxed;
 
-/// A running, sandboxed subprocess backend with one model loaded.
+/// A running, sandboxed subprocess backend serving one model, which it has
+/// loaded once [`Self::load`] returns.
 pub struct SubprocessBackend {
     socket: PathBuf,
     /// Handle to the sandbox the backend runs in. Dropping it stops the
     /// backend, which is why teardown needs no `Drop` impl of its own here.
-    supervisor: Supervisor,
+    supervisor: Box<dyn Supervise>,
+    /// The `POST /v1/load` body, fixed when the backend starts. See
+    /// [`load_body`].
+    load_body: serde_json::Value,
     /// Device label reported by the backend's `/v1/status` (e.g. `"cuda"`).
     device: String,
     /// The secret/option pairs injected on every `/v1` request, per the
@@ -137,6 +142,77 @@ pub struct Launch<'a> {
     pub on_load_progress: Option<&'a (dyn Fn(LoadProgress) + Send + Sync)>,
 }
 
+/// What [`SubprocessBackend::start`] starts: [`Launch`] without the load's
+/// progress callback, which [`SubprocessBackend::load`] takes instead.
+pub struct Start<'a> {
+    /// The backend's install directory: `backend.toml` and the binary.
+    pub backend_dir: &'a Path,
+    /// The binary, relative to `backend_dir`: the manifest's `entrypoint`.
+    pub entrypoint: &'a str,
+    /// The model the backend serves. With `backend_dir`, it names the
+    /// instance.
+    pub model: &'a str,
+    /// The model's declared `provider`, echoed on `/v1/load` (see
+    /// [`load_body`]).
+    pub provider: Option<&'a str>,
+    /// The model's declared `supported_devices`. They decide whether the
+    /// sandbox is granted the GPU.
+    pub devices: &'a [Device],
+    /// The resolved accelerator (`"cpu"`, `"cuda"`, `"rocm"`, `"metal"`,
+    /// `"vulkan"`), or empty when none resolved, which leaves the backend to
+    /// select for itself.
+    pub device_pref: &'a str,
+    /// The already-formed secret/option header pairs to inject on every
+    /// request.
+    pub context_headers: Vec<(String, String)>,
+}
+
+/// Starts the sandbox a backend instance runs in.
+///
+/// [`Platform`] in a daemon. A trait rather than a direct call so that a test
+/// can serve a backend in-process, and kill it, with no sandbox at all.
+trait Spawn: Send + Sync {
+    fn spawn<'a>(&'a self, sandbox: &'a Sandbox<'a>) -> BoxFuture<'a, Result<Box<dyn Supervise>>>;
+}
+
+/// A running backend's sandbox, as this module drives it.
+trait Supervise: Send + Sync {
+    /// The instance's name, for log lines and error messages.
+    fn label(&self) -> &str;
+    /// Recent backend output, for a diagnostic.
+    fn logs(&self) -> String;
+    /// Stop the backend, awaiting its exit. Dropping the handle stops it too,
+    /// blocking.
+    fn stop(&mut self) -> BoxFuture<'_, ()>;
+}
+
+/// The platform's sandbox: a `systemd --user` unit on Linux, `sandbox-exec`
+/// on macOS.
+struct Platform;
+
+impl Spawn for Platform {
+    fn spawn<'a>(&'a self, sandbox: &'a Sandbox<'a>) -> BoxFuture<'a, Result<Box<dyn Supervise>>> {
+        Box::pin(async move {
+            let supervisor: Box<dyn Supervise> = Box::new(spawn_sandboxed(sandbox).await?);
+            Ok(supervisor)
+        })
+    }
+}
+
+impl Supervise for Supervisor {
+    fn label(&self) -> &str {
+        Supervisor::label(self)
+    }
+
+    fn logs(&self) -> String {
+        Supervisor::logs(self)
+    }
+
+    fn stop(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(Supervisor::stop(self))
+    }
+}
+
 /// Everything a platform spawner needs to start one backend instance.
 struct Sandbox<'a> {
     product: &'a ProductSpec,
@@ -157,16 +233,13 @@ struct Sandbox<'a> {
 }
 
 impl SubprocessBackend {
-    /// Spawn the sandboxed backend and have it load `launch.model`.
+    /// Spawn the sandboxed backend and have it load `launch.model`: a
+    /// [`start`](Self::start) and then a [`load`](Self::load).
     ///
     /// The model's files must already be on disk under `launch.backend_dir`.
     ///
     /// # Errors
-    /// Returns an error if this instance — this backend serving this model —
-    /// is already loading or loaded in this daemon, if the socket or
-    /// cache directory cannot be made, the binary is missing, the sandbox
-    /// refuses to start, the backend does not answer within 30 seconds, or
-    /// the load fails.
+    /// As [`start`](Self::start) and [`load`](Self::load).
     pub async fn spawn(product: &ProductSpec, launch: Launch<'_>) -> Result<Self> {
         let Launch {
             backend_dir,
@@ -178,6 +251,54 @@ impl SubprocessBackend {
             context_headers,
             on_load_progress,
         } = launch;
+        let mut backend = Self::start(
+            product,
+            Start {
+                backend_dir,
+                entrypoint,
+                model,
+                provider,
+                devices,
+                device_pref,
+                context_headers,
+            },
+        )
+        .await?;
+        backend.load(on_load_progress).await?;
+        Ok(backend)
+    }
+
+    /// Spawn the sandboxed backend and wait for it to answer, without loading
+    /// anything yet.
+    ///
+    /// The backend needs only its binary to start, so a product can start it
+    /// while the model's files are still downloading, and [`load`](Self::load)
+    /// once they are on disk.
+    ///
+    /// # Errors
+    /// Returns an error if this instance — this backend serving this model —
+    /// is already started in this daemon, if the socket or cache directory
+    /// cannot be made, the binary is missing, the sandbox refuses to start, or
+    /// the backend does not answer within 30 seconds.
+    pub async fn start(product: &ProductSpec, start: Start<'_>) -> Result<Self> {
+        Self::start_with(product, start, Arc::new(Platform)).await
+    }
+
+    /// [`start`](Self::start), with the sandbox started by `spawner`.
+    async fn start_with(
+        product: &ProductSpec,
+        start: Start<'_>,
+        spawner: Arc<dyn Spawn>,
+    ) -> Result<Self> {
+        let Start {
+            backend_dir,
+            entrypoint,
+            model,
+            provider,
+            devices,
+            device_pref,
+            context_headers,
+        } = start;
 
         // Socket under the runtime dir (pathname socket — survives
         // PrivateNetwork). Routed through the validated helper so it gets the
@@ -234,30 +355,29 @@ impl SubprocessBackend {
         // under `/var/folders` is really under `/private/var/folders`.
         let cache_dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
 
-        let supervisor = spawn_sandboxed(&Sandbox {
-            product,
-            instance: &instance,
-            binary: &binary,
-            backend_dir,
-            socket_dir: &socket_dir,
-            cache_dir: &cache_dir,
-            socket: &socket,
-            devices,
-        })
-        .await?;
+        let supervisor = spawner
+            .spawn(&Sandbox {
+                product,
+                instance: &instance,
+                binary: &binary,
+                backend_dir,
+                socket_dir: &socket_dir,
+                cache_dir: &cache_dir,
+                socket: &socket,
+                devices,
+            })
+            .await?;
 
-        let mut backend = Self {
+        let backend = Self {
             socket,
             supervisor,
+            load_body: load_body(model, provider, device_pref),
             device: "unknown".to_string(),
             context_headers: RwLock::new(context_headers),
             claim: Some(claim),
         };
 
-        backend.wait_for_ping(Duration::from_secs(30)).await?;
-        backend
-            .load(model, provider, device_pref, on_load_progress)
-            .await?;
+        backend.wait_for_ping(START_TIMEOUT).await?;
         Ok(backend)
     }
 
@@ -279,23 +399,27 @@ impl SubprocessBackend {
         }
     }
 
-    /// `POST /v1/load` then poll `/v1/status` until `ready` (or `error`),
-    /// capturing the device label the backend reports, and passing each change
-    /// in the backend's own account of the load to `on_load_progress`.
+    /// Have the backend load the model it was started for: `POST /v1/load`,
+    /// then poll `/v1/status` until `ready` (or `error`), capturing the device
+    /// label the backend reports, and passing each change in the backend's own
+    /// account of the load to `on_load_progress`.
+    ///
+    /// The model's files must be on disk by now. Call it once.
     ///
     /// How long a load may take depends on whether the backend reports
     /// progress. One that does is held to [`STALL_TIMEOUT`] without its
     /// report moving, and to nothing else, so a slow first load on a slow
     /// card is not cut off while it is visibly working. One that does not
     /// gets [`LOAD_TIMEOUT`] in all.
-    async fn load(
+    ///
+    /// # Errors
+    /// Returns an error if the backend refuses the load, reports `error`,
+    /// stops answering, or stalls or runs out of time as above.
+    pub async fn load(
         &mut self,
-        name: &str,
-        provider: Option<&str>,
-        device_pref: &str,
         on_load_progress: Option<&(dyn Fn(LoadProgress) + Send + Sync)>,
     ) -> Result<()> {
-        let body = serde_json::to_vec(&load_body(name, provider, device_pref))?;
+        let body = serde_json::to_vec(&self.load_body)?;
         let (status, resp) = self
             .request("POST", "/v1/load", &json_headers(), body)
             .await?;
@@ -496,6 +620,9 @@ impl Drop for SubprocessBackend {
         let _ = std::fs::remove_file(&self.socket);
     }
 }
+
+/// How long a backend gets to answer `/v1/ping` once its sandbox has started.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a load may take before the daemon gives up on it, when the
 /// backend does not report its progress.
@@ -803,3 +930,7 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
