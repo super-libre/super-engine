@@ -5,10 +5,11 @@
 //! it to answer on its pathname Unix socket, has it load one model, and then
 //! carries the product's `/v1` requests to it. What those requests are — a
 //! transcription, a synthesis — is the product's. This module knows only the
-//! part of the contract every product shares: `/v1/ping`, `/v1/load`,
-//! `/v1/status`, and the secret/option headers every request carries. The
-//! model's files are provisioned before any of this, by the product (see
-//! [`crate::download`]); the backend itself shares no code with the daemon.
+//! part of the contract every product shares: `/v1/ping`, `/v1/prepare`,
+//! `/v1/load`, `/v1/status`, and the secret/option headers every request
+//! carries. The model's files are provisioned by the product, a prepare's
+//! before the prepare and the rest before the load (see [`crate::download`]);
+//! the backend itself shares no code with the daemon.
 //!
 //! The sandbox is the one genuinely per-platform part: a hardened
 //! `systemd-run --user` transient unit on Linux (`systemd`), a `sandbox-exec`
@@ -21,14 +22,15 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
-use log::info;
+use log::{info, warn};
 use super_engine_protocol::ProductSpec;
 use super_engine_protocol::models::load_progress::LoadProgress;
 use super_engine_spec::manifest::Device;
@@ -50,12 +52,21 @@ use sandbox_exec::spawn_sandboxed;
 #[cfg(target_os = "linux")]
 use systemd::spawn_sandboxed;
 
-/// A running, sandboxed subprocess backend with one model loaded.
+/// A running, sandboxed subprocess backend serving one model, which it has
+/// loaded once [`Self::load`] returns.
 pub struct SubprocessBackend {
-    socket: PathBuf,
+    /// What the sandbox was spawned from, kept so that a backend whose
+    /// process has died can be spawned again exactly as it was. See
+    /// [`Self::load`].
+    instance: Instance,
+    /// Starts the sandbox: [`Platform`], or a test's stand-in.
+    spawner: Arc<dyn Spawn>,
     /// Handle to the sandbox the backend runs in. Dropping it stops the
     /// backend, which is why teardown needs no `Drop` impl of its own here.
-    supervisor: Supervisor,
+    supervisor: Box<dyn Supervise>,
+    /// The `POST /v1/load` body, fixed when the backend starts. See
+    /// [`load_body`].
+    load_body: serde_json::Value,
     /// Device label reported by the backend's `/v1/status` (e.g. `"cuda"`).
     device: String,
     /// The secret/option pairs injected on every `/v1` request, per the
@@ -137,6 +148,77 @@ pub struct Launch<'a> {
     pub on_load_progress: Option<&'a (dyn Fn(LoadProgress) + Send + Sync)>,
 }
 
+/// What [`SubprocessBackend::start`] starts: [`Launch`] without the load's
+/// progress callback, which [`SubprocessBackend::load`] takes instead.
+pub struct Start<'a> {
+    /// The backend's install directory: `backend.toml` and the binary.
+    pub backend_dir: &'a Path,
+    /// The binary, relative to `backend_dir`: the manifest's `entrypoint`.
+    pub entrypoint: &'a str,
+    /// The model the backend serves. With `backend_dir`, it names the
+    /// instance.
+    pub model: &'a str,
+    /// The model's declared `provider`, echoed on `/v1/load` (see
+    /// [`load_body`]).
+    pub provider: Option<&'a str>,
+    /// The model's declared `supported_devices`. They decide whether the
+    /// sandbox is granted the GPU.
+    pub devices: &'a [Device],
+    /// The resolved accelerator (`"cpu"`, `"cuda"`, `"rocm"`, `"metal"`,
+    /// `"vulkan"`), or empty when none resolved, which leaves the backend to
+    /// select for itself.
+    pub device_pref: &'a str,
+    /// The already-formed secret/option header pairs to inject on every
+    /// request.
+    pub context_headers: Vec<(String, String)>,
+}
+
+/// Starts the sandbox a backend instance runs in.
+///
+/// [`Platform`] in a daemon. A trait rather than a direct call so that a test
+/// can serve a backend in-process, and kill it, with no sandbox at all.
+trait Spawn: Send + Sync {
+    fn spawn<'a>(&'a self, sandbox: &'a Sandbox<'a>) -> BoxFuture<'a, Result<Box<dyn Supervise>>>;
+}
+
+/// A running backend's sandbox, as this module drives it.
+trait Supervise: Send + Sync {
+    /// The instance's name, for log lines and error messages.
+    fn label(&self) -> &str;
+    /// Recent backend output, for a diagnostic.
+    fn logs(&self) -> String;
+    /// Stop the backend, awaiting its exit. Dropping the handle stops it too,
+    /// blocking.
+    fn stop(&mut self) -> BoxFuture<'_, ()>;
+}
+
+/// The platform's sandbox: a `systemd --user` unit on Linux, `sandbox-exec`
+/// on macOS.
+struct Platform;
+
+impl Spawn for Platform {
+    fn spawn<'a>(&'a self, sandbox: &'a Sandbox<'a>) -> BoxFuture<'a, Result<Box<dyn Supervise>>> {
+        Box::pin(async move {
+            let supervisor: Box<dyn Supervise> = Box::new(spawn_sandboxed(sandbox).await?);
+            Ok(supervisor)
+        })
+    }
+}
+
+impl Supervise for Supervisor {
+    fn label(&self) -> &str {
+        Supervisor::label(self)
+    }
+
+    fn logs(&self) -> String {
+        Supervisor::logs(self)
+    }
+
+    fn stop(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(Supervisor::stop(self))
+    }
+}
+
 /// Everything a platform spawner needs to start one backend instance.
 struct Sandbox<'a> {
     product: &'a ProductSpec,
@@ -156,18 +238,44 @@ struct Sandbox<'a> {
     devices: &'a [Device],
 }
 
+/// A [`Sandbox`], owned: what [`SubprocessBackend::start`] spawned, for as
+/// long as the backend runs.
+struct Instance {
+    product: &'static ProductSpec,
+    /// See [`instance_key`].
+    key: String,
+    binary: PathBuf,
+    backend_dir: PathBuf,
+    socket_dir: PathBuf,
+    cache_dir: PathBuf,
+    socket: PathBuf,
+    devices: Vec<Device>,
+}
+
+impl Instance {
+    fn sandbox(&self) -> Sandbox<'_> {
+        Sandbox {
+            product: self.product,
+            instance: &self.key,
+            binary: &self.binary,
+            backend_dir: &self.backend_dir,
+            socket_dir: &self.socket_dir,
+            cache_dir: &self.cache_dir,
+            socket: &self.socket,
+            devices: &self.devices,
+        }
+    }
+}
+
 impl SubprocessBackend {
-    /// Spawn the sandboxed backend and have it load `launch.model`.
+    /// Spawn the sandboxed backend and have it load `launch.model`: a
+    /// [`start`](Self::start) and then a [`load`](Self::load).
     ///
     /// The model's files must already be on disk under `launch.backend_dir`.
     ///
     /// # Errors
-    /// Returns an error if this instance — this backend serving this model —
-    /// is already loading or loaded in this daemon, if the socket or
-    /// cache directory cannot be made, the binary is missing, the sandbox
-    /// refuses to start, the backend does not answer within 30 seconds, or
-    /// the load fails.
-    pub async fn spawn(product: &ProductSpec, launch: Launch<'_>) -> Result<Self> {
+    /// As [`start`](Self::start) and [`load`](Self::load).
+    pub async fn spawn(product: &'static ProductSpec, launch: Launch<'_>) -> Result<Self> {
         let Launch {
             backend_dir,
             entrypoint,
@@ -178,6 +286,54 @@ impl SubprocessBackend {
             context_headers,
             on_load_progress,
         } = launch;
+        let mut backend = Self::start(
+            product,
+            Start {
+                backend_dir,
+                entrypoint,
+                model,
+                provider,
+                devices,
+                device_pref,
+                context_headers,
+            },
+        )
+        .await?;
+        backend.load(on_load_progress).await?;
+        Ok(backend)
+    }
+
+    /// Spawn the sandboxed backend and wait for it to answer, without loading
+    /// anything yet.
+    ///
+    /// The backend needs only its binary to start, so a product can start it
+    /// while the model's files are still downloading, and [`load`](Self::load)
+    /// once they are on disk.
+    ///
+    /// # Errors
+    /// Returns an error if this instance — this backend serving this model —
+    /// is already started in this daemon, if the socket or cache directory
+    /// cannot be made, the binary is missing, the sandbox refuses to start, or
+    /// the backend does not answer within 30 seconds.
+    pub async fn start(product: &'static ProductSpec, start: Start<'_>) -> Result<Self> {
+        Self::start_with(product, start, Arc::new(Platform)).await
+    }
+
+    /// [`start`](Self::start), with the sandbox started by `spawner`.
+    async fn start_with(
+        product: &'static ProductSpec,
+        start: Start<'_>,
+        spawner: Arc<dyn Spawn>,
+    ) -> Result<Self> {
+        let Start {
+            backend_dir,
+            entrypoint,
+            model,
+            provider,
+            devices,
+            device_pref,
+            context_headers,
+        } = start;
 
         // Socket under the runtime dir (pathname socket — survives
         // PrivateNetwork). Routed through the validated helper so it gets the
@@ -234,31 +390,109 @@ impl SubprocessBackend {
         // under `/var/folders` is really under `/private/var/folders`.
         let cache_dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
 
-        let supervisor = spawn_sandboxed(&Sandbox {
+        let instance = Instance {
             product,
-            instance: &instance,
-            binary: &binary,
-            backend_dir,
-            socket_dir: &socket_dir,
-            cache_dir: &cache_dir,
-            socket: &socket,
-            devices,
-        })
-        .await?;
-
-        let mut backend = Self {
+            key: instance,
+            binary,
+            backend_dir: backend_dir.to_path_buf(),
+            socket_dir,
+            cache_dir,
             socket,
+            devices: devices.to_vec(),
+        };
+        let supervisor = spawner.spawn(&instance.sandbox()).await?;
+
+        let backend = Self {
+            instance,
+            spawner,
             supervisor,
+            load_body: load_body(model, provider, device_pref),
             device: "unknown".to_string(),
             context_headers: RwLock::new(context_headers),
             claim: Some(claim),
         };
 
-        backend.wait_for_ping(Duration::from_secs(30)).await?;
-        backend
-            .load(model, provider, device_pref, on_load_progress)
-            .await?;
+        backend.wait_for_ping(START_TIMEOUT).await?;
         Ok(backend)
+    }
+
+    /// Have the backend build what its first load needs, from the files
+    /// already on disk, while the product downloads the rest.
+    ///
+    /// Only for a model that declares
+    /// [`prepare_files`](super_engine_spec::manifest::ModelEntry::prepare_files),
+    /// once those files are on disk. The body is the load's. The backend
+    /// answers at once and prepares in the background, and [`load`](Self::load)
+    /// carries on from wherever the prepare got to, so nothing here waits for
+    /// the prepare to finish.
+    ///
+    /// Best effort, so it does not fail. A backend that refuses, does not
+    /// answer, or cannot be reached is logged, and its load does the whole
+    /// setup itself, as it would have with no prepare.
+    pub async fn prepare(&self) {
+        let label = self.label();
+        let body = self.load_body.to_string().into_bytes();
+        let answer = tokio::time::timeout(
+            PREPARE_TIMEOUT,
+            self.request("POST", "/v1/prepare", &json_headers(), body),
+        )
+        .await;
+        match answer {
+            Ok(Ok((202 | 200, _))) => info!("backend {label} is preparing its first load"),
+            Ok(Ok((status, resp))) => warn!(
+                "backend {label} answered {status} to the prepare, so its load will do the whole \
+                 setup: {}",
+                String::from_utf8_lossy(&resp)
+            ),
+            Ok(Err(e)) => warn!(
+                "could not ask backend {label} to prepare, so its load will do the whole setup: \
+                 {e:#}"
+            ),
+            Err(_) => warn!(
+                "backend {label} did not answer the prepare within {} seconds, so its load will \
+                 do the whole setup",
+                PREPARE_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    /// Start the backend again if its process has died since it started.
+    ///
+    /// A product may spend minutes downloading weights between the start and
+    /// the load, with the backend preparing all the while, and a driver fault
+    /// in that prepare takes the process with it. Nothing reports that until
+    /// the load, so the load asks first. The kernel cache the backend was
+    /// writing is in its cache directory, which outlives the process, so the
+    /// restart costs the start and whatever the prepare had not yet written.
+    async fn restart_if_gone(&mut self) -> Result<()> {
+        if self.is_alive().await {
+            return Ok(());
+        }
+        warn!(
+            "backend {} stopped answering before its load; starting it again. Its recent \
+             output:\n{}",
+            self.label(),
+            self.logs()
+        );
+        // Before the new one is spawned: the two share a name, so the old
+        // handle's teardown, which stops by name, would otherwise stop its
+        // replacement.
+        self.supervisor.stop().await;
+        self.supervisor = self.spawner.spawn(&self.instance.sandbox()).await?;
+        self.wait_for_ping(START_TIMEOUT).await
+    }
+
+    /// Whether the backend answers `/v1/ping`, asked once.
+    ///
+    /// Once rather than polled as at the start: a backend that has started
+    /// keeps its socket for as long as it runs, so one that does not answer
+    /// now is not about to.
+    async fn is_alive(&self) -> bool {
+        let ping = self.request("GET", "/v1/ping", &[], Vec::new());
+        matches!(
+            tokio::time::timeout(ALIVE_TIMEOUT, ping).await,
+            Ok(Ok((200, _)))
+        )
     }
 
     /// Poll `/v1/ping` until the backend is serving or the deadline passes.
@@ -279,23 +513,33 @@ impl SubprocessBackend {
         }
     }
 
-    /// `POST /v1/load` then poll `/v1/status` until `ready` (or `error`),
-    /// capturing the device label the backend reports, and passing each change
-    /// in the backend's own account of the load to `on_load_progress`.
+    /// Have the backend load the model it was started for: `POST /v1/load`,
+    /// then poll `/v1/status` until `ready` (or `error`), capturing the device
+    /// label the backend reports, and passing each change in the backend's own
+    /// account of the load to `on_load_progress`.
+    ///
+    /// The model's files must be on disk by now. Call it once.
+    ///
+    /// A backend whose process has died since it started, in a prepare say,
+    /// is started again first, so a prepare that fails cannot fail the load
+    /// however it fails.
     ///
     /// How long a load may take depends on whether the backend reports
     /// progress. One that does is held to [`STALL_TIMEOUT`] without its
     /// report moving, and to nothing else, so a slow first load on a slow
     /// card is not cut off while it is visibly working. One that does not
     /// gets [`LOAD_TIMEOUT`] in all.
-    async fn load(
+    ///
+    /// # Errors
+    /// Returns an error if a backend that died cannot be started again, or if
+    /// the backend refuses the load, reports `error`, stops answering, or
+    /// stalls or runs out of time as above.
+    pub async fn load(
         &mut self,
-        name: &str,
-        provider: Option<&str>,
-        device_pref: &str,
         on_load_progress: Option<&(dyn Fn(LoadProgress) + Send + Sync)>,
     ) -> Result<()> {
-        let body = serde_json::to_vec(&load_body(name, provider, device_pref))?;
+        self.restart_if_gone().await?;
+        let body = self.load_body.to_string().into_bytes();
         let (status, resp) = self
             .request("POST", "/v1/load", &json_headers(), body)
             .await?;
@@ -448,9 +692,10 @@ impl SubprocessBackend {
         headers: &[(String, String)],
         body: Vec<u8>,
     ) -> Result<(hyper::Response<hyper::body::Incoming>, Connection)> {
-        let stream = UnixStream::connect(&self.socket)
+        let socket = &self.instance.socket;
+        let stream = UnixStream::connect(socket)
             .await
-            .with_context(|| format!("connect {}", self.socket.display()))?;
+            .with_context(|| format!("connect {}", socket.display()))?;
         let io = TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
         // The connection task must keep running while the body streams — the
@@ -482,7 +727,7 @@ impl SubprocessBackend {
     /// crash paths and tests.
     pub async fn shutdown(&mut self) {
         self.supervisor.stop().await;
-        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.instance.socket);
         self.claim = None;
     }
 }
@@ -493,9 +738,26 @@ impl Drop for SubprocessBackend {
         // when the field is dropped — synchronously, and idempotently after
         // an awaited `shutdown`. All that is left here is the socket file,
         // which neither supervisor knows about.
-        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.instance.socket);
     }
 }
+
+/// How long a backend gets to answer `/v1/ping` once its sandbox has started.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a backend that has started gets to answer `/v1/ping` before its
+/// load takes it for dead and starts it again.
+///
+/// A ping is answered at once by a backend that is working, preparing
+/// included, so this only has to outlast a busy machine.
+const ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a backend gets to answer `POST /v1/prepare`.
+///
+/// The contract has it answer at once and prepare in the background, so this
+/// only bounds a backend that never answers. A prepare is best effort, and the
+/// download it overlaps must not wait on one.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a load may take before the daemon gives up on it, when the
 /// backend does not report its progress.
@@ -803,3 +1065,7 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

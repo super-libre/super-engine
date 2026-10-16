@@ -460,6 +460,7 @@ mod tests {
             processing_interval_ms: None,
             realtime: false,
             files: vec![],
+            prepare_files: vec![],
             provider: None,
             product: Model {
                 force_preview_support: false,

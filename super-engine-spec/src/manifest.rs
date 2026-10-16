@@ -787,6 +787,27 @@ pub struct ModelEntry<M> {
     /// before `POST /v1/load`. Cloud models declare none.
     #[serde(default)]
     pub files: Vec<FileSpec>,
+    /// The files the model's prepare reads, each a `destination` from
+    /// [`files`](Self::files). Empty — the default — means the model has no
+    /// prepare.
+    ///
+    /// A prepare does the one-off part of a first load before the weights
+    /// arrive. A backend that builds its GPU kernels on its first load can
+    /// build them from the model's configuration alone, because kernels depend
+    /// on shapes and never on weight values. The product downloads these files
+    /// first, starts the backend and sends `POST /v1/prepare`, then downloads
+    /// the rest while the backend works. Declaring the field is the backend's
+    /// promise that it serves that route for this model, and that the prepare
+    /// reads only these files.
+    ///
+    /// Named by destination rather than by entry because a destination is
+    /// what the backend reads. Of the variants writing to one, exactly one is
+    /// downloaded, and the prepare finds it at the same path whichever it is.
+    ///
+    /// Which generation introduces the field is the product's to say, in
+    /// [`Product::CONTRACT_FIELDS`].
+    #[serde(default)]
+    pub prepare_files: Vec<String>,
     /// Compatibility shim; not part of model identity, which is
     /// `(name, source)`.
     ///
@@ -1156,6 +1177,18 @@ pub enum ManifestError {
         /// The destination whose variants disagree.
         destination: String,
     },
+    /// A `[[models]].prepare_files` entry is not one of the model's file
+    /// destinations.
+    #[error(
+        "model `{model}` lists `{file}` in `prepare_files`, but none of its `files` \
+         has that `destination`"
+    )]
+    PrepareFileNotListed {
+        /// The model declaring it.
+        model: String,
+        /// The entry, as written.
+        file: String,
+    },
     /// A rule of the product's own, from [`Product::validate`].
     #[error(transparent)]
     Product(Box<dyn std::error::Error + Send + Sync>),
@@ -1257,7 +1290,8 @@ impl<P: Product> Manifest<P> {
     /// # Errors
     /// Returns a [`ManifestError`] on TOML errors, a `[backend].product` that
     /// is not this product ([`OtherProduct`](ManifestError::OtherProduct)),
-    /// an unsafe entrypoint or file destination, a malformed `[backend].id`,
+    /// an unsafe entrypoint or file destination, a `prepare_files` entry that
+    /// is not one of its model's destinations, a malformed `[backend].id`,
     /// a malformed `[[assets.subprocess]]` entry, a field the declared
     /// [`contract`](Generation) does not include
     /// ([`FieldRequiresContract`](ManifestError::FieldRequiresContract)), or a
@@ -1424,6 +1458,8 @@ impl<P: Product> Manifest<P> {
 /// binary cannot. What is refused is the same in both places — a
 /// discriminator naming a family the entry never declared, which is a typo
 /// that would otherwise select nothing and say nothing.
+///
+/// Also that `prepare_files` names only the model's own destinations.
 fn validate_files<M>(model: &ModelEntry<M>) -> Result<(), ManifestError> {
     let name = || model.name.clone();
     // Destination -> the `optional` its first variant declared.
@@ -1466,6 +1502,20 @@ fn validate_files<M>(model: &ModelEntry<M>) -> Result<(), ManifestError> {
             }
             _ => {}
         }
+    }
+    // The prepare runs while the rest of the files are still downloading, so
+    // a file it names has to be one the daemon downloads ahead of it. A name
+    // matching no destination is never downloaded at all, and the prepare
+    // would look for a file that is not there.
+    if let Some(file) = model
+        .prepare_files
+        .iter()
+        .find(|file| !optional_by_destination.contains_key(file.as_str()))
+    {
+        return Err(ManifestError::PrepareFileNotListed {
+            model: name(),
+            file: file.clone(),
+        });
     }
     Ok(())
 }
@@ -2730,6 +2780,98 @@ mod tests {
         assert!(
             message.contains("c/k.bin") && message.contains("optional"),
             "the refusal must name the destination: {message}"
+        );
+    }
+
+    /// `prepare_files` names destinations, so a destination with several
+    /// variants is listed once and covers whichever variant the host gets.
+    #[test]
+    fn prepare_files_name_the_models_destinations() {
+        let text = with_model(
+            r#"
+            files = [
+                { url = "https://h/config.json", destination = "m/config.json" },
+                { url = "https://h/k-cuda.bin", destination = "c/k.bin", accel = "cuda",
+                  optional = true },
+                { url = "https://h/k-rocm.bin", destination = "c/k.bin", accel = "rocm",
+                  optional = true },
+                { url = "https://h/w.bin", destination = "m/w.bin" },
+            ]
+            prepare_files = ["m/config.json", "c/k.bin"]"#,
+        );
+        let m = Manifest::parse(&text).expect("prepare_files naming destinations parses");
+        assert_eq!(m.models[0].prepare_files, ["m/config.json", "c/k.bin"]);
+    }
+
+    /// Absent is the default, and means the model has no prepare.
+    #[test]
+    fn prepare_files_default_to_none() {
+        let text = with_model(r#"files = [{ url = "https://h/w.bin", destination = "m/w.bin" }]"#);
+        let m = Manifest::parse(&text).expect("a model without prepare_files parses");
+        assert!(m.models[0].prepare_files.is_empty());
+    }
+
+    /// A name matching no destination is a file the daemon never downloads,
+    /// so a prepare reading it would find nothing there. Matching is exact:
+    /// the backend reads the path as written, so a spelling that would only
+    /// normalize to a destination is refused as well.
+    #[test]
+    fn a_prepare_file_must_be_one_of_the_models_destinations() {
+        for listed in [
+            "m/missing.json",
+            "./m/config.json",
+            "m/w.bin/",
+            "https://h/config.json",
+        ] {
+            let text = with_model(&format!(
+                r#"
+            files = [
+                {{ url = "https://h/config.json", destination = "m/config.json" }},
+                {{ url = "https://h/w.bin", destination = "m/w.bin" }},
+            ]
+            prepare_files = ["m/config.json", "{listed}"]"#
+            ));
+            let err = Manifest::parse(&text).expect_err("an unlisted prepare file must not parse");
+            assert!(
+                matches!(
+                    &err,
+                    ManifestError::PrepareFileNotListed { model, file }
+                        if model == "m" && file == listed
+                ),
+                "the refusal must name the model and the entry: {err}"
+            );
+        }
+    }
+
+    /// A destination of another model does not count. The daemon downloads
+    /// only the files of the model it loads, so another model's file may never
+    /// be on disk.
+    #[test]
+    fn a_prepare_file_from_another_model_is_refused() {
+        let text = format!(
+            r#"{VALID}
+            [[models]]
+            name = "a"
+            primary_language = "en"
+            supported_languages = ["en"]
+            supported_devices = ["cpu"]
+            files = [{{ url = "https://h/a.json", destination = "a/config.json" }}]
+
+            [[models]]
+            name = "b"
+            primary_language = "en"
+            supported_languages = ["en"]
+            supported_devices = ["cpu"]
+            files = [{{ url = "https://h/b.json", destination = "b/config.json" }}]
+            prepare_files = ["a/config.json"]
+            "#
+        );
+        let message = Manifest::parse(&text)
+            .expect_err("another model's file must not parse")
+            .to_string();
+        assert!(
+            message.contains("`b`") && message.contains("a/config.json"),
+            "the refusal must name the model and the entry: {message}"
         );
     }
 
