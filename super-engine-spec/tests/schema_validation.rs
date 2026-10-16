@@ -39,6 +39,44 @@ fn the_schema_still_accepts_the_legacy_provider_key() {
     );
 }
 
+/// `prepare_files` is a list of destinations. `ModelEntry` is closed, so the
+/// key has to be in the schema for an editor to accept a manifest using it,
+/// and its shape has to be a list of strings for one written wrong to be
+/// flagged where it is typed.
+///
+/// That each entry is one of the model's own destinations is the parser's to
+/// check: a JSON schema cannot compare one property's values with another's.
+#[test]
+fn the_schema_takes_prepare_files_as_a_list_of_destinations() {
+    let v = backend_validator();
+    let model = |prepare_files: Value| {
+        let mut doc = sub_base();
+        doc["models"] = json!([{ "name": "m",
+            "primary_language": "en", "supported_languages": ["en"],
+            "supported_devices": ["gpu"],
+            "files": [
+                { "url": "https://example.com/config.json", "destination": "m/config.json" },
+                { "url": "https://example.com/w.bin", "destination": "m/w.bin" }
+            ],
+            "prepare_files": prepare_files }]);
+        doc
+    };
+    let listed = model(json!(["m/config.json"]));
+    let errors: Vec<String> = v.iter_errors(&listed).map(|e| format!("{e}")).collect();
+    assert!(
+        errors.is_empty(),
+        "a model listing its prepare files must validate: {errors:#?}"
+    );
+    assert!(
+        !v.is_valid(&model(json!("m/config.json"))),
+        "a bare string is not a list of files"
+    );
+    assert!(
+        !v.is_valid(&model(json!([{ "destination": "m/config.json" }]))),
+        "an entry is a destination, not a file table"
+    );
+}
+
 fn wasm_base() -> Value {
     json!({
         "backend": { "id": "app.test.y", "source": "github.com/x/y", "name": "Y",
