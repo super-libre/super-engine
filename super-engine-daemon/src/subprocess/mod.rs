@@ -55,7 +55,12 @@ use systemd::spawn_sandboxed;
 /// A running, sandboxed subprocess backend serving one model, which it has
 /// loaded once [`Self::load`] returns.
 pub struct SubprocessBackend {
-    socket: PathBuf,
+    /// What the sandbox was spawned from, kept so that a backend whose
+    /// process has died can be spawned again exactly as it was. See
+    /// [`Self::load`].
+    instance: Instance,
+    /// Starts the sandbox: [`Platform`], or a test's stand-in.
+    spawner: Arc<dyn Spawn>,
     /// Handle to the sandbox the backend runs in. Dropping it stops the
     /// backend, which is why teardown needs no `Drop` impl of its own here.
     supervisor: Box<dyn Supervise>,
@@ -233,6 +238,35 @@ struct Sandbox<'a> {
     devices: &'a [Device],
 }
 
+/// A [`Sandbox`], owned: what [`SubprocessBackend::start`] spawned, for as
+/// long as the backend runs.
+struct Instance {
+    product: &'static ProductSpec,
+    /// See [`instance_key`].
+    key: String,
+    binary: PathBuf,
+    backend_dir: PathBuf,
+    socket_dir: PathBuf,
+    cache_dir: PathBuf,
+    socket: PathBuf,
+    devices: Vec<Device>,
+}
+
+impl Instance {
+    fn sandbox(&self) -> Sandbox<'_> {
+        Sandbox {
+            product: self.product,
+            instance: &self.key,
+            binary: &self.binary,
+            backend_dir: &self.backend_dir,
+            socket_dir: &self.socket_dir,
+            cache_dir: &self.cache_dir,
+            socket: &self.socket,
+            devices: &self.devices,
+        }
+    }
+}
+
 impl SubprocessBackend {
     /// Spawn the sandboxed backend and have it load `launch.model`: a
     /// [`start`](Self::start) and then a [`load`](Self::load).
@@ -241,7 +275,7 @@ impl SubprocessBackend {
     ///
     /// # Errors
     /// As [`start`](Self::start) and [`load`](Self::load).
-    pub async fn spawn(product: &ProductSpec, launch: Launch<'_>) -> Result<Self> {
+    pub async fn spawn(product: &'static ProductSpec, launch: Launch<'_>) -> Result<Self> {
         let Launch {
             backend_dir,
             entrypoint,
@@ -281,13 +315,13 @@ impl SubprocessBackend {
     /// is already started in this daemon, if the socket or cache directory
     /// cannot be made, the binary is missing, the sandbox refuses to start, or
     /// the backend does not answer within 30 seconds.
-    pub async fn start(product: &ProductSpec, start: Start<'_>) -> Result<Self> {
+    pub async fn start(product: &'static ProductSpec, start: Start<'_>) -> Result<Self> {
         Self::start_with(product, start, Arc::new(Platform)).await
     }
 
     /// [`start`](Self::start), with the sandbox started by `spawner`.
     async fn start_with(
-        product: &ProductSpec,
+        product: &'static ProductSpec,
         start: Start<'_>,
         spawner: Arc<dyn Spawn>,
     ) -> Result<Self> {
@@ -356,21 +390,21 @@ impl SubprocessBackend {
         // under `/var/folders` is really under `/private/var/folders`.
         let cache_dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
 
-        let supervisor = spawner
-            .spawn(&Sandbox {
-                product,
-                instance: &instance,
-                binary: &binary,
-                backend_dir,
-                socket_dir: &socket_dir,
-                cache_dir: &cache_dir,
-                socket: &socket,
-                devices,
-            })
-            .await?;
+        let instance = Instance {
+            product,
+            key: instance,
+            binary,
+            backend_dir: backend_dir.to_path_buf(),
+            socket_dir,
+            cache_dir,
+            socket,
+            devices: devices.to_vec(),
+        };
+        let supervisor = spawner.spawn(&instance.sandbox()).await?;
 
         let backend = Self {
-            socket,
+            instance,
+            spawner,
             supervisor,
             load_body: load_body(model, provider, device_pref),
             device: "unknown".to_string(),
@@ -422,6 +456,45 @@ impl SubprocessBackend {
         }
     }
 
+    /// Start the backend again if its process has died since it started.
+    ///
+    /// A product may spend minutes downloading weights between the start and
+    /// the load, with the backend preparing all the while, and a driver fault
+    /// in that prepare takes the process with it. Nothing reports that until
+    /// the load, so the load asks first. The kernel cache the backend was
+    /// writing is in its cache directory, which outlives the process, so the
+    /// restart costs the start and whatever the prepare had not yet written.
+    async fn restart_if_gone(&mut self) -> Result<()> {
+        if self.is_alive().await {
+            return Ok(());
+        }
+        warn!(
+            "backend {} stopped answering before its load; starting it again. Its recent \
+             output:\n{}",
+            self.label(),
+            self.logs()
+        );
+        // Before the new one is spawned: the two share a name, so the old
+        // handle's teardown, which stops by name, would otherwise stop its
+        // replacement.
+        self.supervisor.stop().await;
+        self.supervisor = self.spawner.spawn(&self.instance.sandbox()).await?;
+        self.wait_for_ping(START_TIMEOUT).await
+    }
+
+    /// Whether the backend answers `/v1/ping`, asked once.
+    ///
+    /// Once rather than polled as at the start: a backend that has started
+    /// keeps its socket for as long as it runs, so one that does not answer
+    /// now is not about to.
+    async fn is_alive(&self) -> bool {
+        let ping = self.request("GET", "/v1/ping", &[], Vec::new());
+        matches!(
+            tokio::time::timeout(ALIVE_TIMEOUT, ping).await,
+            Ok(Ok((200, _)))
+        )
+    }
+
     /// Poll `/v1/ping` until the backend is serving or the deadline passes.
     async fn wait_for_ping(&self, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
@@ -447,6 +520,10 @@ impl SubprocessBackend {
     ///
     /// The model's files must be on disk by now. Call it once.
     ///
+    /// A backend whose process has died since it started, in a prepare say,
+    /// is started again first, so a prepare that fails cannot fail the load
+    /// however it fails.
+    ///
     /// How long a load may take depends on whether the backend reports
     /// progress. One that does is held to [`STALL_TIMEOUT`] without its
     /// report moving, and to nothing else, so a slow first load on a slow
@@ -454,12 +531,14 @@ impl SubprocessBackend {
     /// gets [`LOAD_TIMEOUT`] in all.
     ///
     /// # Errors
-    /// Returns an error if the backend refuses the load, reports `error`,
-    /// stops answering, or stalls or runs out of time as above.
+    /// Returns an error if a backend that died cannot be started again, or if
+    /// the backend refuses the load, reports `error`, stops answering, or
+    /// stalls or runs out of time as above.
     pub async fn load(
         &mut self,
         on_load_progress: Option<&(dyn Fn(LoadProgress) + Send + Sync)>,
     ) -> Result<()> {
+        self.restart_if_gone().await?;
         let body = self.load_body.to_string().into_bytes();
         let (status, resp) = self
             .request("POST", "/v1/load", &json_headers(), body)
@@ -613,9 +692,10 @@ impl SubprocessBackend {
         headers: &[(String, String)],
         body: Vec<u8>,
     ) -> Result<(hyper::Response<hyper::body::Incoming>, Connection)> {
-        let stream = UnixStream::connect(&self.socket)
+        let socket = &self.instance.socket;
+        let stream = UnixStream::connect(socket)
             .await
-            .with_context(|| format!("connect {}", self.socket.display()))?;
+            .with_context(|| format!("connect {}", socket.display()))?;
         let io = TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
         // The connection task must keep running while the body streams — the
@@ -647,7 +727,7 @@ impl SubprocessBackend {
     /// crash paths and tests.
     pub async fn shutdown(&mut self) {
         self.supervisor.stop().await;
-        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.instance.socket);
         self.claim = None;
     }
 }
@@ -658,12 +738,19 @@ impl Drop for SubprocessBackend {
         // when the field is dropped — synchronously, and idempotently after
         // an awaited `shutdown`. All that is left here is the socket file,
         // which neither supervisor knows about.
-        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.instance.socket);
     }
 }
 
 /// How long a backend gets to answer `/v1/ping` once its sandbox has started.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a backend that has started gets to answer `/v1/ping` before its
+/// load takes it for dead and starts it again.
+///
+/// A ping is answered at once by a backend that is working, preparing
+/// included, so this only has to outlast a busy machine.
+const ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a backend gets to answer `POST /v1/prepare`.
 ///

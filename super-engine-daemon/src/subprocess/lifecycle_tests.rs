@@ -33,6 +33,9 @@ enum Prepare {
     Refuses(u16),
     /// Closes the connection without answering.
     HangsUp,
+    /// Dies on it without answering, the way a driver fault in a prepare
+    /// takes the process with it.
+    Dies,
 }
 
 #[derive(Default)]
@@ -54,7 +57,25 @@ struct Post {
     start: usize,
 }
 
-/// One running backend's own state, which a restart begins afresh.
+/// One start of the stand-in, which a restart begins afresh.
+struct Process {
+    /// 1 for the first start, 2 for the one after a restart.
+    start: usize,
+    state: parking_lot::Mutex<State>,
+    socket: PathBuf,
+    /// Ends the server, once [`Self::die`] has made the backend unreachable.
+    died: tokio::sync::Notify,
+}
+
+impl Process {
+    /// Stop answering at once, as a process that exited would: nothing is
+    /// listening on the socket any more, and the server goes.
+    fn die(&self) {
+        let _ = std::fs::remove_file(&self.socket);
+        self.died.notify_one();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum State {
     Starting,
@@ -81,8 +102,7 @@ impl Fake {
     /// Answer one request the way a backend would, or `None` to hang up.
     fn answer(
         &self,
-        start: usize,
-        state: &parking_lot::Mutex<State>,
+        process: &Process,
         method: &hyper::Method,
         path: &str,
         body: &[u8],
@@ -91,13 +111,17 @@ impl Fake {
             self.0.posts.lock().push(Post {
                 path: path.to_string(),
                 body: serde_json::from_slice(body).unwrap_or_default(),
-                start,
+                start: process.start,
             });
         }
-        let mut state = state.lock();
+        let mut state = process.state.lock();
         Some(match (path, *state, self.0.prepare) {
             ("/v1/ping", ..) => (200, serde_json::json!({ "status": "success" })),
             ("/v1/prepare", _, Prepare::HangsUp) => return None,
+            ("/v1/prepare", _, Prepare::Dies) => {
+                process.die();
+                return None;
+            }
             ("/v1/prepare", _, Prepare::Refuses(code)) => (code, error("refused")),
             ("/v1/prepare", State::Starting | State::Preparing, Prepare::Accepts) => {
                 *state = State::Preparing;
@@ -129,17 +153,29 @@ impl Fake {
         // would refuse the bind.
         let _ = std::fs::remove_file(socket);
         let listener = UnixListener::bind(socket)?;
-        let state = Arc::new(parking_lot::Mutex::new(State::Starting));
+        let process = Arc::new(Process {
+            start,
+            state: parking_lot::Mutex::new(State::Starting),
+            socket: socket.to_path_buf(),
+            died: tokio::sync::Notify::new(),
+        });
         let fake = self.clone();
         Ok(tokio::spawn(async move {
             // Owned here, so the connections go when the server does.
             let mut connections = tokio::task::JoinSet::new();
-            while let Ok((stream, _)) = listener.accept().await {
+            loop {
+                let stream = tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => stream,
+                        Err(_) => return,
+                    },
+                    () = process.died.notified() => return,
+                };
                 let fake = fake.clone();
-                let state = Arc::clone(&state);
+                let process = Arc::clone(&process);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let fake = fake.clone();
-                    let state = Arc::clone(&state);
+                    let process = Arc::clone(&process);
                     async move {
                         let method = req.method().clone();
                         let path = req.uri().path().to_string();
@@ -152,7 +188,7 @@ impl Fake {
                         // An error from the service is how hyper is told to
                         // drop the connection without a response.
                         let (status, json) = fake
-                            .answer(start, &state, &method, &path, &body)
+                            .answer(&process, &method, &path, &body)
                             .ok_or("hung up")?;
                         Response::builder()
                             .status(status)
@@ -398,4 +434,74 @@ async fn a_prepare_that_fails_does_not_fail_the_load() {
         assert_eq!(paths, ["/v1/prepare", "/v1/load"], "{name}");
         backend.shutdown().await;
     }
+}
+
+/// A backend that died while the product was downloading is started again
+/// for its load, with the same instance, and the load goes to the new one.
+#[tokio::test]
+async fn a_backend_that_died_after_its_start_is_started_again_for_its_load() {
+    let dir = BackendDir::new("died-before-load");
+    let fake = Fake::new(Prepare::Accepts);
+    let mut backend = SubprocessBackend::start_with(&TEST, dir.start(), Arc::new(fake.clone()))
+        .await
+        .expect("the backend starts");
+
+    fake.kill(&backend.instance.socket).await;
+    backend
+        .load(None)
+        .await
+        .expect("the load starts the backend again and loads");
+
+    assert_eq!(fake.starts(), 2, "the dead backend is started once more");
+    assert_eq!(
+        fake.posts(),
+        [Post {
+            path: "/v1/load".into(),
+            body: model_body(),
+            start: 2
+        }]
+    );
+    let held = SubprocessBackend::start_with(&TEST, dir.start(), Arc::new(fake.clone())).await;
+    assert!(
+        held.is_err(),
+        "the restarted backend still holds its instance"
+    );
+    backend.shutdown().await;
+}
+
+/// The case the restart is for: a driver fault in the prepare takes the
+/// process with it. The prepare reports nothing, as ever, and the load starts
+/// the backend again and does the whole setup there.
+#[tokio::test]
+async fn a_backend_that_dies_in_its_prepare_still_loads() {
+    let dir = BackendDir::new("died-in-prepare");
+    let fake = Fake::new(Prepare::Dies);
+    let mut backend = SubprocessBackend::start_with(&TEST, dir.start(), Arc::new(fake.clone()))
+        .await
+        .expect("the backend starts");
+
+    backend.prepare().await;
+    backend
+        .load(None)
+        .await
+        .expect("a backend that died in its prepare still loads");
+
+    assert_eq!(backend.device(), "cpu");
+    assert_eq!(fake.starts(), 2);
+    assert_eq!(
+        fake.posts(),
+        [
+            Post {
+                path: "/v1/prepare".into(),
+                body: model_body(),
+                start: 1
+            },
+            Post {
+                path: "/v1/load".into(),
+                body: model_body(),
+                start: 2
+            },
+        ]
+    );
+    backend.shutdown().await;
 }
