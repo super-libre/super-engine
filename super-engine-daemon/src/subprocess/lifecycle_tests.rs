@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! A backend's lifecycle — start, load — driven against a backend served
-//! in-process, which stands in for the sandbox and can be killed.
+//! A backend's lifecycle — start, prepare, load — driven against a backend
+//! served in-process, which stands in for the sandbox and can be killed.
 //!
 //! Everything but the sandbox is the real path: the claim, the socket and
 //! cache directories, the requests over the Unix socket, the status polls.
 
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyper::body::Incoming;
@@ -17,14 +16,28 @@ use tokio::net::UnixListener;
 
 use super::*;
 
-/// What a test's stand-in backend was asked, across every time it was
-/// started. Cloned into each server it runs, so a test reads what all of them
-/// saw.
+/// A test's stand-in backend: how it answers a prepare, and what it was
+/// asked across every time it was started. Cloned into each server it runs,
+/// so a test reads what all of them saw.
 #[derive(Clone, Default)]
 struct Fake(Arc<Seen>);
 
+/// How the stand-in answers `POST /v1/prepare`.
+#[derive(Clone, Copy, Default)]
+enum Prepare {
+    /// `202`, then `preparing` until the load, which carries on from it.
+    #[default]
+    Accepts,
+    /// Refuses with this status: `404` from a backend without the route,
+    /// `409` from one already loading, `500` from one that failed.
+    Refuses(u16),
+    /// Closes the connection without answering.
+    HangsUp,
+}
+
 #[derive(Default)]
 struct Seen {
+    prepare: Prepare,
     /// How many times the backend has been started.
     starts: AtomicUsize,
     /// Each `POST`, in order: its path, its body, and which start it reached.
@@ -45,10 +58,18 @@ struct Post {
 #[derive(Clone, Copy)]
 enum State {
     Starting,
+    Preparing,
     Ready,
 }
 
 impl Fake {
+    fn new(prepare: Prepare) -> Self {
+        Self(Arc::new(Seen {
+            prepare,
+            ..Seen::default()
+        }))
+    }
+
     fn posts(&self) -> Vec<Post> {
         self.0.posts.lock().clone()
     }
@@ -57,7 +78,7 @@ impl Fake {
         self.0.starts.load(Ordering::SeqCst)
     }
 
-    /// Answer one request the way a backend would.
+    /// Answer one request the way a backend would, or `None` to hang up.
     fn answer(
         &self,
         start: usize,
@@ -65,7 +86,7 @@ impl Fake {
         method: &hyper::Method,
         path: &str,
         body: &[u8],
-    ) -> (u16, serde_json::Value) {
+    ) -> Option<(u16, serde_json::Value)> {
         if method == hyper::Method::POST {
             self.0.posts.lock().push(Post {
                 path: path.to_string(),
@@ -74,20 +95,31 @@ impl Fake {
             });
         }
         let mut state = state.lock();
-        match (path, *state) {
-            ("/v1/ping", _) => (200, serde_json::json!({ "status": "success" })),
-            ("/v1/load", State::Starting) => {
-                *state = State::Ready;
-                (202, serde_json::json!({ "status": "success" }))
+        Some(match (path, *state, self.0.prepare) {
+            ("/v1/ping", ..) => (200, serde_json::json!({ "status": "success" })),
+            ("/v1/prepare", _, Prepare::HangsUp) => return None,
+            ("/v1/prepare", _, Prepare::Refuses(code)) => (code, error("refused")),
+            ("/v1/prepare", State::Starting | State::Preparing, Prepare::Accepts) => {
+                *state = State::Preparing;
+                (202, accepted("Preparing started"))
             }
-            ("/v1/load", State::Ready) => (409, error("already_loading")),
-            ("/v1/status", State::Starting) => (200, status("starting")),
-            ("/v1/status", State::Ready) => (
+            ("/v1/load", State::Starting | State::Preparing, _) => {
+                *state = State::Ready;
+                (202, accepted("Loading started"))
+            }
+            ("/v1/prepare" | "/v1/load", State::Ready, _) => (409, error("already_loading")),
+            ("/v1/status", State::Starting, _) => (200, status("starting")),
+            ("/v1/status", State::Preparing, _) => (
+                200,
+                serde_json::json!({ "status": "success", "state": "preparing",
+                    "phase": "initial_setup", "step": "building_kernels", "progress": 0.5 }),
+            ),
+            ("/v1/status", State::Ready, _) => (
                 200,
                 serde_json::json!({ "status": "success", "state": "ready", "device": "cpu" }),
             ),
             _ => (404, error("not_found")),
-        }
+        })
     }
 
     /// Serve one start of the backend on `socket` until it is killed.
@@ -117,13 +149,16 @@ impl Fake {
                             .await
                             .map(http_body_util::Collected::to_bytes)
                             .unwrap_or_default();
-                        let (status, json) = fake.answer(start, &state, &method, &path, &body);
-                        let response = Response::builder()
+                        // An error from the service is how hyper is told to
+                        // drop the connection without a response.
+                        let (status, json) = fake
+                            .answer(start, &state, &method, &path, &body)
+                            .ok_or("hung up")?;
+                        Response::builder()
                             .status(status)
                             .header("content-type", "application/json")
                             .body(Full::new(Bytes::from(json.to_string())))
-                            .expect("a response from parts that are valid");
-                        Ok::<_, Infallible>(response)
+                            .map_err(|_| "a response from parts that are valid")
                     }
                 });
                 connections.spawn(async move {
@@ -145,6 +180,10 @@ impl Fake {
         }
         let _ = std::fs::remove_file(socket);
     }
+}
+
+fn accepted(message: &str) -> serde_json::Value {
+    serde_json::json!({ "status": "success", "message": message })
 }
 
 fn status(state: &str) -> serde_json::Value {
@@ -294,4 +333,69 @@ async fn a_started_backend_holds_its_instance() {
         "the refused start must not spawn anything"
     );
     first.shutdown().await;
+}
+
+/// The order a product drives a model with `prepare_files` in: start, prepare
+/// while the rest downloads, load. The prepare carries the load's body, and
+/// the load goes to the same backend, which carries on from its prepare.
+#[tokio::test]
+async fn a_prepare_goes_before_the_load_with_the_load_body() {
+    let dir = BackendDir::new("prepare-then-load");
+    let fake = Fake::new(Prepare::Accepts);
+    let mut backend = SubprocessBackend::start_with(&TEST, dir.start(), Arc::new(fake.clone()))
+        .await
+        .expect("the backend starts");
+
+    backend.prepare().await;
+    backend
+        .load(None)
+        .await
+        .expect("the prepared backend loads");
+
+    assert_eq!(backend.device(), "cpu");
+    assert_eq!(
+        fake.posts(),
+        [
+            Post {
+                path: "/v1/prepare".into(),
+                body: model_body(),
+                start: 1
+            },
+            Post {
+                path: "/v1/load".into(),
+                body: model_body(),
+                start: 1
+            },
+        ]
+    );
+    assert_eq!(fake.starts(), 1, "a live backend is not started again");
+    backend.shutdown().await;
+}
+
+/// A prepare is best effort. Whatever the backend answers, and whether it
+/// answers at all, the load still goes ahead and does the whole setup itself.
+#[tokio::test]
+async fn a_prepare_that_fails_does_not_fail_the_load() {
+    for (name, prepare) in [
+        ("not-served", Prepare::Refuses(404)),
+        ("already-loading", Prepare::Refuses(409)),
+        ("failed", Prepare::Refuses(500)),
+        ("hung-up", Prepare::HangsUp),
+    ] {
+        let dir = BackendDir::new(&format!("prepare-{name}"));
+        let fake = Fake::new(prepare);
+        let mut backend = SubprocessBackend::start_with(&TEST, dir.start(), Arc::new(fake.clone()))
+            .await
+            .expect("the backend starts");
+
+        backend.prepare().await;
+        backend
+            .load(None)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: a failed prepare must not fail the load: {e:#}"));
+
+        let paths: Vec<String> = fake.posts().into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, ["/v1/prepare", "/v1/load"], "{name}");
+        backend.shutdown().await;
+    }
 }

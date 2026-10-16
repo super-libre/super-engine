@@ -5,10 +5,11 @@
 //! it to answer on its pathname Unix socket, has it load one model, and then
 //! carries the product's `/v1` requests to it. What those requests are — a
 //! transcription, a synthesis — is the product's. This module knows only the
-//! part of the contract every product shares: `/v1/ping`, `/v1/load`,
-//! `/v1/status`, and the secret/option headers every request carries. The
-//! model's files are provisioned by the product before the load (see
-//! [`crate::download`]); the backend itself shares no code with the daemon.
+//! part of the contract every product shares: `/v1/ping`, `/v1/prepare`,
+//! `/v1/load`, `/v1/status`, and the secret/option headers every request
+//! carries. The model's files are provisioned by the product, a prepare's
+//! before the prepare and the rest before the load (see [`crate::download`]);
+//! the backend itself shares no code with the daemon.
 //!
 //! The sandbox is the one genuinely per-platform part: a hardened
 //! `systemd-run --user` transient unit on Linux (`systemd`), a `sandbox-exec`
@@ -29,7 +30,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
-use log::info;
+use log::{info, warn};
 use super_engine_protocol::ProductSpec;
 use super_engine_protocol::models::load_progress::LoadProgress;
 use super_engine_spec::manifest::Device;
@@ -381,6 +382,46 @@ impl SubprocessBackend {
         Ok(backend)
     }
 
+    /// Have the backend build what its first load needs, from the files
+    /// already on disk, while the product downloads the rest.
+    ///
+    /// Only for a model that declares
+    /// [`prepare_files`](super_engine_spec::manifest::ModelEntry::prepare_files),
+    /// once those files are on disk. The body is the load's. The backend
+    /// answers at once and prepares in the background, and [`load`](Self::load)
+    /// carries on from wherever the prepare got to, so nothing here waits for
+    /// the prepare to finish.
+    ///
+    /// Best effort, so it does not fail. A backend that refuses, does not
+    /// answer, or cannot be reached is logged, and its load does the whole
+    /// setup itself, as it would have with no prepare.
+    pub async fn prepare(&self) {
+        let label = self.label();
+        let body = self.load_body.to_string().into_bytes();
+        let answer = tokio::time::timeout(
+            PREPARE_TIMEOUT,
+            self.request("POST", "/v1/prepare", &json_headers(), body),
+        )
+        .await;
+        match answer {
+            Ok(Ok((202 | 200, _))) => info!("backend {label} is preparing its first load"),
+            Ok(Ok((status, resp))) => warn!(
+                "backend {label} answered {status} to the prepare, so its load will do the whole \
+                 setup: {}",
+                String::from_utf8_lossy(&resp)
+            ),
+            Ok(Err(e)) => warn!(
+                "could not ask backend {label} to prepare, so its load will do the whole setup: \
+                 {e:#}"
+            ),
+            Err(_) => warn!(
+                "backend {label} did not answer the prepare within {} seconds, so its load will \
+                 do the whole setup",
+                PREPARE_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
     /// Poll `/v1/ping` until the backend is serving or the deadline passes.
     async fn wait_for_ping(&self, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
@@ -419,7 +460,7 @@ impl SubprocessBackend {
         &mut self,
         on_load_progress: Option<&(dyn Fn(LoadProgress) + Send + Sync)>,
     ) -> Result<()> {
-        let body = serde_json::to_vec(&self.load_body)?;
+        let body = self.load_body.to_string().into_bytes();
         let (status, resp) = self
             .request("POST", "/v1/load", &json_headers(), body)
             .await?;
@@ -623,6 +664,13 @@ impl Drop for SubprocessBackend {
 
 /// How long a backend gets to answer `/v1/ping` once its sandbox has started.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a backend gets to answer `POST /v1/prepare`.
+///
+/// The contract has it answer at once and prepare in the background, so this
+/// only bounds a backend that never answers. A prepare is best effort, and the
+/// download it overlaps must not wait on one.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a load may take before the daemon gives up on it, when the
 /// backend does not report its progress.
