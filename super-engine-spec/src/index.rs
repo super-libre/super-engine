@@ -651,6 +651,7 @@ mod tests {
                 version = "1.0.0"
                 kind = "wasm"
                 entrypoint = "y.wasm"
+                product = "super-test"
                 contract = "{contract}"
                 description = "Test backend."
 

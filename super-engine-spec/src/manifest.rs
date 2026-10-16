@@ -96,8 +96,14 @@ pub struct BackendMeta<C> {
     /// Must not escape the backend directory: no absolute paths, no `..`
     /// components, no backslashes, no embedded NUL.
     pub entrypoint: String,
-    /// The backend-protocol contract generation implemented. See
-    /// [`Generation`].
+    /// The product this backend is built for, by its slug, e.g. `super-stt`.
+    /// A manifest naming any product other than the one parsing it is
+    /// refused. Optional on the type so manifests written before the field
+    /// keep loading; a product's contract makes it required.
+    #[serde(default)]
+    pub product: Option<String>,
+    /// The backend-protocol contract generation implemented, as
+    /// [`product`](Self::product) numbers them. See [`Generation`].
     pub contract: C,
     /// License of the backend: a current SPDX identifier that is OSI-approved
     /// or FSF Free/Libre (e.g. `Apache-2.0`, `MIT`, `GPL-3.0-only`), or the
@@ -1009,6 +1015,15 @@ pub enum ManifestError {
     /// `[backend].id` is present but not a well-formed reverse-DNS id.
     #[error("`[backend].id` is not a valid reverse-DNS id: {0}")]
     InvalidId(String),
+    /// `[backend].product` names a product other than the one parsing the
+    /// manifest.
+    #[error("this backend is built for {declared}, not {expected}")]
+    OtherProduct {
+        /// The product the manifest names.
+        declared: String,
+        /// The slug of the product parsing it.
+        expected: &'static str,
+    },
     /// A field was declared that the manifest's `contract` does not include.
     ///
     /// Both fixes are named because they are not equivalent: raising the
@@ -1031,15 +1046,18 @@ pub enum ManifestError {
     /// A field the manifest's `contract` requires was not declared.
     #[error(
         "`contract = \"{declared}\"` requires `{field}`, which this manifest does not \
-         declare — add it, or drop to `contract = \"{previous}\"` where it is optional"
+         declare — add it{}",
+        or_drop_to(.previous.as_deref())
     )]
     FieldRequiredByContract {
         /// The field, spelled as in the manifest (e.g. `[backend].id`).
         field: String,
         /// The generation the manifest declares, as the manifest spells it.
         declared: String,
-        /// The newest generation that does not require it.
-        previous: String,
+        /// The newest generation that does not require it. `None` when the
+        /// product's first generation already does, so adding it is the only
+        /// fix.
+        previous: Option<String>,
     },
     /// A `[[models.files]]` `destination` is not a safe relative path.
     #[error("backend.toml file destination {0:?} is not a safe relative path")]
@@ -1194,11 +1212,39 @@ fn contract_violation<P: Product>(
                 Some(ManifestError::FieldRequiredByContract {
                     field: field.path(),
                     declared: declared.to_string(),
-                    previous: field.since.previous().unwrap_or(field.since).to_string(),
+                    previous: field.since.previous().map(|c| c.to_string()),
                 })
             }
             _ => None,
         })
+}
+
+/// The second half of [`ManifestError::FieldRequiredByContract`]'s message:
+/// the generation that would let the field go, when there is one.
+fn or_drop_to(previous: Option<&str>) -> String {
+    previous.map_or_else(String::new, |previous| {
+        format!(", or drop to `contract = \"{previous}\"` where it is optional")
+    })
+}
+
+/// What a manifest names in `[backend].product`, read from the text on its own.
+///
+/// Separate from the typed parse so it can run first. A manifest written for
+/// another product fails that parse in ways that say nothing about why: an
+/// unknown contract, or a rule of a field this product does not have. And when
+/// it does not fail, nothing else in it would refuse it. `None` when the field
+/// is absent, or when the text does not get this far, so the typed parse
+/// reports the error with its location.
+fn declared_product(text: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Head {
+        backend: HeadBackend,
+    }
+    #[derive(Deserialize)]
+    struct HeadBackend {
+        product: Option<String>,
+    }
+    toml::from_str::<Head>(text).ok()?.backend.product
 }
 
 impl<P: Product> Manifest<P> {
@@ -1209,9 +1255,10 @@ impl<P: Product> Manifest<P> {
     /// lives in the single canonical parser so every consumer inherits it.
     ///
     /// # Errors
-    /// Returns a [`ManifestError`] on TOML errors, an unsafe entrypoint or
-    /// file destination, a malformed `[backend].id`, a malformed
-    /// `[[assets.subprocess]]` entry, a field the declared
+    /// Returns a [`ManifestError`] on TOML errors, a `[backend].product` that
+    /// is not this product ([`OtherProduct`](ManifestError::OtherProduct)),
+    /// an unsafe entrypoint or file destination, a malformed `[backend].id`,
+    /// a malformed `[[assets.subprocess]]` entry, a field the declared
     /// [`contract`](Generation) does not include
     /// ([`FieldRequiresContract`](ManifestError::FieldRequiresContract)), or a
     /// rule of the product's own ([`Product::validate`]).
@@ -1233,13 +1280,25 @@ impl<P: Product> Manifest<P> {
     /// import-from-directory, and the indexer — goes through
     /// [`parse`](Self::parse).
     ///
+    /// The product rule is not exempt. A backend built for another product
+    /// cannot run here however it got onto disk, so it leaves the catalog.
+    ///
     /// # Errors
-    /// As [`parse`](Self::parse), less `FieldRequiresContract`.
+    /// As [`parse`](Self::parse), less `FieldRequiresContract` and
+    /// `FieldRequiredByContract`.
     pub fn parse_installed(text: &str) -> Result<Self, ManifestError> {
         Self::parse_inner(text, ContractFields::Ignored)
     }
 
     fn parse_inner(text: &str, fields: ContractFields) -> Result<Self, ManifestError> {
+        if let Some(declared) = declared_product(text)
+            && declared != P::SLUG
+        {
+            return Err(ManifestError::OtherProduct {
+                declared,
+                expected: P::SLUG,
+            });
+        }
         let mut m: Self = toml::from_str(text)?;
         // Every field defaults when absent, so the typed struct cannot tell
         // "declared the field" from "left it out". The raw document can, and
@@ -1641,6 +1700,7 @@ mod tests {
             version = "1.0.0"
             kind = "wasm"
             entrypoint = "y.wasm"
+            product = "super-test"
             contract = "{contract}"
             description = "Test backend."
 
@@ -1704,6 +1764,120 @@ mod tests {
         let without_id = manifest_with("v1", "").replace("            id = \"app.test.y\"\n", "");
         let m = Manifest::parse(&without_id).expect("v1 does not require an id");
         assert_eq!(m.backend.id, None);
+    }
+
+    /// The manifest's text with `[backend].product` removed.
+    fn without_product(text: &str) -> String {
+        text.replace("            product = \"super-test\"\n", "")
+    }
+
+    /// The product's own slug is the one value that parses.
+    #[test]
+    fn a_manifest_naming_this_product_parses() {
+        let m = Manifest::parse(&manifest_with("v2", "")).expect("own product parses");
+        assert_eq!(m.backend.product.as_deref(), Some("super-test"));
+    }
+
+    /// Any other value is refused, and the error names both products. Not just
+    /// the other product we know of: a typo is refused the same way.
+    #[test]
+    fn a_manifest_naming_any_other_product_is_refused() {
+        for other in ["super-other", "super-tset", ""] {
+            let text = manifest_with("v2", "")
+                .replace(r#"product = "super-test""#, &format!("product = {other:?}"));
+            match Manifest::parse(&text) {
+                Err(ManifestError::OtherProduct { declared, expected }) => {
+                    assert_eq!(declared, other);
+                    assert_eq!(expected, "super-test");
+                }
+                other => panic!("expected OtherProduct, got {other:?}"),
+            }
+        }
+        let err = Manifest::parse(&manifest_with("v2", "").replace("super-test", "super-other"))
+            .expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            "this backend is built for super-other, not super-test"
+        );
+    }
+
+    /// The product is checked before anything else, because another product's
+    /// manifest fails the rest in ways that do not say why. Its contract may be
+    /// one this product never had, and its fields may break rules of a field
+    /// with the same name here.
+    #[test]
+    fn another_products_manifest_is_refused_as_that_before_its_contract_is_read() {
+        let text = manifest_with("v9", "")
+            .replace(r#"product = "super-test""#, r#"product = "super-other""#);
+        assert!(matches!(
+            Manifest::parse(&text),
+            Err(ManifestError::OtherProduct { .. })
+        ));
+    }
+
+    /// Unlike the contract-field rule, the product rule holds at discovery
+    /// too: a backend built for another product cannot run here, however it
+    /// got onto disk.
+    #[test]
+    fn an_installed_manifest_for_another_product_is_refused() {
+        let text = manifest_with("v1", "").replace("super-test", "super-other");
+        assert!(matches!(
+            Manifest::parse_installed(&text),
+            Err(ManifestError::OtherProduct { .. })
+        ));
+    }
+
+    /// The test product's v2 requires the field, the way a product's newer
+    /// generation does once its older ones were published without it.
+    #[test]
+    fn a_v2_manifest_must_declare_its_product() {
+        let err = Manifest::parse(&without_product(&manifest_with("v2", "")))
+            .expect_err("v2 requires a product");
+        assert_eq!(
+            err.to_string(),
+            "`contract = \"v2\"` requires `[backend].product`, which this manifest does \
+             not declare — add it, or drop to `contract = \"v1\"` where it is optional"
+        );
+    }
+
+    /// v1 predates the field, so a manifest without it is still read as this
+    /// product's: that is what every manifest published before it was.
+    #[test]
+    fn a_v1_manifest_may_omit_its_product() {
+        let m = Manifest::parse(&without_product(&manifest_with("v1", "")))
+            .expect("v1 does not require a product");
+        assert_eq!(m.backend.product, None);
+    }
+
+    /// A product can require a field from its first generation, and then there
+    /// is no older contract to drop to. The message offers only the fix that
+    /// exists.
+    #[test]
+    fn a_field_required_from_the_first_generation_names_one_fix() {
+        let err = ManifestError::FieldRequiredByContract {
+            field: "[backend].product".into(),
+            declared: "v1".into(),
+            previous: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "`contract = \"v1\"` requires `[backend].product`, which this manifest does \
+             not declare — add it"
+        );
+    }
+
+    /// A value of the wrong type is not a product name to compare. It is left
+    /// to the typed parse, which says where it is.
+    #[test]
+    fn a_product_that_is_not_a_string_is_a_located_parse_error() {
+        let text = manifest_with("v2", "").replace(r#"product = "super-test""#, "product = 1");
+        let err = Manifest::parse(&text).expect_err("not a string");
+        let text = err.to_string();
+        assert!(matches!(err, ManifestError::Toml(_)), "got {text}");
+        assert!(
+            text.contains("line"),
+            "error should carry a location: {text}"
+        );
     }
 
     /// The requirement is on *declaring* the field, and the value is still

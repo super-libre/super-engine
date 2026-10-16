@@ -391,6 +391,7 @@ fn the_schema_gates_role_on_contract_v2() {
 
     let mut v2 = wasm_base();
     v2["backend"]["contract"] = json!("v2");
+    v2["backend"]["product"] = json!("super-test");
     v2["models"] = json!([post_processor_model()]);
     let errors: Vec<String> = v.iter_errors(&v2).map(|e| e.to_string()).collect();
     assert!(
@@ -420,6 +421,34 @@ fn the_schema_gates_role_on_contract_v2() {
         v.is_valid(&plain),
         "a v1 manifest without v2 fields stays valid"
     );
+}
+
+/// A schema is one product's, so `product` takes that product's slug and
+/// nothing else, and the generation that requires it says so. The schema half
+/// of `Manifest::parse`'s `OtherProduct` and `FieldRequiredByContract`.
+#[test]
+fn the_schema_takes_only_its_own_product() {
+    let v = backend_validator();
+
+    let mut own = wasm_base();
+    own["backend"]["product"] = json!(TestProduct::SLUG);
+    assert!(v.is_valid(&own), "the product's own slug validates");
+
+    let mut other = wasm_base();
+    other["backend"]["product"] = json!("super-other");
+    let at: Vec<String> = v
+        .iter_errors(&other)
+        .map(|e| e.instance_path().to_string())
+        .collect();
+    assert!(
+        at.iter().any(|path| path.ends_with("/backend/product")),
+        "another product is refused at the field: {at:#?}"
+    );
+
+    let mut v2_without = wasm_base();
+    v2_without["backend"]["contract"] = json!("v2");
+    assert!(!v.is_valid(&v2_without), "v2 requires the field");
+    assert!(v.is_valid(&wasm_base()), "v1 may omit it");
 }
 
 /// Every generation the parser knows is one the schema offers, and nothing

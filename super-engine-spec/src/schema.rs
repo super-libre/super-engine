@@ -312,11 +312,18 @@ where
     }
 
     // Per-definition conditionals.
-    inject_definition_rules(
-        root.get_mut("definitions")
-            .and_then(Value::as_object_mut)
-            .expect("definitions"),
-    );
+    let defs = root
+        .get_mut("definitions")
+        .and_then(Value::as_object_mut)
+        .expect("definitions");
+    inject_definition_rules(defs);
+
+    // This schema is one product's, so `product` has one legal value: the
+    // parser refuses every other, and an editor says so where it is typed.
+    defs.get_mut("BackendMeta").expect("BackendMeta def")["properties"]["product"]
+        .as_object_mut()
+        .expect("product property")
+        .insert("const".into(), json!(P::SLUG));
 
     close_objects(&mut root);
     root

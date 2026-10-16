@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! A product for this crate's own tests.
 //!
-//! Its contract exercises every rule the crate enforces: two generations, fields the second one adds, a field it
+//! Its contract exercises every rule the crate enforces: two generations, fields the second one adds, fields it
 //! makes required, and product keys in both `[capabilities]` and
 //! `[[models]]`. Compiled only for tests (the `test-product` feature is how the
 //! integration tests reach it).
@@ -25,7 +25,7 @@ pub enum Contract {
     /// The first generation.
     V1,
     /// v1 plus `[[models]].role` and `[[models]].force_preview_support`, and
-    /// `[backend].id` becomes required.
+    /// `[backend].id` and `[backend].product` become required.
     V2,
 }
 
@@ -159,6 +159,8 @@ impl Product for TestProduct {
     type Model = Model;
     type IndexModel = IndexModel;
 
+    const SLUG: &'static str = "super-test";
+
     const CONTRACT_FIELDS: &'static [ContractField<Contract>] = &[
         ContractField {
             since: Contract::V2,
@@ -177,6 +179,12 @@ impl Product for TestProduct {
             rule: FieldRule::RequiredFrom,
             table: "backend",
             key: "id",
+        },
+        ContractField {
+            since: Contract::V2,
+            rule: FieldRule::RequiredFrom,
+            table: "backend",
+            key: "product",
         },
     ];
 

@@ -34,8 +34,14 @@ pub trait Product: Clone + fmt::Debug + Send + Sync + 'static {
     /// `name` and `supported_devices`.
     type IndexModel: Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync;
 
-    /// Every field rule a generation after the first introduces. See
-    /// [`ContractField`].
+    /// The product's slug, e.g. `super-stt`: the one value a manifest's
+    /// `[backend].product` may name. [`Manifest::parse`] refuses any other,
+    /// because nothing else in a manifest tells two products apart. Contract
+    /// names like `v1` are per product, and each product's own keys are ones
+    /// the other's parser ignores.
+    const SLUG: &'static str;
+
+    /// Every field rule a generation introduces. See [`ContractField`].
     const CONTRACT_FIELDS: &'static [ContractField<Self::Contract>];
 
     /// Names the generated JSON schemas publish under.
