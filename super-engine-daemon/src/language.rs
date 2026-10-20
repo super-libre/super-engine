@@ -40,6 +40,41 @@ fn base(tag: &str) -> &str {
     tag.split('-').next().unwrap_or(tag)
 }
 
+/// Primary subtags that name one language under two spellings, matched either
+/// way round, so a tag reaches a model that declares the other spelling.
+///
+/// The first is a judgment call: IANA registers `fil` (Filipino) and `tl`
+/// (Tagalog) as separate languages, but Filipino is standardized Tagalog, and
+/// backends disagree on which to declare for one language — Qwen3-ASR's `fil`,
+/// Whisper's and Deepgram's `tl` — while the global list offers `tl-PH`. The
+/// rest are IANA's deprecated subtags and their `Preferred-Value`s, which older
+/// tools still emit: Whisper names Javanese `jw`.
+///
+/// A macrolanguage is not the same language as each of its members, so none
+/// is listed: `yue` (Cantonese) must not resolve to `zh`, nor `nn` (Nynorsk) to
+/// `no`.
+const EQUIVALENT_BASES: &[(&str, &str)] = &[
+    ("fil", "tl"),
+    ("he", "iw"),
+    ("id", "in"),
+    ("jv", "jw"),
+    ("ro", "mo"),
+    ("yi", "ji"),
+];
+
+/// `base`, then every other spelling of it.
+fn base_spellings(base: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(base).chain(EQUIVALENT_BASES.iter().filter_map(move |&(a, b)| {
+        if a == base {
+            Some(b)
+        } else if b == base {
+            Some(a)
+        } else {
+            None
+        }
+    }))
+}
+
 /// The tags the global language setting accepts (`POST /settings/language`),
 /// and what `GET /settings/language/list` publishes.
 ///
@@ -75,23 +110,31 @@ pub fn is_offered_globally(tag: &str) -> bool {
 }
 
 /// Match a chosen tag against a model's `supported_languages` with region rules.
-/// Returns the value to send, or `None` to omit.
+/// Returns the value to send — always in the model's own spelling — or `None`
+/// to omit.
 fn adapt(tag: &str, supported: &[String]) -> Option<String> {
     if tag == "auto" {
         return Some("auto".to_string());
     }
-    if supported.iter().any(|s| s == tag) {
-        return Some(tag.to_string()); // exact (base or region)
+    let declared = |t: &str| supported.iter().any(|s| s == t);
+    let b = base(tag);
+    let qualifiers = &tag[b.len()..];
+    // Exact (base or region), under any spelling of the language: tl-PH
+    // reaches a model declaring fil-PH, and tl one declaring fil.
+    if let Some(t) = base_spellings(b)
+        .map(|s| format!("{s}{qualifiers}"))
+        .find(|t| declared(t))
+    {
+        return Some(t);
     }
     // No exact match: a region tag falls back to the base language when the
     // model lists it (e.g. es-MX → es), even if the model also carries region
     // variants for that language (e.g. a model listing `es` + `es-419`). Only when
     // the base isn't supported either is the language unsupported → omit.
-    if has_region(tag) {
-        let b = base(tag);
-        if supported.iter().any(|s| s == b) {
-            return Some(b.to_string());
-        }
+    if has_region(tag)
+        && let Some(b) = base_spellings(b).find(|b| declared(b))
+    {
+        return Some(b.to_string());
     }
     None
 }
@@ -207,6 +250,56 @@ mod tests {
         let r = resolve_language(true, None, Some("ja"), &s(&["en", "es"]));
         assert_eq!(r.wire, None);
         assert_eq!(r.source, LanguageSource::Default);
+    }
+
+    #[test]
+    fn global_tagalog_reaches_a_model_declaring_filipino() {
+        // The global list offers tl-PH; Qwen3-ASR declares `fil`.
+        let r = resolve_language(true, None, Some("tl-PH"), &s(&["en", "fil"]));
+        assert_eq!(r.wire.as_deref(), Some("fil"));
+        assert_eq!(r.source, LanguageSource::Global);
+    }
+
+    #[test]
+    fn equivalent_spellings_match_either_way_and_keep_the_model_spelling() {
+        let r = resolve_language(true, Some("fil-PH"), None, &s(&["en", "tl"]));
+        assert_eq!(r.wire.as_deref(), Some("tl"));
+        let r = resolve_language(true, Some("fil"), None, &s(&["en", "tl"]));
+        assert_eq!(r.wire.as_deref(), Some("tl"));
+        let r = resolve_language(true, None, Some("he-IL"), &s(&["en", "iw"]));
+        assert_eq!(r.wire.as_deref(), Some("iw"));
+        let r = resolve_language(true, Some("jv"), None, &s(&["en", "jw"]));
+        assert_eq!(r.wire.as_deref(), Some("jw"));
+    }
+
+    #[test]
+    fn equivalent_spelling_keeps_the_region() {
+        let r = resolve_language(true, None, Some("tl-PH"), &s(&["en", "fil", "fil-PH"]));
+        assert_eq!(r.wire.as_deref(), Some("fil-PH"));
+    }
+
+    #[test]
+    fn own_spelling_wins_when_the_model_declares_both() {
+        let r = resolve_language(true, None, Some("tl-PH"), &s(&["fil", "tl"]));
+        assert_eq!(r.wire.as_deref(), Some("tl"));
+    }
+
+    #[test]
+    fn macrolanguage_members_are_not_equivalent() {
+        // Cantonese is not Chinese to a model, nor Nynorsk Norwegian.
+        let r = resolve_language(true, None, Some("zh-Hant"), &s(&["en", "yue"]));
+        assert_eq!(r.wire, None);
+        let r = resolve_language(true, None, Some("no-NO"), &s(&["en", "nn"]));
+        assert_eq!(r.wire, None);
+    }
+
+    #[test]
+    fn each_base_has_at_most_one_other_spelling() {
+        let mut bases: Vec<&str> = EQUIVALENT_BASES.iter().flat_map(|&(a, b)| [a, b]).collect();
+        let n = bases.len();
+        bases.sort_unstable();
+        bases.dedup();
+        assert_eq!(bases.len(), n, "a base listed twice");
     }
 
     #[test]
