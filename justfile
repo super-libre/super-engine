@@ -18,8 +18,8 @@ test *args:
 doctest *args:
     cargo test --workspace --all-features --doc {{ args }}
 
-# Full local CI gate: format, lint, tests, doctests
-ci: fmt-check check test doctest
+# Full local CI gate: format, lint, tests. `test` runs the doctests too.
+ci: fmt-check check test
 
 # Remove build artifacts
 clean:
