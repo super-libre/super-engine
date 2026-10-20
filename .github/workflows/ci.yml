@@ -32,14 +32,14 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Keyed on the rustc version as well as Cargo.lock. Cargo throws away a
+      # target directory an older stable built, and a key on the lockfile
+      # alone kept restoring one without ever saving a fresh one. Saved from
+      # main only; a pull request restores main's.
       - name: Cache dependencies
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run the CI gate
         run: just ci
@@ -63,13 +63,9 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache dependencies
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The runtime-directory code has a macOS arm of its own (the Darwin
       # per-user temp directory), so the gate runs here too.
