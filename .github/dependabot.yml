@@ -9,3 +9,14 @@ updates:
     schedule:
       interval: "weekly"
     target-branch: "main"
+    # Minor and patch bumps land together, one PR a week rather than one per
+    # action, each with a CI run of its own. A major arrives as its own PR: it
+    # can change what a workflow does, and red in the group it would hold back
+    # every routine bump behind it.
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

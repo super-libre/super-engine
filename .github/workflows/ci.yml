@@ -10,6 +10,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A job of its own, needing no system libraries or cache, so a formatting
+  # slip fails in seconds and does not stop clippy and the tests reporting.
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2.87.28
+        with:
+          tool: just
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: just fmt-check
+
   linux:
     name: Linux
     runs-on: ubuntu-latest
@@ -30,19 +49,24 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
+      # Keyed on the rustc version as well as Cargo.lock. Cargo throws away a
+      # target directory an older stable built, and a key on the lockfile
+      # alone kept restoring one without ever saving a fresh one. Saved from
+      # main only; a pull request restores main's.
       - name: Cache dependencies
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Run the CI gate
-        run: just ci
+      # The rest of `just ci`, a step per check so the job's page shows which
+      # one failed and how long each took.
+      - name: Run clippy
+        run: just check
+
+      - name: Run tests
+        run: just test
 
   macos:
     name: macOS
@@ -60,18 +84,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
       - name: Cache dependencies
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The runtime-directory code has a macOS arm of its own (the Darwin
-      # per-user temp directory), so the gate runs here too.
-      - name: Run the CI gate
-        run: just ci
+      # per-user temp directory), so clippy and the tests run here too.
+      - name: Run clippy
+        run: just check
+
+      - name: Run tests
+        run: just test
