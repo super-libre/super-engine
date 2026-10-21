@@ -69,7 +69,7 @@
     # OpenAPI: the daemons generate their protocol spec from the router and the
     # wire types, so the types here derive `ToSchema` behind an `openapi`
     # feature rather than being described a second time.
-    utoipa     = { version = "5.5.0", features = ["axum_extras", "chrono"] }
+    utoipa     = { version = "6.0.0", features = ["axum_extras", "chrono"] }
 
   [workspace.lints.clippy]
     pedantic = { level = "warn", priority = -1 }
