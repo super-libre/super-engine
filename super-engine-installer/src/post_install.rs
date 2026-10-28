@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Post-install steps run back in the unprivileged user process after the
-//! root phase has placed files: systemd service (re)start, applet panel
-//! restart, launcher-cache nudge and legacy `~/.local` cleanup, then any
+//! root phase has placed files: systemd service (re)start, app restart,
+//! applet panel restart, launcher-cache nudge and legacy `~/.local` cleanup, then any
 //! steps of the product's own ([`Installer::after_install`]). Every step is
 //! best-effort (`log::warn!` on failure) except the daemon restart, the one
 //! failure the app must hear about. The systemd unit is named after the
@@ -16,6 +16,7 @@
 //! needing a command-runner trait or a mocked OS.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use super_engine_protocol::ProductSpec;
 
@@ -55,6 +56,9 @@ pub enum Step {
     /// `systemctl --user restart|start <slug>` (verb picked at execution
     /// time, via `is-active`) — the one step whose failure is a hard error.
     RestartOrStart,
+    /// Restart the app windows left running the binary the root phase just
+    /// replaced, so they run the new release.
+    RestartApp,
     /// Restart `cosmic-panel` so it picks up the just-updated applet binary.
     RestartPanel,
     /// Nudge COSMIC's launcher caches (app grid + search backend) to rescan
@@ -69,16 +73,19 @@ pub enum Step {
 /// Decide which [`Step`]s to run, and in what order, from facts already known
 /// before any post-install I/O: `components` (what was just installed or
 /// updated), `applet_changes` (captured *before* the root phase ran: whether
-/// an applet binary the panel may be running is replaced or removed), and two
+/// an applet binary the panel may be running is replaced or removed), and three
 /// environment probes the caller
 /// (`run`) is expected to have already made: `systemctl_available` (a `$PATH`
-/// lookup) and `panel_running` (a `pgrep` check). `panel_running` only matters
+/// lookup), `panel_running` (a `pgrep` check) and `app_running` (whether an
+/// app window other than the one running this installer is on the installed
+/// binary). `panel_running` only matters
 /// when `components.applet && applet_changes` — a caller may cheaply
 /// pass `true` unconditionally for any other combination and it's simply
-/// ignored.
+/// ignored. `app_running` likewise only matters when `components.app`.
 ///
-/// Order: systemd install/enable/restart, then the applet's panel restart,
-/// then the launcher-cache nudge, then legacy cleanup. Every file is already
+/// Order: systemd install/enable/restart, then the app restart (after the
+/// daemon's, so the new app meets the new daemon), then the applet's panel
+/// restart, then the launcher-cache nudge, then legacy cleanup. Every file is already
 /// placed by the time this runs — that all happens earlier, in the root phase
 /// — so [`Step::CleanupLegacy`] is a single unconditional sweep rather than
 /// one pass per component; removing files that were never there is a no-op, so
@@ -90,6 +97,7 @@ pub fn plan(
     applet_changes: bool,
     systemctl_available: bool,
     panel_running: bool,
+    app_running: bool,
 ) -> Vec<Step> {
     let mut steps = Vec::new();
 
@@ -98,6 +106,10 @@ pub fn plan(
         steps.push(Step::RemoveLegacyUnit);
         steps.push(Step::Enable);
         steps.push(Step::RestartOrStart);
+    }
+
+    if components.app && app_running {
+        steps.push(Step::RestartApp);
     }
 
     if components.applet && applet_changes && panel_running {
@@ -155,6 +167,107 @@ async fn step_restart_or_start(unit: &str) -> Result<(), InstallError> {
             "daemon {verb} failed: run `systemctl --user {verb} {unit}` manually"
         )))
     }
+}
+
+/// How long an app window gets to quit before the installer gives up on
+/// restarting it.
+const APP_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Quit the app windows running the replaced binary, then start the new one.
+/// Left alone, a window keeps running the previous release, and the daemon
+/// refuses its session: its executable no longer matches the one the session
+/// was approved for, so the user is asked to approve the app all over again.
+/// When a window does not quit in time, no second one is started beside it.
+async fn step_restart_app(app: &Path, pids: &[u32]) {
+    for pid in pids {
+        let _ = cmd_ok("kill", &["-TERM", &pid.to_string()]).await;
+    }
+    let deadline = Instant::now() + APP_QUIT_TIMEOUT;
+    while pids
+        .iter()
+        .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+    {
+        if Instant::now() >= deadline {
+            log::warn!("the app did not quit; not starting the updated one beside it");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !launch_app(app).await {
+        log::warn!("failed to start the updated app {}", app.display());
+    }
+}
+
+/// Start `app` apart from this installer, so it outlives it: as a transient
+/// systemd user unit where there is one, as the desktop starts apps, or else
+/// in a session of its own.
+async fn launch_app(app: &Path) -> bool {
+    let app = app.to_string_lossy();
+    if on_path("systemd-run") {
+        cmd_ok("systemd-run", &["--user", "--collect", "--quiet", &app]).await
+    } else {
+        tokio::process::Command::new("setsid")
+            .args(["-f", &app])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|s| s.success())
+    }
+}
+
+/// The user's processes running the installed app at `app`, or the copy the
+/// root phase just replaced there, leaving out any that launched this
+/// installer: an in-app update restarts its own app when the user asks.
+fn running_app_pids(app: &Path) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let launchers = ancestors_of_self();
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| !launchers.contains(pid))
+        .filter(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| runs_app(&exe, app))
+        })
+        .collect()
+}
+
+/// Whether `exe`, a process's `/proc/<pid>/exe`, is `app`, or the copy of it
+/// replaced on disk, which `/proc` reports as `<app> (deleted)`.
+fn runs_app(exe: &Path, app: &Path) -> bool {
+    let exe = exe.as_os_str().as_encoded_bytes();
+    let app = app.as_os_str().as_encoded_bytes();
+    exe == app || exe.strip_suffix(b" (deleted)") == Some(app)
+}
+
+/// The pids of this process's parent, its parent's parent, and so on, short
+/// of init.
+fn ancestors_of_self() -> Vec<u32> {
+    let mut ancestors = Vec::new();
+    let mut pid = std::process::id();
+    while let Some(parent) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(parent_pid)
+        .filter(|&parent| parent > 1)
+    {
+        ancestors.push(parent);
+        pid = parent;
+    }
+    ancestors
+}
+
+/// The parent pid in a `/proc/<pid>/stat` line: the second field after the
+/// command name, which is in parentheses and may itself hold spaces or `)`.
+fn parent_pid(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 async fn step_restart_panel() {
@@ -267,12 +380,19 @@ pub async fn run(
     // guard itself, so passing `false` when it doesn't apply is equivalent.
     let panel_running =
         components.applet && applet_changes && cmd_ok("pgrep", &["-f", "cosmic-panel"]).await;
+    let app = prefix.join(format!("bin/{}-app", product.slug));
+    let app_pids = if components.app {
+        running_app_pids(&app)
+    } else {
+        Vec::new()
+    };
 
     for step in plan(
         *components,
         applet_changes,
         systemctl_available,
         panel_running,
+        !app_pids.is_empty(),
     ) {
         match step {
             Step::DaemonReload => step_daemon_reload().await,
@@ -288,6 +408,7 @@ pub async fn run(
             // module's doc comment, which documents `RestartOrStart` as the
             // sole hard error.
             Step::RestartOrStart => step_restart_or_start(unit).await?,
+            Step::RestartApp => step_restart_app(&app, &app_pids).await,
             Step::RestartPanel => step_restart_panel().await,
             Step::NudgeLaunchers => step_nudge_launchers().await,
             Step::CleanupLegacy => cleanup_legacy(product),
@@ -383,11 +504,27 @@ mod tests {
     #[test]
     fn plan_daemon_only_skips_launcher_nudge_and_applet_restart() {
         // Even with every environment probe favorable (systemctl+cosmic
-        // available, applet "already installed", panel "running") — none of
-        // that matters when the applet isn't part of THIS run's components.
-        let steps = plan(daemon_only(), true, true, true);
+        // available, applet "already installed", panel and app "running") —
+        // none of that matters when the applet and app aren't part of THIS
+        // run's components.
+        let steps = plan(daemon_only(), true, true, true, true);
         assert!(!steps.contains(&Step::NudgeLaunchers));
         assert!(!steps.contains(&Step::RestartPanel));
+        assert!(!steps.contains(&Step::RestartApp));
+    }
+
+    /// An app window is restarted only when this run replaced the app and a
+    /// window is on it.
+    #[test]
+    fn plan_app_restart_requires_the_app_selected_and_running() {
+        let app_only = Components {
+            daemon: false,
+            app: true,
+            applet: false,
+        };
+        assert!(plan(app_only, false, true, false, true).contains(&Step::RestartApp));
+        assert!(!plan(app_only, false, true, false, false).contains(&Step::RestartApp));
+        assert!(!plan(daemon_only(), false, true, false, true).contains(&Step::RestartApp));
     }
 
     #[test]
@@ -397,21 +534,21 @@ mod tests {
             app: false,
             applet: true,
         };
-        assert!(plan(applet_only, true, false, true).contains(&Step::RestartPanel));
+        assert!(plan(applet_only, true, false, true, false).contains(&Step::RestartPanel));
         // No running applet's binary changes (a fresh install, or an applet
         // already current): no restart even if the panel is running.
-        assert!(!plan(applet_only, false, false, true).contains(&Step::RestartPanel));
+        assert!(!plan(applet_only, false, false, true, false).contains(&Step::RestartPanel));
         // An applet's binary changes, but the panel isn't currently running:
         // nothing to restart.
-        assert!(!plan(applet_only, true, false, false).contains(&Step::RestartPanel));
+        assert!(!plan(applet_only, true, false, false, false).contains(&Step::RestartPanel));
         // Applet not selected THIS run (e.g. a daemon-only update), even
         // though it was installed before and the panel is running.
-        assert!(!plan(daemon_only(), true, false, true).contains(&Step::RestartPanel));
+        assert!(!plan(daemon_only(), true, false, true, false).contains(&Step::RestartPanel));
     }
 
     #[test]
     fn plan_no_systemctl_means_no_systemd_steps() {
-        let steps = plan(all_three(), true, false, true);
+        let steps = plan(all_three(), true, false, true, false);
         assert!(!steps.contains(&Step::DaemonReload));
         assert!(!steps.contains(&Step::RemoveLegacyUnit));
         assert!(!steps.contains(&Step::Enable));
@@ -425,7 +562,7 @@ mod tests {
             app: true,
             applet: false,
         };
-        let steps = plan(app_only, false, true, false);
+        let steps = plan(app_only, false, true, false, false);
         assert!(!steps.iter().any(|s| matches!(
             s,
             Step::DaemonReload | Step::RemoveLegacyUnit | Step::Enable | Step::RestartOrStart
@@ -434,8 +571,10 @@ mod tests {
 
     #[test]
     fn plan_cleanup_legacy_always_runs_regardless_of_every_other_gate() {
-        assert!(plan(Components::default(), false, false, false).contains(&Step::CleanupLegacy));
-        assert!(plan(all_three(), true, true, true).contains(&Step::CleanupLegacy));
+        assert!(
+            plan(Components::default(), false, false, false, false).contains(&Step::CleanupLegacy)
+        );
+        assert!(plan(all_three(), true, true, true, true).contains(&Step::CleanupLegacy));
     }
 
     #[test]
@@ -445,7 +584,7 @@ mod tests {
             app: true,
             applet: false,
         };
-        let steps = plan(app_only, false, true, false);
+        let steps = plan(app_only, false, true, false, false);
         assert!(steps.contains(&Step::NudgeLaunchers));
         assert!(
             !steps
@@ -458,11 +597,11 @@ mod tests {
     fn plan_full_update_interactive_uses_the_documented_step_order() {
         // Everything on: daemon+app+applet all selected (an "all" update),
         // the applet was already installed and its panel is currently
-        // running, systemctl and cosmic-panel both available, interactive
-        // session. The documented order for the "all" case: systemd
-        // install/enable/(re)start, applet panel restart, launcher nudge,
-        // legacy cleanup.
-        let steps = plan(all_three(), true, true, true);
+        // running, an app window is open, systemctl and cosmic-panel both
+        // available, interactive session. The documented order for the
+        // "all" case: systemd install/enable/(re)start, app restart, applet
+        // panel restart, launcher nudge, legacy cleanup.
+        let steps = plan(all_three(), true, true, true, true);
         assert_eq!(
             steps,
             vec![
@@ -470,11 +609,55 @@ mod tests {
                 Step::RemoveLegacyUnit,
                 Step::Enable,
                 Step::RestartOrStart,
+                Step::RestartApp,
                 Step::RestartPanel,
                 Step::NudgeLaunchers,
                 Step::CleanupLegacy,
             ]
         );
+    }
+
+    /// A window counts as running the installed app on the installed path, or
+    /// on the copy the root phase replaced there, and on nothing else: not a
+    /// development build of the same name, nor a path that merely starts
+    /// with it.
+    #[test]
+    fn a_window_runs_the_app_on_its_path_or_the_replaced_copy() {
+        let app = Path::new("/usr/local/bin/super-test-app");
+        assert!(runs_app(Path::new("/usr/local/bin/super-test-app"), app));
+        assert!(runs_app(
+            Path::new("/usr/local/bin/super-test-app (deleted)"),
+            app
+        ));
+        assert!(!runs_app(
+            Path::new("/home/u/super-test/target/debug/super-test-app"),
+            app
+        ));
+        assert!(!runs_app(
+            Path::new("/usr/local/bin/super-test-app-old"),
+            app
+        ));
+    }
+
+    /// The parent pid comes after the command name, which can hold spaces
+    /// and parentheses of its own.
+    #[test]
+    fn parent_pid_reads_past_the_command_name() {
+        assert_eq!(parent_pid("123 (super-test-app) S 45 123 123 0"), Some(45));
+        assert_eq!(parent_pid("123 (a b) c) S 7 123 123 0"), Some(7));
+        assert_eq!(parent_pid("garbage"), None);
+    }
+
+    /// This process's own ancestry is readable, and never includes itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestors_of_self_names_the_parent_first() {
+        let ancestors = ancestors_of_self();
+        assert_eq!(
+            ancestors.first().copied(),
+            Some(std::os::unix::process::parent_id()).filter(|&p| p > 1)
+        );
+        assert!(!ancestors.contains(&std::process::id()));
     }
 
     /// The per-user leftovers are the product's own: its binaries, launcher
