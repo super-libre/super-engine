@@ -6,11 +6,15 @@
 use anyhow::Result;
 use cpal::Device;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use super_engine_protocol::ProductSpec;
 use super_engine_protocol::models::theme::AudioTheme;
+
+/// Silence played after the last tone, so the fade-out is not cut off when the
+/// stream stops.
+const SILENCE_PADDING: Duration = Duration::from_millis(50);
 
 pub const WARMUP_TONE_DURATION_MS: u64 = 20;
 pub const WARMUP_TONE_FREQUENCY: f32 = 44000.0;
@@ -65,8 +69,8 @@ impl BeepParams {
         let fade_in_samples = crate::num_cast::f32_to_usize(sample_rate * fade_in_ms_f32 / 1000.0);
         let fade_out_samples =
             crate::num_cast::f32_to_usize(sample_rate * fade_out_ms_f32 / 1000.0);
-        // 50 ms silence padding to let the fade-out complete before the stream stops.
-        let silence_padding_samples = crate::num_cast::f32_to_usize(sample_rate * 0.05);
+        let silence_padding_samples =
+            crate::num_cast::f32_to_usize(sample_rate * SILENCE_PADDING.as_secs_f32());
         let total_samples_with_padding = total_samples + silence_padding_samples;
         let _ = device; // consumed only by build_stream; held here for coherence
         Self {
@@ -148,6 +152,45 @@ fn next_sample_f32(
     Some(value)
 }
 
+/// How many frames into a buffer the tone ends, when that buffer holds the
+/// tone's last sample: `clock_before` and `clock_after` are the sample clock
+/// before and after the buffer was filled. `None` for every other buffer.
+fn tone_end_in_buffer(
+    params: &BeepParams,
+    clock_before: usize,
+    clock_after: usize,
+) -> Option<usize> {
+    (clock_before < params.total_samples && clock_after >= params.total_samples)
+        .then(|| params.total_samples - clock_before)
+}
+
+/// How long after a buffer's callback the tone ends: the output's latency to
+/// the buffer's first frame, plus the frames ahead of the tone's end in it.
+fn tone_end_delay(latency: Duration, frames_ahead: usize, sample_rate: f32) -> Duration {
+    let frames = f64::from(u32::try_from(frames_ahead).unwrap_or(u32::MAX));
+    latency + Duration::try_from_secs_f64(frames / f64::from(sample_rate)).unwrap_or_default()
+}
+
+/// Record when the tone leaves the speakers, if the buffer just filled holds
+/// its last sample. Left unset when the output reports no usable timing.
+fn note_tone_end(
+    params: &BeepParams,
+    clock_before: usize,
+    clock_after: usize,
+    info: &cpal::OutputCallbackInfo,
+    tone_end: &OnceLock<Instant>,
+) {
+    let Some(frames_ahead) = tone_end_in_buffer(params, clock_before, clock_after) else {
+        return;
+    };
+    let timestamp = info.timestamp();
+    let Some(latency) = timestamp.playback.duration_since(&timestamp.callback) else {
+        return;
+    };
+    let _ =
+        tone_end.set(Instant::now() + tone_end_delay(latency, frames_ahead, params.sample_rate));
+}
+
 /// Build an output stream for the given device + config, wiring up the
 /// per-sample generator for both F32 and I16 sample formats.
 ///
@@ -160,6 +203,7 @@ fn build_stream(
     frequencies: Vec<f32>,
     volume: f32,
     finished: Arc<AtomicBool>,
+    tone_end: Arc<OnceLock<Instant>>,
 ) -> Result<cpal::Stream> {
     let channels = params.channels;
     match config.sample_format() {
@@ -169,7 +213,8 @@ fn build_stream(
             let stream = device
                 .build_output_stream(
                     &config.config(),
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                        let clock_before = sample_clock;
                         for frame in data.chunks_mut(channels) {
                             let v = next_sample_f32(
                                 &mut sample_clock,
@@ -184,6 +229,7 @@ fn build_stream(
                                 *s = v;
                             }
                         }
+                        note_tone_end(&params, clock_before, sample_clock, info, &tone_end);
                     },
                     |err| log::warn!("Audio stream error: {err}"),
                     None,
@@ -197,7 +243,8 @@ fn build_stream(
             let stream = device
                 .build_output_stream(
                     &config.config(),
-                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
+                        let clock_before = sample_clock;
                         for frame in data.chunks_mut(channels) {
                             let v = next_sample_f32(
                                 &mut sample_clock,
@@ -218,6 +265,7 @@ fn build_stream(
                                 *s = iv;
                             }
                         }
+                        note_tone_end(&params, clock_before, sample_clock, info, &tone_end);
                     },
                     |err| log::warn!("Audio stream error: {err}"),
                     None,
@@ -231,15 +279,17 @@ fn build_stream(
     }
 }
 
-/// Spin-wait until the stream finishes or the timeout elapses, then sleep
-/// an extra buffer-flush period and drop the stream.
+/// Spin-wait until the stream finishes or the timeout elapses, hold it until
+/// the sequence has played, then drop it. Returns the instant the tone
+/// finished playing.
 fn wait_for_completion(
     stream: cpal::Stream,
     finished: &AtomicBool,
+    tone_end: &OnceLock<Instant>,
     total_duration_ms: u64,
     freq_count: usize,
     sample_rate: f32,
-) {
+) -> Instant {
     let beep_start = std::time::Instant::now();
     // freq_count is a tiny count of frequencies (typically 1–4); fits u64.
     let freq_count_u64 = u64::try_from(freq_count).unwrap_or(u64::MAX);
@@ -252,15 +302,26 @@ fn wait_for_completion(
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Most audio drivers use 256–2048 sample buffers; assume ~1024 worst-case.
-    // 1024/sample_rate*1000 is in the range [~10, ~46] ms for typical rates, then clamped to
-    // [100, 200]. The f32 result is non-negative and well within u64 range; clamp before cast.
-    let buffer_flush_ms_f32 = (1024.0_f32 / sample_rate * 1000.0).clamp(0.0, f32::MAX);
-    let buffer_flush_ms = crate::num_cast::f32_to_u64(buffer_flush_ms_f32);
-    let buffer_flush_time = Duration::from_millis(buffer_flush_ms.clamp(100, 200));
-    std::thread::sleep(buffer_flush_time);
+    let played = if let Some(&tone_end) = tone_end.get() {
+        // The output reported when the tone leaves the speakers. Hold the
+        // stream through the silence after it, so the fade-out is not cut.
+        let hold_until = tone_end + SILENCE_PADDING;
+        std::thread::sleep(hold_until.saturating_duration_since(Instant::now()));
+        tone_end
+    } else {
+        // No timing from the output. Most audio drivers use 256–2048 sample
+        // buffers; assume ~1024 worst-case. 1024/sample_rate*1000 is in the range
+        // [~10, ~46] ms for typical rates, then clamped to [100, 200]. The f32
+        // result is non-negative and well within u64 range; clamp before cast.
+        let buffer_flush_ms_f32 = (1024.0_f32 / sample_rate * 1000.0).clamp(0.0, f32::MAX);
+        let buffer_flush_ms = crate::num_cast::f32_to_u64(buffer_flush_ms_f32);
+        let buffer_flush_time = Duration::from_millis(buffer_flush_ms.clamp(100, 200));
+        std::thread::sleep(buffer_flush_time);
+        Instant::now()
+    };
 
     drop(stream);
+    played
 }
 
 /// The variable that, set to `1`, makes every cue a no-op:
@@ -298,15 +359,36 @@ pub fn play_beep_sequence(
     fade_out_ms: u64,
     volume: f32,
 ) -> Result<()> {
+    play_sequence(
+        product,
+        frequencies,
+        duration_ms,
+        fade_in_ms,
+        fade_out_ms,
+        volume,
+    )
+    .map(|_played| ())
+}
+
+/// [`play_beep_sequence`], returning the instant the sequence finished
+/// playing (see [`play_beep_sequence_until_played`]).
+fn play_sequence(
+    product: &ProductSpec,
+    frequencies: &[f32],
+    duration_ms: u64,
+    fade_in_ms: u64,
+    fade_out_ms: u64,
+    volume: f32,
+) -> Result<Instant> {
     if frequencies.is_empty() {
-        return Ok(());
+        return Ok(Instant::now());
     }
     if cues_muted(product) {
         log::debug!(
             "{}=1 — skipping cue {frequencies:?}",
             mute_cues_env(product)
         );
-        return Ok(());
+        return Ok(Instant::now());
     }
 
     log::info!(
@@ -332,6 +414,7 @@ pub fn play_beep_sequence(
     let sample_rate = params.sample_rate;
 
     let finished = Arc::new(AtomicBool::new(false));
+    let tone_end = Arc::new(OnceLock::new());
     let stream = build_stream(
         &device,
         &config,
@@ -339,20 +422,21 @@ pub fn play_beep_sequence(
         frequencies.to_vec(),
         volume,
         Arc::clone(&finished),
+        Arc::clone(&tone_end),
     )?;
 
     stream
         .play()
         .map_err(|e| anyhow::anyhow!("Failed to play beep: {e}"))?;
 
-    wait_for_completion(
+    Ok(wait_for_completion(
         stream,
         &finished,
+        &tone_end,
         duration_ms,
         frequencies.len(),
         sample_rate,
-    );
-    Ok(())
+    ))
 }
 
 /// Async wrapper over [`play_beep_sequence`]. The underlying call sets up a cpal
@@ -372,8 +456,39 @@ pub async fn play_beep_sequence_async(
     fade_out_ms: u64,
     volume: f32,
 ) -> Result<()> {
+    play_beep_sequence_until_played(
+        product,
+        frequencies,
+        duration_ms,
+        fade_in_ms,
+        fade_out_ms,
+        volume,
+    )
+    .await
+    .map(|_played| ())
+}
+
+/// [`play_beep_sequence_async`], returning the instant the sequence finished
+/// playing out of the speakers: the one the output device reported for its
+/// last tone, or, when the device reports no timing, the end of a fixed
+/// margin after that tone was handed to it. A recorder that opened the
+/// microphone before the cue keeps only what it captured after this instant.
+/// A muted or empty sequence plays nothing and returns the current instant.
+///
+/// # Errors
+///
+/// Propagates the playback error (no output device, or stream build/play
+/// failure), or reports a task-join failure.
+pub async fn play_beep_sequence_until_played(
+    product: &'static ProductSpec,
+    frequencies: Vec<f32>,
+    duration_ms: u64,
+    fade_in_ms: u64,
+    fade_out_ms: u64,
+    volume: f32,
+) -> Result<Instant> {
     tokio::task::spawn_blocking(move || {
-        play_beep_sequence(
+        play_sequence(
             product,
             &frequencies,
             duration_ms,
@@ -555,6 +670,50 @@ mod tests {
             result.is_ok(),
             "Empty frequency array should not cause error"
         );
+    }
+
+    fn params_with_tone_of(total_samples: usize) -> BeepParams {
+        BeepParams {
+            sample_rate: 48_000.0,
+            channels: 1,
+            total_samples,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+            samples_per_beep: total_samples,
+            total_samples_with_padding: total_samples + 2_400,
+        }
+    }
+
+    /// Only the buffer holding the tone's last sample says where the tone
+    /// ends in it.
+    #[test]
+    fn the_tone_ends_in_the_buffer_holding_its_last_sample() {
+        let params = params_with_tone_of(1_000);
+        assert_eq!(tone_end_in_buffer(&params, 0, 512), None);
+        assert_eq!(tone_end_in_buffer(&params, 512, 1_024), Some(488));
+        assert_eq!(tone_end_in_buffer(&params, 488, 1_000), Some(512));
+        assert_eq!(tone_end_in_buffer(&params, 1_024, 1_536), None);
+    }
+
+    /// The tone ends the output's latency after the callback, plus the time
+    /// the frames ahead of its end take to play.
+    #[test]
+    fn the_tone_ends_a_latency_and_its_frames_after_the_callback() {
+        assert_eq!(
+            tone_end_delay(Duration::from_millis(40), 480, 48_000.0),
+            Duration::from_millis(50)
+        );
+    }
+
+    /// An empty sequence plays nothing, so it has finished playing when it
+    /// returns.
+    #[tokio::test]
+    async fn an_empty_sequence_has_played_when_it_returns() {
+        let before = Instant::now();
+        let played = play_beep_sequence_until_played(&TEST, vec![], 100, 10, 10, 1.0)
+            .await
+            .unwrap();
+        assert!(before <= played && played <= Instant::now());
     }
 
     /// The mute switch is named after the product, beside its other test
