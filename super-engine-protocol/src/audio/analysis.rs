@@ -47,22 +47,13 @@ impl AudioAnalyzer {
             };
         }
 
-        // Ensure we have enough samples for analysis
-        let samples_to_use = if samples.len() < 64 {
-            // Pad with zeros if too few samples
-            let mut padded = samples.to_vec();
-            padded.resize(64, 0.0);
-            padded
-        } else if samples.len() > self.buffer_size {
-            // Take the most recent samples
-            let start = samples.len() - self.buffer_size;
-            samples[start..].to_vec()
-        } else {
-            samples.to_vec()
-        };
-
-        // Apply Hann window to reduce spectral leakage
-        let windowed_samples = hann_window(&samples_to_use);
+        // The most recent `buffer_size` samples, windowed to reduce spectral
+        // leakage, then zero-padded to a power of two of at least 64. The FFT
+        // takes no other length, and a capture chunk can be any length: the one
+        // released after a start cue is cut wherever the cue ended.
+        let recent = &samples[samples.len().saturating_sub(self.buffer_size)..];
+        let mut windowed_samples = hann_window(recent);
+        windowed_samples.resize(recent.len().max(64).next_power_of_two(), 0.0);
 
         // Perform FFT
         let spectrum_result = samples_fft_to_spectrum(
@@ -99,8 +90,8 @@ impl AudioAnalyzer {
         // computed in f64 (deliberately wider than the original f32) so the
         // usize sample count converts losslessly; the result only feeds the
         // discrete noise-floor threshold comparisons below.
-        let sum_sq: f32 = samples_to_use.iter().map(|&x| x * x).sum();
-        let n = u32::try_from(samples_to_use.len()).unwrap_or(u32::MAX);
+        let sum_sq: f32 = recent.iter().map(|&x| x * x).sum();
+        let n = u32::try_from(recent.len()).unwrap_or(u32::MAX);
         let input_rms: f64 = (f64::from(sum_sq) / f64::from(n)).sqrt();
 
         Self::scale_bands(&mut band_amplitudes, input_rms);
@@ -506,6 +497,25 @@ mod tests {
                 data.dominant_frequency >= freq * 0.85 && data.dominant_frequency <= freq * 1.15,
                 "dominant for {freq}Hz tone was {}, outside ±15%",
                 data.dominant_frequency
+            );
+        }
+    }
+
+    /// A chunk whose length is not a power of two still yields bands. The FFT
+    /// takes only powers of two, and the chunk released after a start cue is
+    /// cut wherever the cue ended, so it used to come back as zero bands.
+    #[test]
+    fn a_chunk_of_any_length_is_analyzed() {
+        let analyzer = AudioAnalyzer::new(44_100, 1024);
+        for len in [100, 700, 1000, 1500] {
+            let samples: Vec<f32> = (0..len)
+                .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
+                .collect();
+            let freq_data = analyzer.analyze(&samples);
+            assert_eq!(freq_data.bands.len(), 64);
+            assert!(
+                freq_data.total_energy > 0.0,
+                "a {len}-sample chunk came back as zero bands"
             );
         }
     }
