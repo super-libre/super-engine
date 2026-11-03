@@ -45,7 +45,7 @@ fn xdg_override(var: &str) -> Option<PathBuf> {
 
 /// `$XDG_CONFIG_HOME/<slug>` (fallback: the platform's config directory —
 /// `$HOME/.config` on Linux, `~/Library/Application Support` on macOS — else
-/// `/tmp/.config/<slug>`). Daemon: append `daemon.toml`; applet: append
+/// `/tmp/.config/<slug>`). Daemon: append `daemon.ron`; applet: append
 /// `applet-<variant>.toml`.
 #[must_use]
 pub fn config_dir(product: &ProductSpec) -> PathBuf {

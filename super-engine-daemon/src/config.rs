@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The daemon's own settings file, `daemon.toml`, and the part of it every
+//! The daemon's own settings file, `daemon.ron`, and the part of it every
 //! daemon shares: the HTTP surface beyond the Unix socket.
 //!
 //! A product's `DaemonConfig` is its own struct; [`load`] and [`save`] read
 //! and write it the way every daemon does, and [`ConfigFile::normalize`] is
 //! where it repairs a stale value rather than resetting the whole file.
+//!
+//! The file is RON because it is the daemon's state, not a file for people to
+//! edit: the daemon writes it, and clients change it through the API.
 
 use std::path::{Path, PathBuf};
 
@@ -20,10 +23,10 @@ pub trait ConfigFile: Serialize + DeserializeOwned + Default {
     fn normalize(&mut self) {}
 }
 
-/// `daemon.toml` in the product's config directory.
+/// `daemon.ron` in the product's config directory.
 #[must_use]
 pub fn config_path(product: &ProductSpec) -> PathBuf {
-    paths::config_dir(product).join("daemon.toml")
+    paths::config_dir(product).join("daemon.ron")
 }
 
 /// Parse `content`, falling back to defaults when it does not parse. Pure (no
@@ -31,7 +34,7 @@ pub fn config_path(product: &ProductSpec) -> PathBuf {
 /// config and whether it was reset, so the caller knows to write the defaults.
 #[must_use]
 pub fn parse_or_reset<C: ConfigFile>(content: &str) -> (C, bool) {
-    match toml::from_str::<C>(content) {
+    match ron::from_str::<C>(content) {
         Ok(mut config) => {
             config.normalize();
             (config, false)
@@ -41,6 +44,18 @@ pub fn parse_or_reset<C: ConfigFile>(content: &str) -> (C, bool) {
             (C::default(), true)
         }
     }
+}
+
+/// `config` as [`save`] writes it. [`load`] compares a file against this to
+/// decide whether to rewrite it.
+///
+/// # Errors
+///
+/// Returns an error if `config` cannot be serialized.
+pub fn to_string<C: ConfigFile>(config: &C) -> anyhow::Result<String> {
+    let mut content = ron::ser::to_string_pretty(config, ron::ser::PrettyConfig::default())?;
+    content.push('\n');
+    Ok(content)
 }
 
 /// Load the config at `path`.
@@ -63,7 +78,7 @@ pub fn load<C: ConfigFile>(path: &Path) -> C {
         if let Err(e) = save(path, &config) {
             log::error!("Failed to save default config after parse error: {e}");
         }
-    } else if let Ok(canonical) = toml::to_string_pretty(&config)
+    } else if let Ok(canonical) = to_string(&config)
         && canonical != content
         && let Err(e) = save(path, &config)
     {
@@ -83,7 +98,7 @@ pub fn save<C: ConfigFile>(path: &Path, config: &C) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, toml::to_string_pretty(config)?)?;
+    std::fs::write(path, to_string(config)?)?;
     log::debug!("Saved daemon config to {}", path.display());
     Ok(())
 }
@@ -91,12 +106,12 @@ pub fn save<C: ConfigFile>(path: &Path, config: &C) -> anyhow::Result<()> {
 /// The daemon's HTTP surface beyond the Unix socket it always serves.
 ///
 /// Contract: `docs/protocol/transport.md`. Every field is defaulted, so a
-/// `daemon.toml` written before the section existed loads with the TCP
-/// listener off — which is the only state in which the daemon's callers are
+/// config written before the section existed loads with the TCP listener off
+/// — which is the only state in which the daemon's callers are
 /// all peer-credential-verified.
 ///
 /// `DEFAULT_PORT` is the product's `ProductSpec::tcp_port`: a const parameter
-/// because it is the default a `daemon.toml` without a port loads with.
+/// because it is the default a config without a port loads with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct HttpConfig<const DEFAULT_PORT: u16> {
     #[serde(default)]
@@ -236,7 +251,7 @@ mod tests {
     /// The port a config without one loads with is the product's.
     #[test]
     fn an_absent_port_is_the_products_default() {
-        let config: HttpConfig<7308> = toml::from_str("[tcp]\nenabled = true\n").unwrap();
+        let config: HttpConfig<7308> = ron::from_str("(tcp: (enabled: true))").unwrap();
         assert_eq!(config.tcp.port, 7308);
         assert_eq!(HttpConfig::<7308>::default().tcp.port, 7308);
         assert_eq!(
@@ -252,7 +267,7 @@ mod tests {
     /// default admits every origin.
     #[test]
     fn an_absent_section_is_the_default() {
-        let config: HttpConfig<7308> = toml::from_str("").unwrap();
+        let config: HttpConfig<7308> = ron::from_str("()").unwrap();
         assert_eq!(config, HttpConfig::default());
         assert!(config.tcp.enabled);
         assert!(config.tcp.admits_any_origin());
@@ -289,10 +304,10 @@ mod tests {
     /// A file that does not parse resets; one that does is normalized.
     #[test]
     fn parse_resets_or_normalizes() {
-        let (settings, reset) = parse_or_reset::<Settings>("device = [");
+        let (settings, reset) = parse_or_reset::<Settings>("(device: [");
         assert!(reset);
         assert_eq!(settings, Settings::default());
-        let (settings, reset) = parse_or_reset::<Settings>("device = \"cuda\"\n");
+        let (settings, reset) = parse_or_reset::<Settings>("(device: \"cuda\")");
         assert!(!reset);
         assert_eq!(settings.device, "gpu");
     }
@@ -302,19 +317,52 @@ mod tests {
     #[test]
     fn load_rewrites_what_it_repaired() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.toml");
+        let path = dir.path().join("daemon.ron");
 
-        std::fs::write(&path, "device = \"cuda\"\n").unwrap();
+        std::fs::write(&path, "(device: \"cuda\")").unwrap();
         let settings: Settings = load(&path);
         assert_eq!(settings.device, "gpu");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "device = \"gpu\"\n"
+            "(\n    device: \"gpu\",\n)\n"
         );
 
-        std::fs::write(&path, "device = [").unwrap();
+        std::fs::write(&path, "(device: [").unwrap();
         let settings: Settings = load(&path);
         assert_eq!(settings, Settings::default());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "device = \"\"\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "(\n    device: \"\",\n)\n"
+        );
+    }
+
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Audio {
+        #[serde(
+            default,
+            deserialize_with = "super_engine_protocol::serde_helpers::deserialize_or_default"
+        )]
+        theme: super_engine_protocol::models::theme::AudioTheme,
+    }
+
+    impl ConfigFile for Audio {}
+
+    /// A settings enum survives the file. `deserialize_or_default` reads the
+    /// value through `serde_json::Value`, and RON hands that a bare identifier
+    /// as `null`; the enums are stored as strings, which it reads as written.
+    #[test]
+    fn a_lenient_settings_enum_survives_the_file() {
+        use super_engine_protocol::models::theme::AudioTheme;
+
+        let audio = Audio {
+            theme: AudioTheme::Silent,
+        };
+        let (back, reset) = parse_or_reset::<Audio>(&to_string(&audio).unwrap());
+        assert!(!reset);
+        assert_eq!(back, audio);
+
+        let (unknown, reset) = parse_or_reset::<Audio>("(theme: \"bogus\")");
+        assert!(!reset, "an unknown value falls back without a reset");
+        assert_eq!(unknown, Audio::default());
     }
 }
