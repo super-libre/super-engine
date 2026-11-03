@@ -82,7 +82,7 @@
     utoipa.workspace = true
     # The id each `/events` subscription is acknowledged with.
     uuid = { version = "1", features = ["v4"] }
-    wasmtime = { version = "45.0.0", features = ["async"], optional = true }
+    wasmtime = { version = "48.0.7", features = ["async"], optional = true }
     wasmtime-wasi = { version = "45.0.0", optional = true }
     wasmtime-wasi-http = { version = "45.0.0", optional = true }
 
