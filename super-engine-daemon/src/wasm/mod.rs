@@ -26,11 +26,10 @@ use http_body_util::BodyExt;
 use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::WasiCtx;
-use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::WasiHttpView;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use host::{AllowlistHooks, Host};
 use realtime::{ConsumerStreamResource, ConsumerStreamTransport, WsError};
@@ -154,15 +153,10 @@ impl WasmComponent {
         // gated by the locked-down `WasiCtx` below — no preopened directories
         // and no granted sockets — so the component cannot touch the disk or
         // open raw connections; its only egress is the allowlisted
-        // `wasi:http/outgoing-handler`.
-        // `cli-exit-with-code` is still an `@unstable` WASI 0.2 feature, so
-        // `LinkOptions::default()` leaves it out of the linker — but Rust's
-        // wasm32-wasip2 std imports it, so every component built with a
-        // toolchain that emits that import fails to instantiate unless the
-        // host opts in. Enable it so backends stay loadable across toolchains.
-        let mut link_options = wasmtime_wasi::p2::bindings::LinkOptions::default();
-        link_options.cli_exit_with_code(true);
-        wasmtime_wasi::p2::add_to_linker_with_options_async(&mut linker, &link_options)?;
+        // `wasi:http/outgoing-handler`. That world includes
+        // `wasi:cli/exit.exit-with-code`, which Rust's wasm32-wasip2 std imports;
+        // WASI 0.2.12 made it stable, so the linker carries it without an opt-in.
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
         // A websocket-capable backend additionally imports the realtime `ws`
         // interface and exports `ws-server`; link the host `ws` impl under the
