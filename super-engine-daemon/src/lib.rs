@@ -4,7 +4,7 @@
 //!
 //! - [`auth`]: session tokens, the consent dialog, and the guards every
 //!   route sits behind.
-//! - [`config`]: the daemon's `daemon.toml`, and its HTTP surface settings.
+//! - [`config`]: the daemon's `daemon.ron`, and its HTTP surface settings.
 //! - [`beeper`] (feature `beeper`): the tones a daemon plays as audio cues.
 //! - [`backends`]: installed backends — finding them on disk, the models
 //!   they serve, and the runtime policy a manifest is held to at discovery.

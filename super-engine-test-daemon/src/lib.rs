@@ -8,7 +8,7 @@
 //!
 //! The home is what keeps a test off the machine it runs on. Config, data and
 //! cache each get a directory of their own, so a test daemon neither reads
-//! nor writes the developer's `daemon.toml`, installed backends or registry
+//! nor writes the developer's `daemon.ron`, installed backends or registry
 //! cache, and daemons spawned side by side by one test binary do not
 //! overwrite each other's files.
 //!
@@ -72,7 +72,7 @@ pub const LOG_VAR: &str = "SUPER_ENGINE_TEST_DAEMON_LOG";
 #[derive(Debug, Clone)]
 pub struct Home {
     root: PathBuf,
-    /// `XDG_CONFIG_HOME`: `<config>/<slug>/daemon.toml` is the daemon's
+    /// `XDG_CONFIG_HOME`: `<config>/<slug>/daemon.ron` is the daemon's
     /// config.
     pub config: PathBuf,
     /// `XDG_DATA_HOME`: installed backends live under it.
