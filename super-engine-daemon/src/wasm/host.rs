@@ -5,14 +5,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::Arc;
 
+use http_body_util::BodyExt;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
-use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
-use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
-use wasmtime_wasi_http::p2::{
-    HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView, default_send_request,
+use wasmtime_wasi_http::{
+    Error, RequestOptions, WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
+    default_send_request,
 };
 
 /// Host state handed to each component invocation.
@@ -71,12 +69,31 @@ pub struct AllowlistHooks {
     pub allow_loopback: bool,
 }
 
+/// What [`WasiHttpHooks::send_request`] hands back: the response, plus the
+/// future that drives the connection's I/O after the head arrives.
+type SendRequestFuture = Box<
+    dyn Future<
+            Output = Result<
+                (
+                    hyper::Response<WasiBody>,
+                    Box<dyn Future<Output = Result<(), Error>> + Send>,
+                ),
+                Error,
+            >,
+        > + Send,
+>;
+
 impl WasiHttpHooks for AllowlistHooks {
     fn send_request(
         &mut self,
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HttpResult<HostFutureIncomingResponse> {
+        request: hyper::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        fut: Box<dyn Future<Output = Result<(), Error>> + Send>,
+    ) -> SendRequestFuture {
+        // Only a `wasi:http` p3 guest reads the response-processing result
+        // `fut` carries; the p2 `outgoing-handler` passes a no-op, as does the
+        // default hook this one wraps.
+        drop(fut);
         // Enforce egress through the shared allowlist+SSRF check so HTTP and the
         // `ws` host apply byte-for-byte identical rules. This hook used to match
         // the authority string exactly as written, which diverged from
@@ -88,26 +105,35 @@ impl WasiHttpHooks for AllowlistHooks {
         // check-then-connect (TOCTOU); production should use async DNS and pin
         // the resolved address through to connect. The bare-host early return
         // rejects an authority-form request with no host outright.
-        let Some(host) = request.uri().host().map(str::to_string) else {
-            return Err(
-                ErrorCode::InternalError(Some("outbound request has no host".to_string())).into(),
-            );
+        //
+        // The check runs here, before the request is handed off, so a refused
+        // request opens no connection. The guest reads the refusal from the
+        // response future rather than from `outgoing-handler.handle`, which
+        // wasmtime no longer lets a hook fail.
+        let verdict = match request.uri().host() {
+            None => Err("outbound request has no host".to_string()),
+            Some(host) => {
+                let port = request
+                    .uri()
+                    .port_u16()
+                    .unwrap_or_else(|| super::base_url::default_port(request.uri().scheme_str()));
+                check_host_allowed(
+                    &self.allowed_hosts,
+                    &self.user_allowed_hosts,
+                    host,
+                    port,
+                    self.allow_loopback,
+                )
+            }
         };
-        let port = request
-            .uri()
-            .port_u16()
-            .unwrap_or_else(|| super::base_url::default_port(request.uri().scheme_str()));
-        if let Err(msg) = check_host_allowed(
-            &self.allowed_hosts,
-            &self.user_allowed_hosts,
-            &host,
-            port,
-            self.allow_loopback,
-        ) {
-            return Err(ErrorCode::InternalError(Some(msg)).into());
-        }
-
-        Ok(default_send_request(request, config))
+        Box::new(async move {
+            verdict.map_err(|msg| Error::InternalError(Some(msg)))?;
+            let (response, io) = default_send_request(request, options).await?;
+            Ok((
+                response.map(BodyExt::boxed_unsync),
+                Box::new(io) as Box<dyn Future<Output = Result<(), Error>> + Send>,
+            ))
+        })
     }
 }
 

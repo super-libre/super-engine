@@ -20,3 +20,27 @@ updates:
         update-types:
           - "minor"
           - "patch"
+  # Crates get security PRs only: a limit of 0 keeps version updates off, and
+  # this entry shapes the security PRs. It sets no `target-branch`, because an
+  # entry that sets one no longer applies to security updates.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    # wasmtime, wasmtime-wasi and wasmtime-wasi-http require each other within
+    # one major version. Bumping one alone across a major pulls in a second
+    # wasmtime whose types don't match, so the build breaks. Within a major
+    # they resolve, and they move together in one PR.
+    groups:
+      wasmtime:
+        applies-to: "security-updates"
+        patterns:
+          - "wasmtime*"
+    # Majors are ignored. 48 is an LTS line with security fixes until August
+    # 2028, so a fix arrives as a 48.0.x patch. The move to the next LTS (60)
+    # is made by hand.
+    ignore:
+      - dependency-name: "wasmtime*"
+        update-types:
+          - "version-update:semver-major"
