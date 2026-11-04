@@ -11,20 +11,22 @@
 
 use crate::http::PeerInfo;
 use crate::http::origins::admits_any_origin;
+use crate::instance::InstanceLock;
 use crate::resource_management::ResourceManager;
 use anyhow::{Context, Result};
 use axum::http::StatusCode;
 use log::{info, warn};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
 /// Where a daemon serves, and what it serves there.
 pub struct Listeners {
-    /// The Unix socket, always served.
-    pub socket_path: PathBuf,
+    /// The lock on the Unix socket, which is always served: [`serve`] binds
+    /// the socket this names. Taken at the start of the daemon's startup, so
+    /// a second daemon never gets this far.
+    pub instance: InstanceLock,
     /// The loopback address of the TCP listener, or `None` when the user
     /// turned it off.
     pub tcp: Option<SocketAddr>,
@@ -33,13 +35,17 @@ pub struct Listeners {
     pub allowed_origins: Vec<String>,
 }
 
-/// Create the parent directory, remove any stale socket file, bind the
-/// Unix listener, and set socket permissions.
+/// Create the parent directory, remove a socket file left behind by a daemon
+/// that is gone, bind the Unix listener, and set socket permissions.
+///
+/// Taking `instance` is what makes the removal safe: while it is held, no
+/// other daemon can be serving that path, so a file there is a leftover.
 ///
 /// # Errors
 /// Returns an error if directory creation, stale-file removal, socket
 /// bind, or permission setting fails.
-async fn bind_listener(socket_path: &Path) -> Result<UnixListener> {
+async fn bind_listener(instance: &InstanceLock) -> Result<UnixListener> {
+    let socket_path = instance.socket_path();
     if let Some(parent) = socket_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -114,8 +120,9 @@ where
         }
     };
 
-    let socket_path = listeners.socket_path;
-    let listener = bind_listener(&socket_path).await?;
+    let instance = listeners.instance;
+    let socket_path = instance.socket_path().to_path_buf();
+    let listener = bind_listener(&instance).await?;
 
     info!("HTTP daemon listening on socket: {}", socket_path.display());
 
@@ -177,6 +184,8 @@ where
         if cleanup_path.exists() {
             let _ = tokio::fs::remove_file(&cleanup_path).await;
         }
+        // Only now, with the socket gone, may the next daemon start.
+        drop(instance);
     });
 
     Ok(handle)

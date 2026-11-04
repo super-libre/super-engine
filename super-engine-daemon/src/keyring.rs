@@ -60,10 +60,13 @@ fn backend_secret_account(source: &str, name: &str) -> String {
 /// is headless; touching the real secret service hangs on an unlock prompt)
 /// while leaving production behavior on the real keyring untouched.
 ///
+/// Keyed as the system keyring is, by service (the product's slug) and then
+/// account, so two products in one process keep their secrets apart here too.
+///
 /// The map lives for the whole process, so tests sharing it must use unique
 /// account keys to avoid collisions.
-fn mock_store() -> &'static Mutex<HashMap<String, String>> {
-    static STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+fn mock_store() -> &'static Mutex<HashMap<(&'static str, String), String>> {
+    static STORE: OnceLock<Mutex<HashMap<(&'static str, String), String>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -133,7 +136,7 @@ impl Keyring {
             return Ok(mock_store()
                 .lock()
                 .expect("mock keyring store poisoned")
-                .get(account)
+                .get(&(self.product.slug, account.to_string()))
                 .cloned());
         }
         match self.entry(account)?.get_password() {
@@ -149,7 +152,7 @@ impl Keyring {
             mock_store()
                 .lock()
                 .expect("mock keyring store poisoned")
-                .insert(account.to_string(), value.to_string());
+                .insert((self.product.slug, account.to_string()), value.to_string());
             return Ok(());
         }
         self.entry(account)?
@@ -163,7 +166,7 @@ impl Keyring {
             mock_store()
                 .lock()
                 .expect("mock keyring store poisoned")
-                .remove(account);
+                .remove(&(self.product.slug, account.to_string()));
             return Ok(());
         }
         match self.entry(account)?.delete_credential() {
@@ -349,6 +352,24 @@ mod tests {
         keyring.delete_backend_secret(src, name).unwrap();
         assert!(!keyring.has_backend_secret(src, name).unwrap());
         keyring.delete_backend_secret(src, name).unwrap(); // idempotent
+    }
+
+    /// The same backend secret for two products is two secrets, as it is in
+    /// the system keyring, where each product is its own service.
+    #[test]
+    fn two_products_keep_the_same_secret_apart() {
+        let (src, name) = ("github.com/acme/both-products", "shared_api_key");
+        let (test, other) = (Keyring::in_memory(&TEST), Keyring::in_memory(&OTHER));
+        test.set_backend_secret(src, name, "sk-test").unwrap();
+        assert!(!other.has_backend_secret(src, name).unwrap());
+        other.set_backend_secret(src, name, "sk-other").unwrap();
+        assert_eq!(
+            test.get_backend_secret(src, name).unwrap().as_deref(),
+            Some("sk-test")
+        );
+        test.delete_backend_secret(src, name).unwrap();
+        assert!(other.has_backend_secret(src, name).unwrap());
+        other.delete_backend_secret(src, name).unwrap();
     }
 
     #[test]
