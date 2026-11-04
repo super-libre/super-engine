@@ -436,15 +436,15 @@ pub async fn ask_user_for_consent(
 }
 
 /// Basenames of the first-party client binaries that skip the consent
-/// popup when co-located with the daemon binary: the product's app, CLI and
-/// COSMIC applet (`<slug>-app`, `<slug>-cli`, `<slug>-cosmic-applet`), and the
-/// COSMIC applet every product shares ([`SHARED_APPLET`]). The product's own
-/// applet stays trusted until its installs have all been replaced.
-/// See [`is_official_client`] for the full trust check.
-fn official_client_names(product: &ProductSpec) -> [String; 4] {
-    let [app, cli, applet] =
-        ["app", "cli", "cosmic-applet"].map(|client| format!("{}-{client}", product.slug));
-    [app, cli, applet, SHARED_APPLET.to_string()]
+/// popup when co-located with the daemon binary: the ones the product names
+/// in [`ProductSpec::clients`], and the COSMIC applet every product shares
+/// ([`SHARED_APPLET`]). See [`is_official_client`] for the full trust check.
+fn official_client_names(product: &ProductSpec) -> impl Iterator<Item = &'static str> {
+    product
+        .clients
+        .iter()
+        .copied()
+        .chain(std::iter::once(SHARED_APPLET))
 }
 
 /// First-party trust check: does `exe_path` denote one of our own
@@ -503,7 +503,7 @@ fn is_official_client_in(product: &ProductSpec, daemon_dir: &Path, exe_path: &Pa
     let Some(name) = resolved.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    if !official_client_names(product).iter().any(|n| n == name) {
+    if !official_client_names(product).any(|n| n == name) {
         return false;
     }
     let parent = resolved.parent();
@@ -913,6 +913,36 @@ mod tests {
             assert!(
                 !is_official_client_in(daemon_dir.path(), &link),
                 "canonicalization must unmask a symlink escaping the daemon dir"
+            );
+        }
+
+        /// What the product names is what is trusted, whatever its slug: one
+        /// daemon can serve clients that were each a product of their own,
+        /// and a `<slug>-app` it does not name is a stranger.
+        #[test]
+        fn only_the_clients_the_product_names_are_official() {
+            use super_engine_protocol::{ProductSpec, SHARED_APPLET};
+            static MERGED: ProductSpec = ProductSpec {
+                display_name: "Super Merged",
+                slug: "super-merged",
+                short_name: "merged",
+                env_prefix: "SUPER_MERGED",
+                tcp_port: 7307,
+                repo: "github.com/example/super-merged",
+                index_url: "https://example.com/super-merged/index.json",
+                scopes: &[],
+                topics: &[],
+                clients: &["super-test-app", "super-other-cli"],
+            };
+            let dir = tempfile::tempdir().unwrap();
+            for named in ["super-test-app", "super-other-cli", SHARED_APPLET] {
+                let client = write_executable(dir.path(), named, 0o755);
+                assert!(in_dir(&MERGED, dir.path(), &client), "{named} is named");
+            }
+            let unnamed = write_executable(dir.path(), "super-merged-app", 0o755);
+            assert!(
+                !in_dir(&MERGED, dir.path(), &unnamed),
+                "a client the product does not name faces the consent dialog"
             );
         }
 
