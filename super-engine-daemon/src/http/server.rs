@@ -76,10 +76,10 @@ async fn bind_listener(instance: &InstanceLock) -> Result<UnixListener> {
 /// background task.
 ///
 /// `router` runs first, on the blocking pool. It is where a daemon builds its
-/// state, which loads the persisted session store from the system keyring
-/// ([`Auth::load`](crate::auth::Auth::load)); if the keyring is unavailable
-/// the daemon refuses to start. Doing it before binding guarantees we never
-/// leave a listening-but-unserviced socket behind on a keyring failure.
+/// state, which loads the persisted session store
+/// ([`Auth::load`](crate::auth::Auth::load)). Doing it before binding
+/// guarantees we never leave a listening-but-unserviced socket behind when
+/// building the state fails.
 ///
 /// Returns the [`JoinHandle`](tokio::task::JoinHandle) of the accept-loop
 /// task so the caller can supervise it: if the task ends before
@@ -98,21 +98,19 @@ pub async fn serve<F>(
 where
     F: FnOnce() -> Result<axum::Router> + Send + 'static,
 {
-    // That keyring read is a *blocking* secret-service call: on a locked
-    // keyring it waits on the D-Bus unlock prompt for as long as the user
-    // takes. Run it on the blocking pool and race it against the shutdown
-    // signal so the wait stays interruptible — otherwise a Ctrl+C during
-    // the unlock wait is swallowed (the caller's supervision `select!` is
-    // only reached once startup finishes) and the daemon can't be stopped.
+    // Building the state is blocking work. Run it on the blocking pool and
+    // race it against the shutdown signal so it stays interruptible —
+    // otherwise a Ctrl+C while it runs is swallowed (the caller's supervision
+    // `select!` is only reached once startup finishes).
     let app = {
         let mut shutdown_rx = shutdown_tx.subscribe();
         let load = tokio::task::spawn_blocking(router);
         tokio::select! {
             biased;
             _ = shutdown_rx.recv() => {
-                // The blocking load is still parked on the keyring prompt;
-                // a dropped runtime would join (and hang on) it, so exit
-                // the process directly. Nothing is bound or in flight yet.
+                // The blocking build is still running; a dropped runtime
+                // would join (and wait for) it, so exit the process
+                // directly. Nothing is bound or in flight yet.
                 info!("Shutdown requested during session-store load; exiting");
                 std::process::exit(130);
             }

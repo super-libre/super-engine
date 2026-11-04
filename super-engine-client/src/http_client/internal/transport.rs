@@ -235,7 +235,7 @@ pub(crate) async fn check_subscribe_status(
 ///
 /// Deliberately *not* applied to the consent-bearing `/auth/request`
 /// (see [`open`]'s `timeout` param): that call is held open while a human
-/// clicks Allow/Deny and may type a keyring password, so a machine timer
+/// clicks Allow/Deny, so a machine timer
 /// must never race it. Sized generously even for the machine calls so a
 /// slow model reload still completes; a daemon that is simply *down*
 /// fails fast at `connect()` and never reaches this bound.
@@ -247,8 +247,8 @@ pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// `timeout` bounds the wait for the daemon's response headers. Pass
 /// `Some(_)` for machine-to-machine calls so a wedged daemon can't hang
 /// the caller forever. Pass `None` for `/auth/request`, which the daemon
-/// legitimately holds open while the user responds to the consent popup
-/// (and possibly a keyring-unlock prompt) — bounding it would cut the user
+/// legitimately holds open while the user responds to the consent popup —
+/// bounding it would cut the user
 /// off mid-decision.
 pub(crate) async fn open(
     socket_path: &std::path::PathBuf,

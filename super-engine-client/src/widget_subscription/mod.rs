@@ -13,7 +13,7 @@
 //!    persisted blob got wiped, the binary changed and triggered
 //!    `exe_changed`, etc.), `events_stream` returns
 //!    `invalid_session(...)` once and the consumer is stuck — its
-//!    cached client token is still in the keyring, so the next
+//!    cached client token is still in its file, so the next
 //!    `obtain` returns the same dead value.
 //! 3. **Wedged sockets.** A connection that never errors but never
 //!    delivers data either is invisible to the read side. The daemon
@@ -219,7 +219,7 @@ async fn open_stream(socket: &Path, token: &str, config: &WidgetSubscriptionConf
 ///
 /// On every iteration the loop:
 ///
-/// 1. Calls `session::obtain` (cache hit on the keyring or fresh
+/// 1. Calls `session::obtain` (cache hit on the token file or fresh
 ///    consent popup on cold start / after `forget`).
 /// 2. Opens the SSE stream via `http_client::events_stream`.
 /// 3. Reads each `stream.next()` with a `tokio::time::timeout` of

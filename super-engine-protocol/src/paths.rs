@@ -77,6 +77,20 @@ pub fn cache_dir(product: &ProductSpec) -> PathBuf {
         .join(product.slug)
 }
 
+/// `$XDG_STATE_HOME/<slug>` (fallback: the platform's state directory —
+/// `$HOME/.local/state` on Linux; macOS has none, so its local data directory,
+/// `~/Library/Application Support` — else `/tmp/.local/state/<slug>`). Holds
+/// what must survive a restart but is no one's to edit: the daemon's secrets
+/// file, and each client's session token.
+#[must_use]
+pub fn state_dir(product: &ProductSpec) -> PathBuf {
+    xdg_override("XDG_STATE_HOME")
+        .or_else(dirs::state_dir)
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| home_join(".local/state"))
+        .join(product.slug)
+}
+
 /// `$HOME/<suffix>`, falling back to `/tmp/<suffix>` when `HOME` is unset —
 /// the shared fallback for the config/data dirs above.
 fn home_join(suffix: &str) -> PathBuf {
@@ -86,7 +100,7 @@ fn home_join(suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_dir, config_dir, data_dir};
+    use super::{cache_dir, config_dir, data_dir, state_dir};
     use crate::product::ProductSpec;
     use crate::test_product::{OTHER, TEST};
 
@@ -101,7 +115,7 @@ mod tests {
     /// `xdg_override` existed, because `dirs` reads `~/Library/…` and ignores
     /// the environment.
     ///
-    /// One test for all three bases and their defaults: they share the process
+    /// One test for all four bases and their defaults: they share the process
     /// environment, so separate tests setting and unsetting these would race
     /// each other.
     #[test]
@@ -114,6 +128,7 @@ mod tests {
             ),
             ("XDG_DATA_HOME", data_dir),
             ("XDG_CACHE_HOME", cache_dir),
+            ("XDG_STATE_HOME", state_dir),
         ] {
             unsafe {
                 std::env::set_var(var, &root);

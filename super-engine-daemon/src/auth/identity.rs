@@ -31,7 +31,7 @@ pub enum PeerIdentity {
     ///
     /// The id is only as trustworthy as the sandbox that wrote it, and this is
     /// not a defence against a hostile process running as the user — one of
-    /// those can read the session tokens out of the keyring regardless. It is
+    /// those can read the session tokens out of their files regardless. It is
     /// what lets the daemon name the caller correctly in the consent dialog,
     /// and keep one sandboxed app's grant from silently covering another's.
     Native {

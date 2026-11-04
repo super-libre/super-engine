@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! A client of a daemon built on super-engine: the HTTP transport over the
-//! daemon's Unix socket, the session tokens clients keep in the keyring, the
+//! daemon's Unix socket, the session token each client keeps in a file, the
 //! retry policy, and the self-healing `/events` subscription the widgets run
 //! on.
 //!

@@ -15,9 +15,9 @@
 //! - [`download_stream`]: streaming a download to disk, hashing it on the
 //!   way.
 //! - [`events`]: the event bus, its core topics, and the `/events` stream.
-//! - [`keyring`]: the system keyring, which holds the session tokens and each
-//!   backend's API credentials.
 //! - [`resource_management`]: the per-client connection cap and rate limit.
+//! - [`secrets`]: the daemon's secrets file, which holds the session tokens
+//!   and each backend's API keys.
 //! - [`language`]: which language a model is asked to work in, and the tags
 //!   the global setting offers.
 //! - [`load_gate`]: one model load at a time per slot, and the newest
@@ -35,7 +35,7 @@
 //! - [`wasm`] (feature `wasm`): running a backend shipped as a WASM
 //!   component, and its realtime WebSocket host.
 //!
-//! Everything named after the product (the keyring service, the consent
+//! Everything named after the product (the state directory, the consent
 //! helper, the environment variables) comes from the
 //! [`ProductSpec`](super_engine_protocol::ProductSpec) the daemon passes in.
 
@@ -51,7 +51,6 @@ pub mod download_stream;
 pub mod events;
 pub mod http;
 pub mod instance;
-pub mod keyring;
 pub mod language;
 pub mod load_gate;
 #[cfg(feature = "beeper")]
@@ -59,6 +58,7 @@ mod num_cast;
 pub mod openapi;
 pub mod registry;
 pub mod resource_management;
+pub mod secrets;
 pub mod self_update;
 pub mod shutdown;
 #[cfg(feature = "subprocess")]

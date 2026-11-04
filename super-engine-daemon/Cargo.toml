@@ -34,7 +34,6 @@
         version = "0.1",
         features = ["http1", "server", "service", "tokio"]
     }
-    keyring.workspace = true
     libc.workspace = true
     log.workspace = true
     parking_lot = "0.12"
