@@ -50,6 +50,7 @@ pub mod download_progress;
 pub mod download_stream;
 pub mod events;
 pub mod http;
+pub mod instance;
 pub mod keyring;
 pub mod language;
 pub mod load_gate;
