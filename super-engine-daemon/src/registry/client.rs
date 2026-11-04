@@ -268,7 +268,7 @@ fn persist_to_disk(
             .as_secs(),
         index: serde_json::from_slice(body)?,
     };
-    // `write_atomic` writes `<path>.tmp` beside the target, so the parent must
+    // `write_atomic` writes its temp file beside the target, so the parent must
     // exist. Creating it here (on the blocking thread) instead of eagerly in the
     // sync `from_env` constructor keeps that I/O off the async path too (Tier 3 #3).
     if let Some(parent) = cache_path.parent() {

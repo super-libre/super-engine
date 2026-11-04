@@ -87,8 +87,10 @@ pub fn load<C: ConfigFile>(path: &Path) -> C {
     config
 }
 
-/// Save `config` to `path`, creating its directory. Blocking
-/// (`std::fs::write`); on the async runtime call it from `spawn_blocking`.
+/// Save `config` to `path`, creating its directory. The file is replaced
+/// atomically ([`write_atomic`](super_engine_spec::fs::write_atomic)), so a
+/// crash or a racing save never leaves it truncated or mixed. Blocking (it
+/// `fsync`s); on the async runtime call it from `spawn_blocking`.
 ///
 /// # Errors
 ///
@@ -98,7 +100,7 @@ pub fn save<C: ConfigFile>(path: &Path, config: &C) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, to_string(config)?)?;
+    super_engine_spec::fs::write_atomic(path, to_string(config)?.as_bytes())?;
     log::debug!("Saved daemon config to {}", path.display());
     Ok(())
 }
