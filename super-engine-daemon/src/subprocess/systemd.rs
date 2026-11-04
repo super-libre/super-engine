@@ -30,8 +30,8 @@ fn unit_prefix(product: &ProductSpec) -> String {
 /// process, two checkouts — pulled the backend out from under a daemon that
 /// was happily serving, leaving it reporting a model loaded with nothing
 /// behind the socket, and the reloaded backend fighting the first for the GPU.
-/// The unit name ends in the PID of the daemon that spawned it precisely so the
-/// two can be told apart; [`is_orphaned_unit`] reads it.
+/// The unit name ends in the PID and start time of the daemon that spawned it
+/// precisely so the two can be told apart; [`is_orphaned_unit`] reads them.
 pub(super) async fn cleanup_orphan_units(product: &ProductSpec) {
     let prefix = unit_prefix(product);
     // `systemctl --user list-units` is the safest enumerator: it includes
@@ -65,12 +65,11 @@ pub(super) async fn cleanup_orphan_units(product: &ProductSpec) {
         }
     };
     let listing = String::from_utf8_lossy(&listing);
-    let daemon = product.daemon_binary();
     let units: Vec<String> = listing
         .lines()
         .filter_map(|line| line.split_whitespace().next().map(str::to_string))
         .filter(|u| u.starts_with(&prefix))
-        .filter(|u| is_orphaned_unit(u, |pid| daemon_is_alive(&daemon, pid)))
+        .filter(|u| is_orphaned_unit(u, is_running))
         .collect();
     if units.is_empty() {
         return;
@@ -94,46 +93,61 @@ pub(super) async fn cleanup_orphan_units(product: &ProductSpec) {
 
 /// Whether `unit` was left behind by a daemon that is no longer running.
 ///
-/// The name is `<slug>-backend-<instance>-<pid>[.service]`, and the instance
-/// part may itself contain dashes, so the PID is the segment after the *last*
-/// one. `alive` answers whether that PID is a running daemon.
+/// The name is `<slug>-backend-<instance>-<pid>-<start>[.service]`, ending in
+/// [`owner`]: the spawning daemon's PID and start time. The instance part may
+/// itself contain dashes, so those are the *last* two segments. `running`
+/// answers whether that PID is still the process that started then. This
+/// daemon's own units pass that test, so a sweep later in its life leaves them
+/// alone too.
 ///
 /// Unparseable names and live owners are both left alone. That asymmetry is
 /// deliberate: a unit wrongly swept takes a working daemon's backend with it,
 /// while a unit wrongly kept costs memory until the next restart — one is a
 /// broken machine, the other is untidy.
-fn is_orphaned_unit(unit: &str, alive: impl Fn(u32) -> bool) -> bool {
+fn is_orphaned_unit(unit: &str, running: impl Fn(u32, u64) -> bool) -> bool {
     let name = unit.strip_suffix(".service").unwrap_or(unit);
-    let Some((_, pid)) = name.rsplit_once('-') else {
+    let Some((rest, start)) = name.rsplit_once('-') else {
         return false;
     };
-    let Ok(pid) = pid.parse::<u32>() else {
+    let Some((_, pid)) = rest.rsplit_once('-') else {
         return false;
     };
-    // Our own units are not orphans either: this runs before any of them
-    // exists, but a retry later in the process's life must not sweep them.
-    pid != std::process::id() && !alive(pid)
+    let (Ok(pid), Ok(start)) = (pid.parse::<u32>(), start.parse::<u64>()) else {
+        return false;
+    };
+    !running(pid, start)
 }
 
-/// The longest process name the kernel keeps in `/proc/<pid>/comm`: the
-/// 16-byte `TASK_COMM_LEN`, less its terminator.
-const COMM_MAX: usize = 15;
-
-/// Whether `pid` is a live daemon whose binary is named `daemon`.
+/// When `pid` started, in clock ticks since boot (field 22 of
+/// `/proc/<pid>/stat`), or `None` when there is no such process.
 ///
-/// Checks the name as well as existence, so a recycled PID now belonging to
-/// something unrelated does not make a genuine orphan look owned.
-fn daemon_is_alive(daemon: &str, pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm_names(&comm, daemon))
+/// A PID is handed out again once its process is gone, but no two processes
+/// share a PID and a start time, so the pair names one daemon for good. That
+/// is what lets the sweep judge a unit's owner without knowing what the
+/// owner's binary is called: one product's own daemon, or a binary that hosts
+/// several products, is told apart from whatever has the PID now all the same.
+fn start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2, the process name, is in parentheses and may itself hold spaces
+    // or parentheses, so count from the last `)`: field 3 comes right after.
+    let (_, after_name) = stat.rsplit_once(')')?;
+    after_name.split_whitespace().nth(22 - 3)?.parse().ok()
 }
 
-/// Whether `comm` — a `/proc/<pid>/comm` as read — names the binary `binary`.
+/// Whether `pid` is still the process that started at `start`.
+fn is_running(pid: u32, start: u64) -> bool {
+    start_time(pid) == Some(start)
+}
+
+/// How this daemon's unit names end: `<pid>-<start time>`. See [`start_time`].
 ///
-/// The kernel clips the name to [`COMM_MAX`] bytes, so a daemon binary with a
-/// longer name arrives cut short and is compared as cut.
-fn comm_names(comm: &str, binary: &str) -> bool {
-    let clipped = &binary.as_bytes()[..binary.len().min(COMM_MAX)];
-    comm.trim_end().as_bytes() == clipped
+/// # Errors
+/// If this process's own start time cannot be read, which on Linux means
+/// `/proc` is not mounted.
+fn owner() -> Result<String> {
+    let pid = std::process::id();
+    let start = start_time(pid).context("cannot read this daemon's start time in /proc")?;
+    Ok(format!("{pid}-{start}"))
 }
 
 /// A running backend, as a `systemd --user` transient unit.
@@ -300,18 +314,14 @@ async fn stop_stale_unit(unit: &str) {
 
 /// Spawn the backend binary in a hardened `systemd-run --user` transient unit.
 ///
-/// The unit is named `<slug>-backend-<instance>-<daemon pid>`: the prefix is
-/// what [`cleanup_orphan_units`] sweeps by, and the pid is what keeps two
-/// daemons' units distinct. `s.devices` is the model's declared
+/// The unit is named `<slug>-backend-<instance>-<daemon pid>-<daemon start
+/// time>`: the prefix is what [`cleanup_orphan_units`] sweeps by, and the
+/// [`owner`] at the end is what keeps two daemons' units distinct and tells a
+/// live owner from a dead one. `s.devices` is the model's declared
 /// `supported_devices`; it decides whether this unit is granted the GPU
 /// device nodes. See [`needs_gpu_access`].
 pub(super) async fn spawn_sandboxed(s: &Sandbox<'_>) -> Result<Unit> {
-    let unit = format!(
-        "{}{}-{}",
-        unit_prefix(s.product),
-        s.instance,
-        std::process::id()
-    );
+    let unit = format!("{}{}-{}", unit_prefix(s.product), s.instance, owner()?);
 
     // Both of these are about relaunching an instance this daemon started
     // once and lost track of: the unit name would collide, and the socket is
@@ -474,20 +484,23 @@ fn hardening_params(
 
 #[cfg(test)]
 mod orphan_tests {
-    use super::{comm_names, is_orphaned_unit};
+    use super::{is_orphaned_unit, is_running, owner, start_time};
 
-    const DEAD: fn(u32) -> bool = |_| false;
-    const LIVE: fn(u32) -> bool = |_| true;
+    const DEAD: fn(u32, u64) -> bool = |_, _| false;
+    const LIVE: fn(u32, u64) -> bool = |_, _| true;
 
     /// The sweep exists for units a dead daemon left holding a model.
     #[test]
     fn a_unit_whose_daemon_is_gone_is_swept() {
         assert!(is_orphaned_unit(
-            "super-test-backend-app-super-test-big-model-1-7b-4242.service",
+            "super-test-backend-app-super-test-big-model-1-7b-4242-81234.service",
             DEAD
         ));
         // Also without the suffix, which is how `list-units` prints some rows.
-        assert!(is_orphaned_unit("super-test-backend-small-4242", DEAD));
+        assert!(is_orphaned_unit(
+            "super-test-backend-small-4242-81234",
+            DEAD
+        ));
     }
 
     /// The regression this guards: a second daemon starting must not pull the
@@ -497,61 +510,74 @@ mod orphan_tests {
     #[test]
     fn a_unit_belonging_to_a_live_daemon_is_left_alone() {
         assert!(!is_orphaned_unit(
-            "super-test-backend-app-super-test-big-model-1-7b-4242.service",
+            "super-test-backend-app-super-test-big-model-1-7b-4242-81234.service",
             LIVE
         ));
     }
 
-    /// Our own units are never orphans, however this is called.
+    /// Our own units are never orphans, however this is called: they end in
+    /// this process's PID and start time, and this process is running.
     #[test]
     fn this_daemons_own_units_are_never_swept() {
-        let mine = format!("super-test-backend-small-{}", std::process::id());
-        assert!(!is_orphaned_unit(&mine, DEAD));
+        let mine = format!("super-test-backend-small-{}", owner().unwrap());
+        assert!(!is_orphaned_unit(&mine, is_running));
     }
 
-    /// A name that carries no PID is left alone rather than guessed at: the
-    /// cost of keeping a unit is memory, the cost of sweeping a live one is a
-    /// broken daemon.
+    /// A unit whose daemon is gone, while another process now has its PID,
+    /// is still an orphan: the start time no longer matches. That process may
+    /// even run a daemon binary by the same name, or this one.
+    #[test]
+    fn a_reused_pid_does_not_make_an_orphan_look_owned() {
+        let pid = std::process::id();
+        let start = start_time(pid).unwrap();
+        let theirs = format!("super-test-backend-small-{pid}-{}", start + 1);
+        assert!(is_orphaned_unit(&theirs, is_running));
+    }
+
+    /// A name that carries no PID and start time is left alone rather than
+    /// guessed at: the cost of keeping a unit is memory, the cost of sweeping
+    /// a live one is a broken daemon. That includes the names daemons gave
+    /// units before the start time was part of them.
     #[test]
     fn an_unparseable_name_is_left_alone() {
         assert!(!is_orphaned_unit("super-test-backend-.service", DEAD));
         assert!(!is_orphaned_unit(
-            "super-test-backend-small-notapid.service",
+            "super-test-backend-small-notapid-81234.service",
+            DEAD
+        ));
+        assert!(!is_orphaned_unit(
+            "super-test-backend-small-4242.service",
             DEAD
         ));
     }
 
-    /// The instance contains dashes of its own, so the PID is the segment
-    /// after the last one — not the second.
+    /// The instance contains dashes of its own, so the PID and start time are
+    /// the last two segments — not the second and third.
     #[test]
-    fn the_pid_is_read_from_the_end_of_a_dashed_instance() {
-        let seen = std::cell::Cell::new(0);
+    fn the_owner_is_read_from_the_end_of_a_dashed_instance() {
+        let seen = std::cell::Cell::new((0, 0));
         assert!(is_orphaned_unit(
-            "super-test-backend-app-super-test-big-model-1-7b-991.service",
-            |pid| {
-                seen.set(pid);
+            "super-test-backend-app-super-test-big-model-1-7b-991-5555.service",
+            |pid, start| {
+                seen.set((pid, start));
                 false
             }
         ));
         assert_eq!(
             seen.get(),
-            991,
+            (991, 5555),
             "the instance's own dashes are not the split"
         );
     }
 
-    /// The kernel keeps 15 bytes of a process name, so a daemon binary named
-    /// longer than that is only ever seen cut short — and must still be
-    /// recognized, or every live daemon would look dead and its backends
-    /// would be swept.
+    /// The start time is read for a live process, and stays the same while it
+    /// runs, and there is none for a PID no process can have.
     #[test]
-    fn a_daemon_is_recognized_by_the_name_the_kernel_keeps() {
-        assert!(comm_names("super-test-daem\n", "super-test-daemon"));
-        assert!(comm_names("short-daemon\n", "short-daemon"));
-        // A recycled pid now running something else is not the daemon.
-        assert!(!comm_names("bash\n", "super-test-daemon"));
-        // Nor is another product's daemon.
-        assert!(!comm_names("super-other-dae\n", "super-test-daemon"));
+    fn a_start_time_is_read_only_for_a_live_process() {
+        let pid = std::process::id();
+        let start = start_time(pid).expect("this process has a start time");
+        assert_eq!(start_time(pid), Some(start));
+        assert_eq!(start_time(0), None);
     }
 }
 
