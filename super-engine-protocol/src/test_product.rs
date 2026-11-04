@@ -16,6 +16,7 @@ pub static TEST: ProductSpec = ProductSpec {
     index_url: "https://example.com/super-test/index.json",
     scopes: &["test", "test_events"],
     topics: &[("test_started", "test_events")],
+    clients: &["super-test-app", "super-test-cli"],
 };
 
 /// A second product, to show two stay apart.
@@ -29,4 +30,5 @@ pub static OTHER: ProductSpec = ProductSpec {
     index_url: "https://example.com/super-other/index.json",
     scopes: &["other", "other_events"],
     topics: &[("other_started", "other_events")],
+    clients: &["super-other-app", "super-other-cli"],
 };

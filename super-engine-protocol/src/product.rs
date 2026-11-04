@@ -41,6 +41,14 @@ pub struct ProductSpec {
     /// [`CORE_TOPICS`](crate::scopes::CORE_TOPICS), each with the scope a
     /// subscriber needs for it.
     pub topics: &'static [(&'static str, &'static str)],
+    /// The product's own client binaries, by file name, that skip the
+    /// consent dialog when they sit beside the daemon: its apps and CLIs.
+    /// The COSMIC applet every product shares,
+    /// [`SHARED_APPLET`](crate::SHARED_APPLET), is trusted without being
+    /// listed. Named rather than derived from the slug, because a product's
+    /// clients need not carry its name: one daemon may serve clients that
+    /// were each a product of their own.
+    pub clients: &'static [&'static str],
 }
 
 impl ProductSpec {
