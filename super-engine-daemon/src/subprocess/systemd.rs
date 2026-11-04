@@ -93,29 +93,38 @@ pub(super) async fn cleanup_orphan_units(product: &ProductSpec) {
 
 /// Whether `unit` was left behind by a daemon that is no longer running.
 ///
-/// The name is `<slug>-backend-<instance>-<pid>-<start>[.service]`, ending in
-/// [`owner`]: the spawning daemon's PID and start time. The instance part may
-/// itself contain dashes, so those are the *last* two segments. `running`
-/// answers whether that PID is still the process that started then. This
-/// daemon's own units pass that test, so a sweep later in its life leaves them
-/// alone too.
+/// The name is `<slug>-backend-<instance>-p<pid>-t<start>[.service]`, ending
+/// in [`owner`]: the spawning daemon's PID and start time. `running` answers
+/// whether that PID is still the process that started then. This daemon's own
+/// units pass that test, so a sweep later in its life leaves them alone too.
 ///
 /// Unparseable names and live owners are both left alone. That asymmetry is
 /// deliberate: a unit wrongly swept takes a working daemon's backend with it,
 /// while a unit wrongly kept costs memory until the next restart — one is a
 /// broken machine, the other is untidy.
 fn is_orphaned_unit(unit: &str, running: impl Fn(u32, u64) -> bool) -> bool {
+    unit_owner(unit).is_some_and(|(pid, start)| !running(pid, start))
+}
+
+/// The PID and start time a unit's name ends in, or `None` for a name that
+/// does not end in an [`owner`].
+///
+/// The `p` and `t` are what make this safe. The instance part is made of
+/// letters, digits and dashes, so it can end in numbers of its own (a model
+/// called `voxtral-mini-3b-2507`). So can a name from before the start time
+/// was part of it, `…-voxtral-mini-3b-2507-<pid>`. Read as bare numbers,
+/// that one would be PID 2507 started at its daemon's PID, an owner that is
+/// never running, and the sweep would stop the backend of a daemon that is.
+/// No such name ends in `p<digits>-t<digits>`.
+fn unit_owner(unit: &str) -> Option<(u32, u64)> {
     let name = unit.strip_suffix(".service").unwrap_or(unit);
-    let Some((rest, start)) = name.rsplit_once('-') else {
-        return false;
-    };
-    let Some((_, pid)) = rest.rsplit_once('-') else {
-        return false;
-    };
-    let (Ok(pid), Ok(start)) = (pid.parse::<u32>(), start.parse::<u64>()) else {
-        return false;
-    };
-    !running(pid, start)
+    let (rest, start) = name.rsplit_once("-t")?;
+    let (_, pid) = rest.rsplit_once("-p")?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(start) {
+        return None;
+    }
+    Some((pid.parse().ok()?, start.parse().ok()?))
 }
 
 /// When `pid` started, in clock ticks since boot (field 22 of
@@ -139,7 +148,8 @@ fn is_running(pid: u32, start: u64) -> bool {
     start_time(pid) == Some(start)
 }
 
-/// How this daemon's unit names end: `<pid>-<start time>`. See [`start_time`].
+/// How this daemon's unit names end: `p<pid>-t<start time>`. See
+/// [`start_time`], and [`unit_owner`] for the letters.
 ///
 /// # Errors
 /// If this process's own start time cannot be read, which on Linux means
@@ -147,7 +157,7 @@ fn is_running(pid: u32, start: u64) -> bool {
 fn owner() -> Result<String> {
     let pid = std::process::id();
     let start = start_time(pid).context("cannot read this daemon's start time in /proc")?;
-    Ok(format!("{pid}-{start}"))
+    Ok(format!("p{pid}-t{start}"))
 }
 
 /// A running backend, as a `systemd --user` transient unit.
@@ -314,7 +324,7 @@ async fn stop_stale_unit(unit: &str) {
 
 /// Spawn the backend binary in a hardened `systemd-run --user` transient unit.
 ///
-/// The unit is named `<slug>-backend-<instance>-<daemon pid>-<daemon start
+/// The unit is named `<slug>-backend-<instance>-p<daemon pid>-t<daemon start
 /// time>`: the prefix is what [`cleanup_orphan_units`] sweeps by, and the
 /// [`owner`] at the end is what keeps two daemons' units distinct and tells a
 /// live owner from a dead one. `s.devices` is the model's declared
@@ -493,12 +503,12 @@ mod orphan_tests {
     #[test]
     fn a_unit_whose_daemon_is_gone_is_swept() {
         assert!(is_orphaned_unit(
-            "super-test-backend-app-super-test-big-model-1-7b-4242-81234.service",
+            "super-test-backend-app-super-test-big-model-1-7b-p4242-t81234.service",
             DEAD
         ));
         // Also without the suffix, which is how `list-units` prints some rows.
         assert!(is_orphaned_unit(
-            "super-test-backend-small-4242-81234",
+            "super-test-backend-small-p4242-t81234",
             DEAD
         ));
     }
@@ -510,7 +520,7 @@ mod orphan_tests {
     #[test]
     fn a_unit_belonging_to_a_live_daemon_is_left_alone() {
         assert!(!is_orphaned_unit(
-            "super-test-backend-app-super-test-big-model-1-7b-4242-81234.service",
+            "super-test-backend-app-super-test-big-model-1-7b-p4242-t81234.service",
             LIVE
         ));
     }
@@ -530,34 +540,48 @@ mod orphan_tests {
     fn a_reused_pid_does_not_make_an_orphan_look_owned() {
         let pid = std::process::id();
         let start = start_time(pid).unwrap();
-        let theirs = format!("super-test-backend-small-{pid}-{}", start + 1);
+        let theirs = format!("super-test-backend-small-p{pid}-t{}", start + 1);
         assert!(is_orphaned_unit(&theirs, is_running));
     }
 
     /// A name that carries no PID and start time is left alone rather than
     /// guessed at: the cost of keeping a unit is memory, the cost of sweeping
-    /// a live one is a broken daemon. That includes the names daemons gave
-    /// units before the start time was part of them.
+    /// a live one is a broken daemon.
     #[test]
     fn an_unparseable_name_is_left_alone() {
-        assert!(!is_orphaned_unit("super-test-backend-.service", DEAD));
-        assert!(!is_orphaned_unit(
-            "super-test-backend-small-notapid-81234.service",
-            DEAD
-        ));
-        assert!(!is_orphaned_unit(
-            "super-test-backend-small-4242.service",
-            DEAD
-        ));
+        for unit in [
+            "super-test-backend-.service",
+            "super-test-backend-small-pnotapid-t81234.service",
+            "super-test-backend-small-p4242-t.service",
+            "super-test-backend-small-p4242-t+1.service",
+            "super-test-backend-small-p-t81234.service",
+        ] {
+            assert!(!is_orphaned_unit(unit, DEAD), "{unit} was swept");
+        }
     }
 
-    /// The instance contains dashes of its own, so the PID and start time are
-    /// the last two segments — not the second and third.
+    /// The names daemons gave units before the start time was part of them
+    /// end in the PID alone. Their daemon may still be running, a released
+    /// one beside a newer one on another socket, so they are never swept.
+    /// That includes a model whose own name ends in a number, which read as
+    /// bare numbers would look like a PID and a start time.
+    #[test]
+    fn a_unit_named_the_old_way_is_left_alone() {
+        for unit in [
+            "super-test-backend-small-4242.service",
+            "super-stt-backend-app-super-stt-voxtral-voxtral-mini-3b-2507-4242.service",
+        ] {
+            assert!(!is_orphaned_unit(unit, DEAD), "{unit} was swept");
+        }
+    }
+
+    /// The instance contains dashes and numbers of its own, so the owner is
+    /// read from the end of the name.
     #[test]
     fn the_owner_is_read_from_the_end_of_a_dashed_instance() {
         let seen = std::cell::Cell::new((0, 0));
         assert!(is_orphaned_unit(
-            "super-test-backend-app-super-test-big-model-1-7b-991-5555.service",
+            "super-test-backend-app-super-test-big-model-1-7b-2507-p991-t5555.service",
             |pid, start| {
                 seen.set((pid, start));
                 false
@@ -566,7 +590,7 @@ mod orphan_tests {
         assert_eq!(
             seen.get(),
             (991, 5555),
-            "the instance's own dashes are not the split"
+            "the instance's own dashes and numbers are not the owner"
         );
     }
 
