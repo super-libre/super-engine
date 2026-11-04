@@ -85,7 +85,8 @@ pub struct SubprocessBackend {
     claim: Option<Claim>,
 }
 
-/// The instances a live [`SubprocessBackend`] in this process holds.
+/// The sockets a live [`SubprocessBackend`] in this process holds, one per
+/// instance.
 static RUNNING: LazyLock<parking_lot::Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 /// A hold on one instance name, for as long as the backend behind it runs.
@@ -360,7 +361,12 @@ impl SubprocessBackend {
         // running instance's until it is released. "Loading or loaded",
         // because a second request for a model whose first load is still in
         // flight lands here too, and the answer then is to wait.
-        let claim = Claim::take(&instance).with_context(|| {
+        //
+        // Held by the socket's path, not the instance key alone: the socket is
+        // under this product's runtime directory, so two products in one
+        // process whose backends share an id and a model hold two claims, as
+        // they hold two sockets and two sandboxes.
+        let claim = Claim::take(&socket.to_string_lossy()).with_context(|| {
             format!(
                 "{model} is already loading or loaded as {instance}. Wait for it, or unload it \
                  before loading it again."
