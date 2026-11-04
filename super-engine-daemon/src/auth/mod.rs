@@ -17,8 +17,8 @@ pub mod middleware;
 pub mod routes;
 pub mod tokens;
 
-use crate::keyring::Keyring;
 use crate::resource_management::ResourceManager;
+use crate::secrets::Secrets;
 use consent::{ConsentDialog, ConsentLocks};
 use middleware::DenyCache;
 use std::sync::Arc;
@@ -38,8 +38,9 @@ pub const AUTO_APPROVE: &str = "AUTO_APPROVE";
 pub struct AuthConfig {
     /// The consent dialog: the product it names, and what its scopes grant.
     pub dialog: ConsentDialog,
-    /// Where the session tokens persist.
-    pub keyring: Keyring,
+    /// Where the session tokens persist: the daemon's one
+    /// [`Secrets`], shared with whatever else keeps secrets in it.
+    pub secrets: Secrets,
     /// Counts each caller's connections and requests.
     pub resource_manager: Arc<ResourceManager>,
     /// The browser origins the TCP listener admits: the user's
@@ -65,17 +66,11 @@ struct Inner {
 
 impl Auth {
     /// Load the persisted session tokens and set up an empty consent state.
-    ///
-    /// Blocks on the system keyring, which waits on its unlock prompt for as
-    /// long as the user takes when it is locked, so run it on the blocking
-    /// pool.
-    ///
-    /// # Errors
-    /// When the system keyring is unavailable. See
-    /// [`TokenStore::load_persisted`].
-    pub fn load(config: AuthConfig) -> anyhow::Result<Self> {
-        let tokens = TokenStore::load_persisted(config.dialog.product, config.keyring)?;
-        Ok(Self::with_tokens(config, tokens))
+    /// See [`TokenStore::load_persisted`].
+    #[must_use]
+    pub fn load(config: AuthConfig) -> Self {
+        let tokens = TokenStore::load_persisted(config.secrets.clone());
+        Self::with_tokens(config, tokens)
     }
 
     fn with_tokens(config: AuthConfig, tokens: TokenStore) -> Self {
@@ -142,7 +137,7 @@ impl Auth {
                     product: &super_engine_protocol::test_product::TEST,
                     describe_scopes: describe,
                 },
-                keyring: Keyring::in_memory(&super_engine_protocol::test_product::TEST),
+                secrets: Secrets::in_memory(),
                 resource_manager: Arc::new(ResourceManager::new()),
                 allowed_origins: allowed_origins.iter().map(ToString::to_string).collect(),
             },

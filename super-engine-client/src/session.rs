@@ -5,19 +5,19 @@
 //!
 //! 1. **In-memory cache** (this module's `TOKEN_CACHE`). Hot path —
 //!    set on the first successful `obtain` and reused for the rest of
-//!    the process's lifetime. No keyring access on cache hit, which
+//!    the process's lifetime. No file access on cache hit, which
 //!    matters a lot when a long-lived widget reconnects in a tight
 //!    loop while the daemon is down.
-//! 2. **System keyring** (libsecret/KWallet). Cold-start persistence
-//!    — read once on first `obtain` to recover a token from a previous
-//!    process run. Best-effort write whenever a fresh token is minted.
+//! 2. **Token file**, `<state>/<slug>/clients/<app>.json` at mode 0600 (see
+//!    [`token_path`]). Cold-start persistence — read once on first `obtain`
+//!    to recover a token from a previous process run. Written, atomically,
+//!    whenever a fresh token is minted.
 //!
-//! Each app gets its own keyring "user" (see [`keyring_account`]) so they
-//! don't overwrite each other's tokens, in the keyring service of the product
-//! it is talking to, so an app that talks to both daemons keeps a token for
-//! each. The storage value is a [`Stored`] record: the bearer string and the
-//! scopes it was minted for. Expiry lives server-side and the daemon returns
-//! `invalid_session` if the client presents a stale token.
+//! Each app gets its own file, so apps don't overwrite each other's tokens,
+//! under the state directory of the product it is talking to. The file holds a
+//! [`Stored`] record: the bearer string and the scopes it was minted for.
+//! Expiry lives server-side and the daemon returns `invalid_session` if the
+//! client presents a stale token.
 
 use crate::http_client;
 use serde::{Deserialize, Serialize};
@@ -58,30 +58,16 @@ impl Stored {
     fn covers(&self, needed: &[&str]) -> bool {
         needed.iter().all(|n| self.requested.iter().any(|r| r == n))
     }
-
-    /// Read a keyring value, which is JSON for anything this version wrote and
-    /// a bare token for anything an older one did.
-    ///
-    /// A bare token records no scopes, so it covers nothing and is replaced on
-    /// the next `obtain` — which is exactly the repair an existing install
-    /// needs, without anyone having to clear a keyring entry by hand.
-    fn parse(raw: &str) -> Self {
-        serde_json::from_str(raw).unwrap_or_else(|_| Self {
-            token: raw.to_string(),
-            requested: Vec::new(),
-            granted: Vec::new(),
-        })
-    }
 }
 
 /// Which app is asking, and which product's daemon it is asking.
 #[derive(Clone, Copy, Debug)]
 pub struct AppId {
-    /// The product whose daemon issues the token. Its keyring service
-    /// ([`ProductSpec::session_keyring_service`]) is where the token is kept.
+    /// The product whose daemon issues the token. Its state directory is
+    /// where the token is kept.
     pub product: &'static ProductSpec,
     /// A stable string that uniquely identifies the app (e.g. `"<slug>-cli"`,
-    /// `"<slug>-app"`): the keyring "user" the token is stored under.
+    /// `"<slug>-app"`): the name of the file the token is stored in.
     pub name: &'static str,
 }
 
@@ -108,7 +94,7 @@ type ObtainLockMap = StdMutex<HashMap<AppKey, ObtainLock>>;
 /// `auth_request` flight is in progress per app at any time so parallel
 /// callers (e.g. the settings app's batch of 6 startup GETs) can't each
 /// independently spawn a consent popup. Held across the `auth_request`
-/// await; tokens cached in the keyring after the first caller wins, so
+/// await; tokens saved after the first caller wins, so
 /// subsequent callers double-check `load()` and skip the network entirely.
 static OBTAIN_LOCKS: LazyLock<ObtainLockMap> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -120,9 +106,9 @@ fn lock_for(app_id: AppId) -> ObtainLock {
 }
 
 /// In-process token cache. Populated on every successful `obtain`,
-/// consulted before any keyring access. This is what lets a tight
-/// reconnect loop (e.g. while the daemon is down) avoid hammering the
-/// keyring. Cleared by `forget`.
+/// consulted before the token file is read. This is what lets a tight
+/// reconnect loop (e.g. while the daemon is down) avoid rereading the
+/// file. Cleared by `forget`.
 static TOKEN_CACHE: LazyLock<StdMutex<HashMap<AppKey, Stored>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -138,54 +124,71 @@ fn cache_clear(app_id: AppId) {
     TOKEN_CACHE.lock().unwrap().remove(&app_id.key());
 }
 
-/// When `product`'s `<PREFIX>_KEYRING_MOCK` is set,
-/// route all client-side keyring access (the session-token store this module
-/// manages) to an in-memory mock instead of the system secret service.
-///
-/// This is the client-side twin of the daemon's
-/// `install_mock_if_requested`: the CLI / settings app / applet reach the
-/// keyring through this module's `load`/`save`/`forget`, and an automated
-/// shell or CI run has no unlocked secret service — touching the real one
-/// there blocks on an unlock prompt or fails. Call this once at process
-/// startup, before any keyring access, as it sets the process-wide default
-/// credential builder. A client of both products calls it for each: either
-/// variable set is a request for the mock.
-pub fn install_mock_keyring_if_requested(product: &ProductSpec) {
-    if std::env::var_os(product.env("KEYRING_MOCK")).is_some() {
-        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
-    }
-}
-
-/// The keyring "user" this process stores its token under: the [`AppId`],
-/// plus the sandbox it is running in when there is one.
+/// The file this install keeps `app_id`'s token in:
+/// `<state>/<slug>/clients/<name>.json`, where `<name>` is the [`AppId`]'s
+/// name plus the sandbox it is running in when there is one.
 ///
 /// The bare `AppId` is shared by every build of an app, so a native install
-/// and a flatpak of the same app read and write one entry. The daemon binds
-/// each token to the caller it granted it to, so the token one of them stored
-/// is rejected for the other: with a single shared entry the two take turns
-/// invalidating each other, and every alternation costs the user a fresh
-/// consent popup. Scoping the account by install keeps them apart. A native
-/// install keeps the plain `AppId`, so nothing already stored moves.
-fn keyring_account(app_id: AppId) -> String {
-    match super_engine_protocol::sandbox::own_app_id() {
+/// and a flatpak of the same app would read and write one file. The daemon
+/// binds each token to the caller it granted it to, so the token one of them
+/// stored is rejected for the other: with a single shared file the two take
+/// turns invalidating each other, and every alternation costs the user a fresh
+/// consent popup. Naming the file by install keeps them apart.
+fn token_path(app_id: AppId) -> PathBuf {
+    let name = match super_engine_protocol::sandbox::own_app_id() {
         Some(sandbox_id) => format!("{}@flatpak:{sandbox_id}", app_id.name),
         None => app_id.name.to_string(),
-    }
+    };
+    super_engine_protocol::paths::state_dir(app_id.product)
+        .join("clients")
+        .join(format!("{}.json", file_safe(&name)))
 }
 
-/// The keyring entry `app_id`'s token lives in: the product's session
-/// service, under this install's account.
-fn keyring_entry(app_id: AppId) -> keyring::Result<keyring::Entry> {
-    keyring::Entry::new(
-        &app_id.product.session_keyring_service(),
-        &keyring_account(app_id),
-    )
+/// `name` with every character but letters, digits and `.`, `_`, `-`, `@`,
+/// `:` replaced by `_`, so an app's name never names a path outside the
+/// `clients` directory.
+fn file_safe(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-@:".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The record in the token file at `path`, or None when there is none that
+/// reads.
+fn read_stored(path: &std::path::Path) -> Option<Stored> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Write `stored` to the token file at `path`, at mode 0600.
+fn write_stored(path: &std::path::Path, stored: &Stored) -> Result<(), String> {
+    let value = serde_json::to_string(stored)
+        .map_err(|e| format!("encoding the session record failed: {e}"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("creating {} failed: {e}", dir.display()))?;
+    }
+    super_engine_spec::fs::write_atomic_private(path, value.as_bytes())
+        .map_err(|e| format!("writing {} failed: {e}", path.display()))
+}
+
+/// Delete the token file at `path`. None there is already deleted.
+fn delete_stored(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("deleting {} failed: {e}", path.display())),
+    }
 }
 
 /// Read the stored token for `app_id`, or None if nothing is stored.
 fn load_stored(app_id: AppId) -> Option<Stored> {
-    let entry = keyring_entry(app_id).ok()?;
-    entry.get_password().ok().map(|raw| Stored::parse(&raw))
+    read_stored(&token_path(app_id))
 }
 
 /// Read the cached token for `app_id`, or None if no token is stored.
@@ -198,11 +201,11 @@ pub fn load(app_id: AppId) -> Option<String> {
 }
 
 /// Persist a token for `app_id`, with the scopes it was `requested` with and
-/// the ones the daemon `granted`, to both the in-memory cache and the system
-/// keyring. Replaces any previous value. The in-memory side always succeeds;
-/// the keyring write is best-effort and its failure is reported via the return
-/// value (callers in this module ignore it because the in-memory cache is the
-/// source of truth at runtime).
+/// the ones the daemon `granted`, to both the in-memory cache and the token
+/// file. Replaces any previous value. The in-memory side always succeeds; the
+/// file write's failure is reported via the return value (callers in this
+/// module ignore it because the in-memory cache is the source of truth at
+/// runtime).
 ///
 /// `requested` is what a later [`obtain`] checks its needs against, so passing
 /// a set narrower than the token really covers costs an extra consent popup,
@@ -210,7 +213,7 @@ pub fn load(app_id: AppId) -> Option<String> {
 /// exists to prevent.
 ///
 /// # Errors
-/// Returns an error if the keyring is unavailable or the write fails.
+/// Returns an error if the token file cannot be written.
 pub fn save(
     app_id: AppId,
     token: &str,
@@ -223,49 +226,39 @@ pub fn save(
         granted: granted.to_vec(),
     };
     cache_set(app_id, stored.clone());
-    let value = serde_json::to_string(&stored)
-        .map_err(|e| format!("encoding the session record failed: {e}"))?;
-    let entry = keyring_entry(app_id).map_err(|e| format!("keyring access failed: {e}"))?;
-    entry
-        .set_password(&value)
-        .map_err(|e| format!("keyring write failed: {e}"))?;
-    Ok(())
+    write_stored(&token_path(app_id), &stored)
 }
 
-/// Forget the cached token for `app_id` (both in-memory and the
-/// keyring). Idempotent — succeeds even if nothing was stored.
+/// Forget the cached token for `app_id` (both in-memory and the token file).
+/// Idempotent — succeeds even if nothing was stored.
 ///
 /// # Errors
-/// Returns an error if the keyring is unavailable.
+/// Returns an error if the token file exists and cannot be deleted.
 pub fn forget(app_id: AppId) -> Result<(), String> {
     cache_clear(app_id);
-    let entry = keyring_entry(app_id).map_err(|e| format!("keyring access failed: {e}"))?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keyring delete failed: {e}")),
-    }
+    delete_stored(&token_path(app_id))
 }
 
 /// Get a usable session token for `app_id`. Cascades through three
 /// layers, in order:
 ///
-/// 1. **In-memory cache.** Hot path; no I/O, no keyring access.
-/// 2. **System keyring.** Cold path on first call after a process
+/// 1. **In-memory cache.** Hot path; no I/O.
+/// 2. **Token file.** Cold path on first call after a process
 ///    start. Populates the in-memory cache on success.
 /// 3. **`auth_request`.** Triggers the libcosmic consent popup. Stores
-///    the resulting token in both the cache and the keyring (the
-///    keyring write is best-effort — if it fails the in-memory cache
-///    still keeps the token alive for the rest of the process).
+///    the resulting token in both the cache and the file (the file
+///    write is best-effort — if it fails the in-memory cache still
+///    keeps the token alive for the rest of the process).
 ///
 /// Concurrency-safe: parallel callers for the same `app_id` are
 /// serialized through a per-`AppId` async mutex (double-checked
-/// locking against the cache + keyring), so at most one consent popup
+/// locking against the cache + file), so at most one consent popup
 /// is ever spawned even when the settings app fires its startup batch
 /// of six settings GETs in parallel.
 ///
 /// # Errors
 /// Returns an error if `auth_request` fails (user denied, popup
-/// dismissed, daemon unreachable, etc.). Keyring write failures are
+/// dismissed, daemon unreachable, etc.). Token-file write failures are
 /// silently absorbed (the token remains usable for this process).
 pub async fn obtain(
     socket_path: PathBuf,
@@ -273,12 +266,12 @@ pub async fn obtain(
     app_name: &str,
     scopes: &[&str],
 ) -> http_client::HttpResult<String> {
-    // 1. In-memory cache hit — no keyring access, no I/O.
+    // 1. In-memory cache hit — no I/O.
     if let Some(t) = usable(cache_get(app_id), scopes) {
         return Ok(t);
     }
 
-    // 2. Keyring read (one-time per process per AppId, populates the
+    // 2. Token-file read (one-time per process per AppId, populates the
     //    in-memory cache for subsequent calls).
     if let Some(stored) = load_stored(app_id) {
         if stored.covers(scopes) {
@@ -308,9 +301,9 @@ pub async fn obtain(
     }
 
     let auth = http_client::auth_request(socket_path, app_name, scopes).await?;
-    // `save` updates both in-memory cache and keyring; we ignore the
-    // keyring half's error so a locked / denied keyring doesn't break
-    // the working session.
+    // `save` updates both the in-memory cache and the file; we ignore the
+    // file half's error so a failed write doesn't break the working
+    // session.
     let _ = save(app_id, &auth.session_token, scopes, &auth.scopes);
     Ok(auth.session_token)
 }
@@ -382,7 +375,7 @@ mod tests {
     }
 
     /// Verify that once a token is in the in-memory cache, `obtain`
-    /// returns it without touching the keyring or the network. We
+    /// returns it without reading the token file or the network. We
     /// pass a bogus socket path that would fail if `obtain` fell
     /// through to `auth_request`.
     #[tokio::test]
@@ -401,13 +394,9 @@ mod tests {
         assert_eq!(result.expect("cache hit should succeed"), "TOK-from-cache");
     }
 
-    /// Verify the in-memory cache primitives round-trip cleanly. We
-    /// don't exercise `forget`/`save` directly here because both
-    /// touch the real system keyring, and a unit test under a locked
-    /// keyring would hang on the unlock prompt. The `forget` and
-    /// `save` functions invoke `cache_clear` and `cache_set`
-    /// respectively as their first action, so a working cache layer
-    /// is the necessary-and-sufficient ingredient.
+    /// Verify the in-memory cache primitives round-trip cleanly. `save` and
+    /// `forget` write under the user's real state directory, so the file
+    /// half is tested on its own, in a temp directory, below.
     #[test]
     fn cache_set_get_clear_round_trip() {
         let app_id = AppId::new(&TEST, "test-cache-roundtrip");
@@ -457,28 +446,34 @@ mod tests {
         assert!(declined.covers(&["settings", "test_events"]));
     }
 
-    /// An entry written before this record existed is a bare token. It covers
-    /// nothing, so the next `obtain` replaces it — which is the repair an
-    /// installed app needs without anyone clearing a keyring entry by hand.
+    /// What `save` writes, the next process reads back, from a file only its
+    /// owner can read; and `forget` deletes it, twice if need be.
     #[test]
-    fn a_legacy_bare_token_is_replaced_rather_than_presented() {
-        let legacy = Stored::parse("TOK-from-an-older-build");
-        assert_eq!(legacy.token, "TOK-from-an-older-build");
-        assert!(legacy.requested.is_empty());
-        assert!(!legacy.covers(&["settings"]));
-        // Nothing is asked of a caller that needs nothing, so an empty need is
-        // still covered — `obtain` with no scopes has nothing to re-ask for.
-        assert!(legacy.covers(&[]));
+    fn a_stored_record_round_trips_through_its_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("clients/test-app.json");
+        write_stored(&path, &stored("TOK", &["settings", "test_events"])).expect("written");
+
+        let read = read_stored(&path).expect("read back");
+        assert_eq!(read.token, "TOK");
+        assert!(read.covers(&["settings", "test_events"]));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        delete_stored(&path).expect("deleted");
+        assert!(read_stored(&path).is_none());
+        delete_stored(&path).expect("deleting what is gone is fine");
     }
 
-    /// What `save` writes, `parse` reads back.
+    /// The file is named after the app, in its product's directory, and no
+    /// name can lead out of it.
     #[test]
-    fn a_stored_record_round_trips_through_its_json() {
-        let original = stored("TOK", &["settings", "test_events"]);
-        let raw = serde_json::to_string(&original).expect("a record must encode");
-        let parsed = Stored::parse(&raw);
-        assert_eq!(parsed.token, "TOK");
-        assert!(parsed.covers(&["settings", "test_events"]));
+    fn a_token_file_stays_in_its_products_clients_directory() {
+        let path = token_path(AppId::new(&TEST, "super-test-app"));
+        assert!(path.ends_with("super-test/clients/super-test-app.json"));
+        assert_eq!(file_safe("../../etc/passwd"), ".._.._etc_passwd");
     }
 
     /// One app talking to both daemons holds a token for each: the product is

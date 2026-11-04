@@ -6,16 +6,14 @@
 //! the daemon the way anything else stops one ([`shutdown`]) and removes the
 //! home.
 //!
-//! The home is what keeps a test off the machine it runs on. Config, data and
-//! cache each get a directory of their own, so a test daemon neither reads
-//! nor writes the developer's `daemon.ron`, installed backends or registry
-//! cache, and daemons spawned side by side by one test binary do not
-//! overwrite each other's files.
+//! The home is what keeps a test off the machine it runs on. Config, data,
+//! cache and state each get a directory of their own, so a test daemon neither
+//! reads nor writes the developer's `daemon.ron`, installed backends, registry
+//! cache or secrets file, and daemons spawned side by side by one test binary
+//! do not overwrite each other's files.
 //!
 //! The daemon also starts with its product's test switches on:
 //!
-//! - `<PREFIX>_KEYRING_MOCK=1`: session tokens and secrets live in memory, so
-//!   no keyring prompt can stall the suite.
 //! - `<PREFIX>_AUTO_APPROVE=1`: a token request is granted without the
 //!   consent dialog.
 //! - `<PREFIX>_MUTE_CUES=1`: no audio cue plays through the speakers of
@@ -79,6 +77,9 @@ pub struct Home {
     pub data: PathBuf,
     /// `XDG_CACHE_HOME`: the registry index and install downloads.
     pub cache: PathBuf,
+    /// `XDG_STATE_HOME`: `<state>/<slug>/secrets.ron` holds the session
+    /// tokens and the backends' API keys.
+    pub state: PathBuf,
 }
 
 impl Home {
@@ -94,9 +95,10 @@ impl Home {
             config: root.join("config"),
             data: root.join("data"),
             cache: root.join("cache"),
+            state: root.join("state"),
             root,
         };
-        for dir in [&home.config, &home.data, &home.cache] {
+        for dir in [&home.config, &home.data, &home.cache, &home.state] {
             std::fs::create_dir_all(dir).expect("create a test daemon's home");
         }
         home
@@ -261,13 +263,13 @@ impl TestDaemon {
         let mut set = |key: String, value: &OsStr| {
             env.insert(OsString::from(key), Some(value.to_owned()));
         };
-        set(product.env("KEYRING_MOCK"), OsStr::new("1"));
         set(product.env("AUTO_APPROVE"), OsStr::new("1"));
         set(product.env("MUTE_CUES"), OsStr::new("1"));
         set(product.env("HTTP_SOCKET"), socket.as_os_str());
         set("XDG_CONFIG_HOME".to_owned(), home.config.as_os_str());
         set("XDG_DATA_HOME".to_owned(), home.data.as_os_str());
         set("XDG_CACHE_HOME".to_owned(), home.cache.as_os_str());
+        set("XDG_STATE_HOME".to_owned(), home.state.as_os_str());
         set("GITHUB_API_BASE".to_owned(), OsStr::new(UNREACHABLE_API));
         Builder {
             product,
@@ -528,7 +530,6 @@ mod tests {
                 .flatten()
                 .map(|v| v.to_string_lossy().into_owned())
         };
-        assert_eq!(value("SUPER_TEST_KEYRING_MOCK").as_deref(), Some("1"));
         assert_eq!(value("SUPER_TEST_AUTO_APPROVE").as_deref(), Some("1"));
         assert_eq!(value("SUPER_TEST_MUTE_CUES").as_deref(), Some("1"));
         assert_eq!(
@@ -537,10 +538,20 @@ mod tests {
             "a shared registry cache is one test daemon overwriting another's"
         );
         assert_eq!(
+            value("XDG_STATE_HOME").as_deref(),
+            home.state.to_str(),
+            "a shared secrets file is one test daemon reading another's tokens"
+        );
+        assert_eq!(
             value("SUPER_TEST_HTTP_SOCKET").as_deref(),
             builder.socket().to_str()
         );
-        assert!(home.data.is_dir() && home.config.is_dir() && home.cache.is_dir());
+        assert!(
+            home.data.is_dir()
+                && home.config.is_dir()
+                && home.cache.is_dir()
+                && home.state.is_dir()
+        );
         assert_eq!(
             backends_dir(&TEST, &home),
             home.data.join("super-test").join("backends")

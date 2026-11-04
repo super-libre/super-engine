@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 ///
 /// **In-memory only.** The set lives for the daemon's lifetime; a
 /// daemon restart resets it so the user gets a fresh chance to grant
-/// consent if they want to. This intentionally has no keyring/disk
-/// persistence (per spec).
+/// consent if they want to. This intentionally has no disk persistence
+/// (per spec).
 #[derive(Clone, Default)]
 pub struct DenyCache {
     pub(crate) inner: Arc<Mutex<std::collections::HashSet<ConsentKey>>>,
@@ -314,7 +314,7 @@ pub struct AuthContext {
 /// and only every 30 s. Anything else presenting a token minted for another
 /// binary was authorized for the token's full 30-day life, with no consent
 /// popup anywhere in the flow, because possession was the whole test. A
-/// token reachable from a second process — a keyring entry two installs of
+/// token reachable from a second process — a token file two installs of
 /// the same app share, a copied config — is exactly that case.
 ///
 /// A resolved mismatch revokes, matching the `/events` watch rather than
@@ -651,7 +651,7 @@ mod peer_binding_tests {
     }
 
     /// The case this check exists for: a token minted for one binary is
-    /// presented by a different one. That is what a keyring entry shared
+    /// presented by a different one. That is what a token file shared
     /// between two installs of the same app produces, and possession alone
     /// must not be enough — the daemon's answer is `exe_changed`, and the
     /// session ends rather than merely failing this one call.
