@@ -184,7 +184,10 @@ fn note_tone_end(
         return;
     };
     let timestamp = info.timestamp();
-    let Some(latency) = timestamp.playback.duration_since(&timestamp.callback) else {
+    let Some(latency) = timestamp
+        .playback
+        .checked_duration_since(timestamp.callback)
+    else {
         return;
     };
     let _ =
@@ -212,7 +215,7 @@ fn build_stream(
             let mut phase = 0.0f32;
             let stream = device
                 .build_output_stream(
-                    &config.config(),
+                    config.config(),
                     move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                         let clock_before = sample_clock;
                         for frame in data.chunks_mut(channels) {
@@ -242,7 +245,7 @@ fn build_stream(
             let mut phase = 0.0f32;
             let stream = device
                 .build_output_stream(
-                    &config.config(),
+                    config.config(),
                     move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
                         let clock_before = sample_clock;
                         for frame in data.chunks_mut(channels) {
@@ -277,6 +280,38 @@ fn build_stream(
             "Unsupported sample format for beep playback"
         )),
     }
+}
+
+/// The output config to play a cue in: the device's default, unless that is a
+/// sample format [`build_stream`] does not write.
+///
+/// cpal 0.18 ranks `I32` and `I24` above `I16` for a device with no `F32`,
+/// where 0.17 ranked `I16` first. Left alone, a device whose cues used to play
+/// in `I16` would now be refused. Such a device still offers `I16`, so this
+/// asks for it at the default's rate and channel count.
+fn output_config(device: &Device) -> Result<cpal::SupportedStreamConfig, cpal::Error> {
+    let default = device.default_output_config()?;
+    if writes(default.sample_format()) {
+        return Ok(default);
+    }
+    Ok(i16_alternative(&default, device.supported_output_configs()?).unwrap_or(default))
+}
+
+/// Whether [`build_stream`] writes `format`.
+fn writes(format: cpal::SampleFormat) -> bool {
+    matches!(format, cpal::SampleFormat::F32 | cpal::SampleFormat::I16)
+}
+
+/// `default`, but in `I16`, if one of `ranges` offers that.
+fn i16_alternative(
+    default: &cpal::SupportedStreamConfig,
+    ranges: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+) -> Option<cpal::SupportedStreamConfig> {
+    ranges
+        .into_iter()
+        .filter(|r| r.sample_format() == cpal::SampleFormat::I16)
+        .filter(|r| r.channels() == default.channels())
+        .find_map(|r| r.try_with_sample_rate(default.sample_rate()))
 }
 
 /// Spin-wait until the stream finishes or the timeout elapses, hold it until
@@ -399,9 +434,8 @@ fn play_sequence(
     let device = host
         .default_output_device()
         .ok_or_else(|| anyhow::anyhow!("No output device available"))?;
-    let config = device
-        .default_output_config()
-        .map_err(|e| anyhow::anyhow!("Failed to get output config: {e}"))?;
+    let config =
+        output_config(&device).map_err(|e| anyhow::anyhow!("Failed to get output config: {e}"))?;
 
     let params = BeepParams::compute(
         &device,
@@ -548,6 +582,64 @@ pub async fn preview_theme(
 mod tests {
     use super::*;
     use super_engine_protocol::test_product::TEST;
+
+    fn range(
+        format: cpal::SampleFormat,
+        channels: u16,
+        min: u32,
+        max: u32,
+    ) -> cpal::SupportedStreamConfigRange {
+        cpal::SupportedStreamConfigRange::new(
+            channels,
+            min,
+            max,
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    /// cpal 0.18 defaults a device without `F32` to `I32` where 0.17 chose
+    /// `I16`. A cue asks for the `I16` that device still offers, at the rate
+    /// and channel count the default named, rather than refusing the device.
+    #[test]
+    fn an_integer_default_falls_back_to_i16_at_the_same_rate_and_channels() {
+        let default = cpal::SupportedStreamConfig::new(
+            2,
+            48000,
+            cpal::SupportedBufferSize::Unknown,
+            cpal::SampleFormat::I32,
+        );
+        let offered = [
+            range(cpal::SampleFormat::I32, 2, 8000, 192_000),
+            range(cpal::SampleFormat::I16, 1, 8000, 192_000),
+            range(cpal::SampleFormat::I16, 2, 8000, 44100),
+            range(cpal::SampleFormat::I16, 2, 8000, 192_000),
+        ];
+        let chosen = i16_alternative(&default, offered).expect("an I16 config is offered");
+        assert_eq!(chosen.sample_format(), cpal::SampleFormat::I16);
+        assert_eq!(chosen.channels(), 2);
+        assert_eq!(chosen.sample_rate(), 48000);
+    }
+
+    /// With no `I16` at the default's shape there is nothing to steer to; the
+    /// default stands and `build_stream` names the format it cannot write.
+    #[test]
+    fn no_matching_i16_leaves_the_default_alone() {
+        let default = cpal::SupportedStreamConfig::new(
+            2,
+            48000,
+            cpal::SupportedBufferSize::Unknown,
+            cpal::SampleFormat::I24,
+        );
+        let offered = [
+            range(cpal::SampleFormat::I24, 2, 48000, 48000),
+            range(cpal::SampleFormat::I16, 6, 48000, 48000),
+            range(cpal::SampleFormat::I16, 2, 44100, 44100),
+        ];
+        assert!(i16_alternative(&default, offered).is_none());
+        assert!(!writes(cpal::SampleFormat::I24));
+        assert!(writes(cpal::SampleFormat::F32) && writes(cpal::SampleFormat::I16));
+    }
 
     /// Test helper to calculate fade-out multiplier like the actual code
     fn calculate_fade_out_multiplier(
