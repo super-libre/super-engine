@@ -15,14 +15,14 @@
 //! tree's test coverage — see `plan`'s unit tests below — without ever
 //! needing a command-runner trait or a mocked OS.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super_engine_protocol::ProductSpec;
 
 use crate::errors::InstallError;
 use crate::stage::Components;
-use crate::{AfterInstall, Installer};
+use crate::{AfterInstall, Installer, Retired};
 
 /// Run `bin` with `args`, discarding output, returning whether it exited 0.
 /// A spawn failure (binary missing, etc.) also counts as "not ok".
@@ -294,6 +294,22 @@ async fn step_nudge_launchers() {
         .await;
 }
 
+/// Stop and disable the user units of the products this one replaces, so
+/// their daemon is down before this one starts and does not come back at the
+/// next login. Runs before the root phase, while the unit files are still
+/// there to disable. Best-effort: a unit that was never installed fails to
+/// disable, and that is the common case.
+pub async fn stop_retired_units(retired: &Retired) {
+    if retired.units.is_empty() || !on_path("systemctl") {
+        return;
+    }
+    for unit in retired.units {
+        if cmd_ok("systemctl", &["--user", "disable", "--now", unit]).await {
+            log::info!("Stopped and disabled {unit}, which this install replaces");
+        }
+    }
+}
+
 /// Bins, desktop files, and icons the pre-`/usr/local` per-user install left
 /// behind — cleared so they don't shadow (or duplicate in launchers) the
 /// fresh install.
@@ -380,9 +396,19 @@ pub async fn run(
     // guard itself, so passing `false` when it doesn't apply is equivalent.
     let panel_running =
         components.applet && applet_changes && cmd_ok("pgrep", &["-f", "cosmic-panel"]).await;
-    let app = prefix.join(format!("bin/{}-app", product.slug));
-    let app_pids = if components.app {
-        running_app_pids(&app)
+    // Each app with the windows still running the binary the root phase
+    // replaced.
+    let running_apps: Vec<(PathBuf, Vec<u32>)> = if components.app {
+        installer
+            .apps
+            .iter()
+            .map(|app| prefix.join("bin").join(app))
+            .map(|app| {
+                let pids = running_app_pids(&app);
+                (app, pids)
+            })
+            .filter(|(_, pids)| !pids.is_empty())
+            .collect()
     } else {
         Vec::new()
     };
@@ -392,7 +418,7 @@ pub async fn run(
         applet_changes,
         systemctl_available,
         panel_running,
-        !app_pids.is_empty(),
+        !running_apps.is_empty(),
     ) {
         match step {
             Step::DaemonReload => step_daemon_reload().await,
@@ -408,7 +434,11 @@ pub async fn run(
             // module's doc comment, which documents `RestartOrStart` as the
             // sole hard error.
             Step::RestartOrStart => step_restart_or_start(unit).await?,
-            Step::RestartApp => step_restart_app(&app, &app_pids).await,
+            Step::RestartApp => {
+                for (app, pids) in &running_apps {
+                    step_restart_app(app, pids).await;
+                }
+            }
             Step::RestartPanel => step_restart_panel().await,
             Step::NudgeLaunchers => step_nudge_launchers().await,
             Step::CleanupLegacy => cleanup_legacy(product),
