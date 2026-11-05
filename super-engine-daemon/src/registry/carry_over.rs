@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super_engine_spec::installed_files::InstalledFiles;
 use super_engine_spec::manifest::Manifest;
 use super_engine_spec::product::Product;
 use tokio::fs;
@@ -41,15 +42,14 @@ use tokio::fs;
 /// re-download rather than risking the wrong file being carried over silently.
 /// Two models declaring it *identically* is not a conflict and still maps to
 /// `Some(urls)`.
-fn declared<P: Product>(m: &Manifest<P>) -> HashMap<&str, Option<Vec<&str>>> {
+fn declared<'a>(
+    models: impl IntoIterator<Item = Vec<(&'a str, &'a str)>>,
+) -> HashMap<&'a str, Option<Vec<&'a str>>> {
     let mut out: HashMap<&str, Option<Vec<&str>>> = HashMap::new();
-    for model in &m.models {
+    for files in models {
         let mut per_model: HashMap<&str, Vec<&str>> = HashMap::new();
-        for f in &model.files {
-            per_model
-                .entry(f.destination.as_str())
-                .or_default()
-                .push(f.url.as_str());
+        for (destination, url) in files {
+            per_model.entry(destination).or_default().push(url);
         }
         for (dest, urls) in per_model {
             match out.entry(dest) {
@@ -80,8 +80,44 @@ fn declared<P: Product>(m: &Manifest<P>) -> HashMap<&str, Option<Vec<&str>>> {
 /// output.
 #[must_use]
 pub fn survivors<P: Product>(old: &Manifest<P>, new: &Manifest<P>) -> Vec<String> {
-    let old_files = declared(old);
-    let mut out: Vec<String> = declared(new)
+    survivors_of(&declared(files_of(old)), new)
+}
+
+/// [`survivors`] when the old directory's manifest no longer parses as this
+/// product's — one a product this one replaced installed — read as
+/// [`InstalledFiles`].
+#[must_use]
+pub fn survivors_from_installed<P: Product>(
+    old: &InstalledFiles,
+    new: &Manifest<P>,
+) -> Vec<String> {
+    survivors_of(
+        &declared(old.models.iter().map(|files| {
+            files
+                .iter()
+                .map(|(destination, url)| (destination.as_str(), url.as_str()))
+                .collect()
+        })),
+        new,
+    )
+}
+
+/// Each model's files of `m`, as `(destination, url)`.
+fn files_of<P: Product>(m: &Manifest<P>) -> impl Iterator<Item = Vec<(&str, &str)>> {
+    m.models.iter().map(|model| {
+        model
+            .files
+            .iter()
+            .map(|f| (f.destination.as_str(), f.url.as_str()))
+            .collect()
+    })
+}
+
+fn survivors_of<P: Product>(
+    old_files: &HashMap<&str, Option<Vec<&str>>>,
+    new: &Manifest<P>,
+) -> Vec<String> {
+    let mut out: Vec<String> = declared(files_of(new))
         .into_iter()
         .filter_map(|(dest, urls)| {
             let urls = urls?;

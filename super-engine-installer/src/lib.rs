@@ -50,6 +50,40 @@ pub struct Installer {
     /// The product's own post-install steps, run after the shared ones. They
     /// are best-effort: they log what fails, and the install still succeeds.
     pub after_install: Option<fn(&AfterInstall<'_>)>,
+    /// The apps the `app` component installs, by binary name: each with its
+    /// `resources/<name>.desktop` and icon, and its metainfo when the release
+    /// carries one. A product's apps need not carry its slug.
+    pub apps: &'static [&'static str],
+    /// What installs of the products this one replaces left behind. It goes
+    /// with an install of the daemon: their units are stopped first, then
+    /// their files removed.
+    pub retired: Retired,
+}
+
+/// Files and units of products an [`Installer`]'s product replaces, by name.
+/// Removing a file that is not there is a no-op, so the lists name everything
+/// any of their releases installed.
+#[derive(Debug, Clone, Copy)]
+pub struct Retired {
+    /// Files under `<prefix>/bin`.
+    pub binaries: &'static [&'static str],
+    /// User units: stopped and disabled, then removed from the unit
+    /// directory, so the replaced daemon never runs beside the new one.
+    pub units: &'static [&'static str],
+    /// Apps whose launcher entry, icon and metainfo go.
+    pub apps: &'static [&'static str],
+    /// COSMIC applets whose binary, three launcher entries and icon go.
+    pub applets: &'static [&'static str],
+}
+
+impl Retired {
+    /// A product that replaces nothing.
+    pub const NONE: Self = Self {
+        binaries: &[],
+        units: &[],
+        apps: &[],
+        applets: &[],
+    };
 }
 
 /// What an [`Installer::after_install`] step knows about the install that
@@ -330,6 +364,18 @@ async fn download_verified(
     Ok(tarball_path)
 }
 
+/// Whether this install replaces or removes an applet binary the panel may be
+/// running: the shared applet, when a newer release of it is being installed
+/// over it, or the product's own, or one of the products it replaces.
+fn applet_changes(installer: &Installer, prefix: &Path, applet_release: bool) -> bool {
+    let bin = prefix.join("bin");
+    let product_applet = format!("{}-cosmic-applet", installer.product.slug);
+    (applet_release && bin.join(super_engine_protocol::SHARED_APPLET).exists())
+        || std::iter::once(product_applet.as_str())
+            .chain(installer.retired.applets.iter().copied())
+            .any(|applet| bin.join(applet).exists())
+}
+
 async fn run(
     installer: &Installer,
     cli: &cli::Cli,
@@ -356,7 +402,7 @@ async fn run(
         }
     }
 
-    let components = stage::plan_components(explicit, prefix, cosmic_available, product);
+    let components = stage::plan_components(explicit, prefix, cosmic_available, installer);
     let applet_target = if components.applet {
         resolve_applet(installer, cli, triple, prefix).await?
     } else {
@@ -392,10 +438,7 @@ async fn run(
     // changes under it, which the panel needs restarting to pick up. That is
     // the shared applet replaced by a newer release, or the product's own
     // removed in its favor.
-    let product_applet_bin = prefix.join(format!("bin/{}-cosmic-applet", product.slug));
-    let shared_applet_bin = prefix.join(format!("bin/{}", super_engine_protocol::SHARED_APPLET));
-    let applet_changes =
-        (applet_extracted.is_some() && shared_applet_bin.exists()) || product_applet_bin.exists();
+    let applet_changes = applet_changes(installer, prefix, applet_extracted.is_some());
     let self_exe = std::env::current_exe()
         .map_err(|e| InstallError::InstallFailed(format!("current_exe: {e}")))?;
     let manifest = stage::build_manifest(
@@ -434,6 +477,11 @@ async fn run(
         phase: Phase::Install,
         message: "installing files",
     });
+    // While their unit files are still there to disable: the root phase
+    // removes them, and the replaced daemon must not run beside the new one.
+    if components.daemon {
+        post_install::stop_retired_units(&installer.retired).await;
+    }
     escalate::run_root_phase(method, &manifest_path).await?;
 
     reporter.emit(&Event::Phase {
@@ -496,6 +544,23 @@ mod tests {
         user_agent: "super-engine-installer-tests",
         wrapper_usage: "Used by the tests.",
         after_install: None,
+        apps: &["super-test-app"],
+        retired: Retired::NONE,
+    };
+
+    /// A product that replaced two others, each with an app of its own.
+    pub(crate) static MERGED_INSTALLER: Installer = Installer {
+        product: &TEST,
+        user_agent: "super-engine-installer-tests",
+        wrapper_usage: "Used by the tests.",
+        after_install: None,
+        apps: &["super-a-app", "super-b-app"],
+        retired: Retired {
+            binaries: &["super-a-daemon", "super-a-cli", "a"],
+            units: &["super-a.service"],
+            apps: &["super-old-app"],
+            applets: &["super-a-cosmic-applet"],
+        },
     };
 
     #[test]

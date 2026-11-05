@@ -8,6 +8,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use ring::digest::SHA256;
 use super_engine_spec::index::{IndexAsset, IndexBackend};
+use super_engine_spec::installed_files::InstalledFiles;
 use super_engine_spec::manifest::Manifest;
 use super_engine_spec::product::Product;
 use super_engine_spec::registry::events::{InstallError, InstallPhase};
@@ -502,7 +503,15 @@ async fn find_serving<Prod: Product>(
         if exclude.is_some_and(|e| dir == e) || !dir.is_dir() {
             continue;
         }
-        if Manifest::<Prod>::load(&dir).is_ok_and(|m| m.backend.source == source) {
+        // A directory whose manifest is not this product's — one a product
+        // this one replaced installed — still serves its source until an
+        // update replaces it, and is found by it so the update inherits its
+        // files and retires it.
+        let serves = match Manifest::<Prod>::load(&dir) {
+            Ok(m) => m.backend.source == source,
+            Err(_) => InstalledFiles::load(&dir).is_some_and(|old| old.source == source),
+        };
+        if serves {
             return Some(dir);
         }
     }
@@ -574,13 +583,21 @@ pub async fn retire_previous_dir<Prod: Product>(
 /// preserved. This is a known, accepted gap (end state is still correct
 /// content), not a bug to fix here.
 async fn preserve_models<Prod: Product>(staging: &Path, final_path: &Path) -> std::io::Result<u64> {
-    let (Ok(old), Ok(new)) = (
-        Manifest::<Prod>::load(final_path),
-        Manifest::<Prod>::load(staging),
-    ) else {
+    let Ok(new) = Manifest::<Prod>::load(staging) else {
         return Ok(0);
     };
-    let keep = crate::registry::carry_over::survivors(&old, &new);
+    let keep = match Manifest::<Prod>::load(final_path) {
+        Ok(old) => crate::registry::carry_over::survivors(&old, &new),
+        // Installed by a product this one replaced: its manifest is not this
+        // product's, but its files are still the ones on disk. Only the same
+        // backend's are carried over.
+        Err(_) => match InstalledFiles::load(final_path) {
+            Some(old) if old.source == new.backend.source => {
+                crate::registry::carry_over::survivors_from_installed(&old, &new)
+            }
+            _ => return Ok(0),
+        },
+    };
     if keep.is_empty() {
         return Ok(0);
     }
@@ -1411,6 +1428,94 @@ supported_devices = ["cpu"]
             .unwrap();
         assert_eq!(moved, 7);
         assert!(staging.join("models/m/a.bin").exists());
+    }
+
+    /// A backend a replaced product installed has a manifest this product
+    /// refuses. Its update still keeps the weights already on disk, and finds
+    /// the directory to inherit from — but only for the same backend.
+    #[tokio::test]
+    async fn an_update_keeps_the_weights_of_a_backend_a_replaced_product_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".staging/y-1.0.1");
+        let old_dir = root.path().join("old-y");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(old_dir.join("models/m")).unwrap();
+        // Another product's manifest, in a shape no product today accepts.
+        let old = |source: &str| {
+            format!(
+                r#"
+[backend]
+    source   = "{source}"
+    product  = "super-replaced"
+    contract = "v4"
+
+[[models]]
+    name     = "m"
+    provider = "Legacy"
+    files = [
+        {{ url = "https://h/a.bin", destination = "models/m/a.bin" }},
+    ]
+"#
+            )
+        };
+        std::fs::write(
+            staging.join("backend.toml"),
+            r#"
+[backend]
+    source     = "github.com/x/y"
+    name       = "Y"
+    version    = "1.0.1"
+    kind       = "subprocess"
+    entrypoint = "y"
+    contract   = "v1"
+    license    = "Apache-2.0"
+    description = "Test backend."
+
+[[assets.subprocess]]
+    file   = "y.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel  = ["cpu"]
+
+[[models]]
+    name                = "m"
+    primary_language    = "en"
+    supported_languages = ["en"]
+    supported_devices   = ["cpu"]
+    files = [
+        { url = "https://h/a.bin", destination = "models/m/a.bin" },
+    ]
+"#,
+        )
+        .unwrap();
+        std::fs::write(old_dir.join("backend.toml"), old("github.com/x/y")).unwrap();
+        std::fs::write(old_dir.join("models/m/a.bin"), b"weights").unwrap();
+        assert!(
+            Manifest::<TestProduct>::load(&old_dir).is_err(),
+            "the old manifest is not this product's"
+        );
+
+        assert_eq!(
+            super::previous_dir_for::<TestProduct>(root.path(), "github.com/x/y").await,
+            Some(old_dir.clone()),
+            "the update finds the directory serving its source"
+        );
+        let moved = super::preserve_models::<TestProduct>(&staging, &old_dir)
+            .await
+            .unwrap();
+        assert_eq!(moved, 7);
+        assert!(staging.join("models/m/a.bin").exists());
+
+        // Another backend's files are never taken, whatever their names.
+        let staging_b = root.path().join(".staging/z-1.0.1");
+        std::fs::create_dir_all(&staging_b).unwrap();
+        std::fs::copy(staging.join("backend.toml"), staging_b.join("backend.toml")).unwrap();
+        std::fs::write(old_dir.join("backend.toml"), old("github.com/x/other")).unwrap();
+        std::fs::create_dir_all(old_dir.join("models/m")).unwrap();
+        std::fs::write(old_dir.join("models/m/a.bin"), b"weights").unwrap();
+        let moved = super::preserve_models::<TestProduct>(&staging_b, &old_dir)
+            .await
+            .unwrap();
+        assert_eq!(moved, 0);
     }
 
     #[tokio::test]
