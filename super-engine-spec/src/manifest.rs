@@ -281,10 +281,13 @@ pub struct SubprocessAsset {
     /// Rust target triple, e.g. `x86_64-unknown-linux-gnu`. Tier-1/2 only;
     /// the indexer rejects unknown triples.
     pub target: String,
-    /// Acceleration backends this build carries. A single string is accepted
-    /// and read as a one-element list, which is what every published manifest
-    /// uses; an array declares a binary carrying several runtimes, and the
-    /// daemon tells it at load time which one to use. Must be non-empty.
+    /// Every framework this build runs on, and only those: the daemon offers a
+    /// framework, and moves a model to it without another install, only when
+    /// the installed build lists it. A GPU build that also runs on the CPU
+    /// lists both, `accel = ["cuda", "cpu"]`; one that does not lists its GPU
+    /// framework alone. A single string is read as a one-element list. The
+    /// daemon tells the binary at load time which one to use. Must be
+    /// non-empty.
     #[serde(deserialize_with = "one_or_many")]
     pub accel: Vec<Accel>,
     /// CUDA major version this build targets. Required when `accel` contains
@@ -382,6 +385,23 @@ pub enum Accel {
     Metal,
     Rocm,
     Vulkan,
+}
+
+impl std::str::FromStr for Accel {
+    type Err = String;
+
+    /// The id an accelerator goes by on the wire and in a manifest, the same
+    /// one [`Display`](fmt::Display) writes.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda),
+            "metal" => Ok(Self::Metal),
+            "rocm" => Ok(Self::Rocm),
+            "vulkan" => Ok(Self::Vulkan),
+            other => Err(format!("unknown accelerator `{other}`")),
+        }
+    }
 }
 
 impl fmt::Display for Accel {

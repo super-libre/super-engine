@@ -1,145 +1,194 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Which device a model runs on: the `cpu`/`gpu` preference a client sets,
-//! what a host, an installed build and a model can each offer, and what the
-//! host's GPUs are.
+//! Which framework a model runs on: the preference a client sets, what a host,
+//! an installed backend and a model can each offer, and what the host's GPUs
+//! are.
 //!
-//! A preference is `cpu` or `gpu`. What the daemon records as *actual* is the
-//! accelerator that preference resolved to (`cuda`, `rocm`, `metal`,
-//! `vulkan`), which [`preference_axis`] folds back onto the preference.
+//! A preference is a framework: `cpu`, `cuda`, `rocm`, `metal` or `vulkan`.
+//! What the daemon records as *actual* is the framework the model really runs
+//! on, which is the preference unless the load fell back to the CPU. A
+//! manifest still declares what a model supports on the `cpu`/`gpu` axis,
+//! which [`capability`] maps a framework onto.
 
 use super_engine_protocol::models::gpu::{
     CudaHostInfo, GpuHostInfo, GpuInfo, RocmHostInfo, VulkanHostInfo,
 };
-use super_engine_spec::manifest::Device;
+use super_engine_spec::manifest::{Accel, Device, SubprocessAsset};
 
 use crate::backends::ModelDefinition;
+use crate::registry::compat;
 use crate::registry::host::Host;
 
-/// Normalize a requested device preference, or `None` when it is not one.
+/// Every framework, best first: the order every framework list is in.
+const FRAMEWORKS: [&str; 5] = ["cuda", "rocm", "metal", "vulkan", "cpu"];
+
+/// Normalize a requested preference, or `None` when it is not a framework.
 ///
-/// `cuda` and `metal` are accepted as deprecated spellings of `gpu` so clients
-/// shipped before this vocabulary keep working; `none` is a model property, not
-/// a preference a client may set, so it is rejected here even though
-/// `Device::from_str` parses it.
+/// `gpu` is not one: a GPU is reached through a framework, and which one is
+/// the choice. `none` is a model property, not a preference a client may set.
 #[must_use]
 pub fn parse_device_preference(device: &str) -> Option<String> {
-    match device.parse::<Device>() {
-        Ok(Device::Cpu) => Some("cpu".to_string()),
-        Ok(Device::Gpu) => Some("gpu".to_string()),
-        _ => None,
-    }
+    device.parse::<Accel>().ok().map(|accel| accel.to_string())
 }
 
-/// Collapse a device label onto the `cpu`/`gpu` axis the preference is
-/// expressed in.
-///
-/// Everything a client sets is a preference; everything the daemon records as
-/// *actual* is the accelerator that preference resolved to. The two are only
-/// comparable here — `remote` and anything unrecognized stay themselves, since
-/// neither is a local accelerator that a `gpu` preference could have produced.
+/// Whether `framework` runs on the GPU or the CPU: the axis a manifest
+/// declares what a model supports on. `remote` and anything unrecognized stay
+/// themselves, since neither is a local framework.
 #[must_use]
-pub fn preference_axis(device: &str) -> &str {
-    match device {
+pub fn capability(framework: &str) -> &str {
+    match framework {
         "cuda" | "rocm" | "metal" | "vulkan" => "gpu",
         other => other,
     }
 }
 
-/// Whether a requested device switch is already in effect, and so has nothing
-/// to do.
+/// Whether a requested switch is already in effect, and so has nothing to do.
 ///
-/// The actual device is compared on the preference axis, because it is the
-/// accelerator the preference resolved to: a `gpu` request against a daemon
-/// already running on `cuda` is asking for what it already has, and reloading
-/// the model to grant it costs tens of seconds and a full VRAM churn for no
-/// change. A `gpu` preference that fell back to `cpu` still differs, so it is
-/// retried — which is the point of tracking preferred and actual separately.
+/// The model must be running on the framework asked for, not only have it
+/// stored: one that fell back to the CPU is retried by asking again.
 #[must_use]
 pub fn switch_is_satisfied(current_preferred: &str, current_actual: &str, requested: &str) -> bool {
-    current_preferred == requested && preference_axis(current_actual) == requested
+    current_preferred == requested && current_actual == requested
 }
 
-/// The message a completed device switch reports.
-///
-/// Only a GPU request that genuinely landed on the CPU is a fallback; one that
-/// landed on an accelerator did exactly what was asked, whatever that
-/// accelerator is called.
+/// The message a completed switch reports. Only a GPU framework that landed
+/// on the CPU is a fallback.
 #[must_use]
 pub fn device_switch_message(requested: &str, actual_device: &str) -> String {
-    if requested == "gpu" && preference_axis(actual_device) == "cpu" {
-        "Device switch requested to GPU, but fell back to CPU: no usable accelerator".to_string()
+    if requested != "cpu" && actual_device == "cpu" {
+        format!("Switch to {requested} requested, but the model fell back to the CPU")
     } else {
-        format!("Successfully switched to {actual_device} device")
+        format!("Successfully switched to {actual_device}")
     }
 }
 
-/// The devices this host can offer.
-///
-/// Answers for the host, not for any one model: a client narrowing to a
-/// specific model intersects this with that model's `supported_devices` and
-/// the backend's `installed_accel` from `GET /backend/list`.
+/// The frameworks this host has, best first, the CPU last.
 #[must_use]
 pub fn host_available_devices(host: &Host) -> Vec<String> {
-    let mut devices = vec!["cpu".to_string()];
-    if host.cuda.is_some() || host.rocm.is_some() || host.vulkan.is_some() || host.metal.is_some() {
-        devices.push("gpu".to_string());
-    }
-    devices
+    host.frameworks().iter().map(ToString::to_string).collect()
 }
 
-/// The devices this install can offer a model on this host.
+/// The frameworks an installed backend could run on here: every framework a
+/// build named in its `backend.toml` would run on this host, installed or
+/// not, since another build can be installed. A build runs on the frameworks
+/// its `accel` lists and no others: a CUDA build that also runs on the CPU
+/// says so with `accel = ["cuda", "cpu"]`.
 ///
-/// `declared` is what the *model* can do, `installed_accel` what the
-/// *installed build* can do, and `host_devices` what the machine has; only
-/// the intersection is offerable. A CUDA-only backend on a host with no
-/// NVIDIA GPU installs its CPU asset, and offering a GPU there is the defect
-/// this closes. An empty `installed_accel` means the daemon has no record —
-/// a local-directory import, an install predating the record, or a WASM
-/// component, whose record names a transport rather than an accelerator —
-/// and the manifest is then the only available answer. Online models
-/// (`none`) offer nothing: there is no local compute.
+/// A backend whose manifest names no builds has only what is on disk: the
+/// frameworks its install record names that the host has. A WASM component
+/// runs on the CPU. With no record at all (a directory imported by hand)
+/// nothing says what the build carries, so the backend is taken at its word
+/// and offered every framework the host has; a load it cannot do falls back.
 #[must_use]
-pub fn model_available_devices(
-    host_devices: &[String],
-    declared: &[Device],
+pub fn backend_frameworks(
+    host: &Host,
+    assets: &[SubprocessAsset],
     installed_accel: &[String],
 ) -> Vec<String> {
+    let runnable = compat::runnable_manifest_accels(host, assets);
+    if !runnable.is_empty() {
+        return runnable.iter().map(ToString::to_string).collect();
+    }
+    if installed_accel.iter().any(|a| a == "wasm") {
+        return vec!["cpu".to_string()];
+    }
+    let frameworks = host_available_devices(host);
+    if installed_accel.is_empty() {
+        return frameworks;
+    }
+    frameworks
+        .into_iter()
+        .filter(|f| installed_accel.contains(f))
+        .collect()
+}
+
+/// The frameworks a model can be offered here: those of its backend
+/// ([`backend_frameworks`]) on the axis the model declares. A model declaring
+/// only `cpu` is not offered a GPU framework, nor a GPU-only model the CPU.
+/// Online models (`none`) offer nothing: there is no local compute.
+#[must_use]
+pub fn model_available_devices(declared: &[Device], frameworks: &[String]) -> Vec<String> {
     if declared.contains(&Device::None) {
         return Vec::new();
     }
-    let installed_accel: Vec<&String> = installed_accel.iter().filter(|a| *a != "wasm").collect();
-    let accelerated =
-        installed_accel.is_empty() || installed_accel.iter().any(|a| a.as_str() != "cpu");
-    let mut offered: Vec<String> = declared
+    frameworks
         .iter()
-        .map(ToString::to_string)
-        .filter(|d| host_devices.contains(d))
-        .filter(|d| d == "cpu" || accelerated)
-        .collect();
-    offered.dedup();
-    offered
+        .filter(|f| declared.iter().any(|d| d.to_string() == capability(f)))
+        .cloned()
+        .collect()
 }
 
-/// The devices a backend can be run on here: the union of what its models
-/// are offered, in the `cpu`, `gpu` order every device list uses.
+/// The frameworks a backend's models can run on here: the union of what each
+/// is offered, best first.
 #[must_use]
 pub fn backend_available_devices(per_model: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
-    let mut devices: Vec<String> = per_model.into_iter().flatten().collect();
-    devices.sort();
-    devices.dedup();
-    devices
+    let offered: Vec<String> = per_model.into_iter().flatten().collect();
+    FRAMEWORKS
+        .iter()
+        .filter(|f| offered.iter().any(|o| o == *f))
+        .map(ToString::to_string)
+        .collect()
 }
 
-/// Why a model cannot be set to `device` at all, or `None` when it can.
+/// Whether the build on disk runs on `framework`, so a switch to it can load
+/// at once rather than first installing another build: whether its record,
+/// copied from the build's `accel`, names it. Whisper's CUDA build declares
+/// `["cuda", "cpu"]` and moves to the CPU at once; Qwen's declares `cuda`
+/// alone and has no CPU path.
 ///
-/// Only the manifest is consulted: an online model has no local device, and
-/// a model declaring only `cpu` cannot be sent to the GPU. Whether *this
-/// host* has the accelerator is deliberately not a rejection — a `gpu`
-/// choice on a host without one falls back to the CPU at load time, reported
-/// through `resolved_accel`, the same as it always has. A daemon answers the
-/// message as its `invalid_device` error.
+/// An install with no record (a local import, or a WASM component, whose
+/// record names a transport) is taken at its word: there is no other build to
+/// install, and the backend says at load what it can do.
 #[must_use]
-pub fn device_rejection<M>(definition: &ModelDefinition<M>, device: &str) -> Option<String> {
+pub fn build_installed(framework: &str, installed_accel: &[String]) -> bool {
+    let named: Vec<&String> = installed_accel.iter().filter(|a| *a != "wasm").collect();
+    named.is_empty() || named.iter().any(|a| a.as_str() == framework)
+}
+
+/// The framework a model runs on when none was chosen: the best one offered
+/// that the build on disk runs, or the best one offered.
+#[must_use]
+pub fn default_framework(offered: &[String], installed_accel: &[String]) -> Option<String> {
+    offered
+        .iter()
+        .find(|f| build_installed(f, installed_accel))
+        .or_else(|| offered.first())
+        .cloned()
+}
+
+/// The framework a model loads on: its own choice, `chosen`, when it is
+/// offered here and its build is installed, else [`default_framework`]: the
+/// best framework offered that the build on disk runs. There is no global
+/// default between the two, so a model nobody chose a framework for runs on
+/// the best one it can, not on the CPU.
+///
+/// A client staging a load from this never asks for a build that is not
+/// installed. A choice whose build was replaced since stays stored, and is
+/// used again once that build is back. `None` when nothing is offered: an
+/// online model, or one no build of its backend runs here.
+#[must_use]
+pub fn effective_framework(
+    chosen: Option<&str>,
+    offered: &[String],
+    installed_accel: &[String],
+) -> Option<String> {
+    if let Some(chosen) = chosen
+        && offered.iter().any(|f| f == chosen)
+        && build_installed(chosen, installed_accel)
+    {
+        return Some(chosen.to_string());
+    }
+    default_framework(offered, installed_accel)
+}
+
+/// Why a model cannot be set to `framework` at all, or `None` when it can.
+///
+/// Only the manifest is consulted: an online model has no local device, and a
+/// model declaring only `cpu` cannot be sent to a GPU framework. Whether this
+/// host has it, or the build for it is installed, is the device list's
+/// question and the switch's, not a rejection. A daemon answers the message
+/// as its `invalid_device` error.
+#[must_use]
+pub fn device_rejection<M>(definition: &ModelDefinition<M>, framework: &str) -> Option<String> {
     let name = &definition.name;
     if definition.is_online() {
         return Some(format!(
@@ -151,11 +200,11 @@ pub fn device_rejection<M>(definition: &ModelDefinition<M>, device: &str) -> Opt
         .iter()
         .map(ToString::to_string)
         .collect();
-    if declared.iter().any(|d| d == device) {
+    if declared.iter().any(|d| d == capability(framework)) {
         return None;
     }
     Some(format!(
-        "Model {name} does not run on {device}; it supports {}.",
+        "Model {name} does not run on {framework}; it supports {}.",
         declared.join(", ")
     ))
 }
@@ -228,64 +277,6 @@ fn gpu_host_to_wire() -> GpuHostInfo {
     }
 }
 
-/// Turn the user's `cpu`/`gpu` preference into the accelerator the backend is
-/// told to load on.
-///
-/// The daemon knows which it is — it chose the asset — so it sends the
-/// concrete value rather than forwarding the preference. A binary carrying
-/// several runtimes needs this to pick; one carrying a single runtime ignores
-/// it, since the contract has always been "anything that is not `cpu` means
-/// use the accelerator".
-///
-/// A dual-runtime asset (`accel = ["cuda", "rocm"]`) cannot be resolved by
-/// list position: [`compat::select`](crate::registry::compat::select) chose this asset
-/// because the *host* can run one of its declared families, not because of
-/// where that family sits in the list, so resolving here has to ask the same
-/// question rather than default to "first declared". `host` is `None` only
-/// when detection itself failed, or when none of the declared entries match
-/// what it reports (should not happen for an asset `compat::select` already
-/// approved, but a stale or hand-edited `installed.json` should still degrade
-/// rather than panic) — both fall back to the list-order heuristic.
-///
-/// Returns the empty string when a `gpu` preference names no accelerator at
-/// all: an install with no record (a local-directory import, or one predating
-/// the record) or a CPU-only asset. `device` carries the resolved accelerator
-/// and nothing else, so with none to name the daemon omits the key rather
-/// than forwarding the preference — an absent `device` is the contract's
-/// auto-select, which is precisely "this daemon does not know which
-/// accelerator this build targets".
-#[must_use]
-pub fn resolve_accel(preference: &str, installed_accel: &[String], host: Option<&Host>) -> String {
-    if preference == "cpu" {
-        return "cpu".to_string();
-    }
-    if let Some(host) = host
-        && let Some(found) = installed_accel.iter().find(|a| host_can_run(host, a))
-    {
-        return found.clone();
-    }
-    installed_accel
-        .iter()
-        .find(|a| *a != "cpu")
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// Whether the host can run `accel`, mirroring the presence checks
-/// `registry::compat` gates asset selection on. Full
-/// sm/gfx/floor compatibility was already proven when the asset was
-/// selected; this only has to tell apart two host-compatible accelerators
-/// declared by the same installed asset.
-fn host_can_run(host: &Host, accel: &str) -> bool {
-    match accel {
-        "cuda" => host.cuda.is_some(),
-        "rocm" => host.rocm.is_some(),
-        "vulkan" => host.vulkan.is_some(),
-        "metal" => host.metal.is_some(),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,62 +292,96 @@ mod tests {
         }
     }
 
-    /// The list used to be a constant `["cpu", "cuda"]`, which offered an AMD
-    /// host a device it could never resolve. It answers from the probe now.
-    #[test]
-    fn a_host_without_an_accelerator_offers_only_the_cpu() {
-        assert_eq!(
-            host_available_devices(&bare_host()),
-            vec!["cpu".to_string()]
-        );
-    }
-
-    #[test]
-    fn any_accelerator_adds_the_gpu() {
-        let mut cuda = bare_host();
-        cuda.cuda = Some(CudaHost {
+    fn cuda() -> Option<CudaHost> {
+        Some(CudaHost {
             compute_capability: 86,
-            runtime_major: 13,
+            runtime_major: 12,
             cudnn_present: false,
-        });
-        assert_eq!(
-            host_available_devices(&cuda),
-            vec!["cpu".to_string(), "gpu".to_string()]
-        );
+        })
+    }
 
-        let mut vulkan = bare_host();
-        vulkan.vulkan = Some(VulkanHost {
+    fn vulkan() -> Option<VulkanHost> {
+        Some(VulkanHost {
             api_version: gpu_probe::VulkanVersion::new(1, 3, 0),
-        });
-        assert_eq!(
-            host_available_devices(&vulkan),
-            vec!["cpu".to_string(), "gpu".to_string()]
-        );
+        })
+    }
 
-        // Metal is the accelerator on every Mac, so a daemon that left it out
-        // here would offer a Mac the CPU and nothing else — the same bug the
-        // hardcoded `["cpu", "cuda"]` list had for AMD.
-        let mut metal = bare_host();
-        metal.metal = Some(MetalHost);
-        assert_eq!(
-            host_available_devices(&metal),
-            vec!["cpu".to_string(), "gpu".to_string()]
-        );
+    /// An NVIDIA machine with a Vulkan loader, as most are.
+    fn nvidia_host() -> Host {
+        Host {
+            cuda: cuda(),
+            vulkan: vulkan(),
+            ..bare_host()
+        }
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(ToString::to_string).collect()
+    }
+
+    fn build(accel: &[Accel], cuda_major: Option<u32>) -> SubprocessAsset {
+        SubprocessAsset {
+            file: Some("build.tar.gz".into()),
+            parts: Vec::new(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            accel: accel.to_vec(),
+            cuda_major,
+            cuda_sm: None,
+            cudnn: false,
+            gfx: Vec::new(),
+            vulkan_api: None,
+        }
+    }
+
+    /// A backend publishing a CUDA, a Vulkan and a CPU build, as Qwen does.
+    fn three_builds() -> Vec<SubprocessAsset> {
+        vec![
+            build(&[Accel::Cuda], Some(12)),
+            build(&[Accel::Vulkan], None),
+            build(&[Accel::Cpu], None),
+        ]
     }
 
     #[test]
-    fn the_wire_setter_accepts_the_deprecated_spellings_and_rejects_junk() {
-        assert_eq!(parse_device_preference("gpu"), Some("gpu".to_string()));
-        assert_eq!(parse_device_preference("cuda"), Some("gpu".to_string()));
-        assert_eq!(parse_device_preference("metal"), Some("gpu".to_string()));
-        assert_eq!(parse_device_preference("cpu"), Some("cpu".to_string()));
+    fn a_host_offers_its_frameworks_best_first() {
+        assert_eq!(host_available_devices(&bare_host()), strings(&["cpu"]));
         assert_eq!(
-            parse_device_preference("rocm"),
+            host_available_devices(&nvidia_host()),
+            strings(&["cuda", "vulkan", "cpu"])
+        );
+        // Metal is the framework on every Mac; leaving it out would offer a
+        // Mac the CPU alone.
+        let mac = Host {
+            metal: Some(MetalHost),
+            ..bare_host()
+        };
+        assert_eq!(host_available_devices(&mac), strings(&["metal", "cpu"]));
+    }
+
+    #[test]
+    fn a_preference_is_a_framework() {
+        for framework in ["cpu", "cuda", "rocm", "metal", "vulkan"] {
+            assert_eq!(
+                parse_device_preference(framework).as_deref(),
+                Some(framework)
+            );
+        }
+        assert_eq!(
+            parse_device_preference("gpu"),
             None,
-            "an accel is not a device"
+            "a GPU is reached through a framework"
         );
         assert_eq!(parse_device_preference("none"), None, "not a preference");
         assert_eq!(parse_device_preference("nonsense"), None);
+    }
+
+    #[test]
+    fn a_framework_runs_on_the_gpu_or_the_cpu() {
+        for framework in ["cuda", "rocm", "metal", "vulkan"] {
+            assert_eq!(capability(framework), "gpu", "{framework}");
+        }
+        assert_eq!(capability("cpu"), "cpu");
+        assert_eq!(capability("remote"), "remote");
     }
 
     #[test]
@@ -375,165 +400,243 @@ mod tests {
         );
     }
 
-    /// A GPU whose driver reports no target — an Apple or Intel part, or an
-    /// AMD card on a kernel without KFD — is `null`, never a placeholder
+    /// A GPU whose driver reports no target is `null`, never a placeholder
     /// string a client would have to know to ignore.
     #[test]
     fn an_unreported_architecture_is_null() {
         assert_eq!(arch_label(None), None);
     }
 
-    /// A `gpu` preference and the accelerator it resolved to are the same
-    /// choice spelled on two axes. Comparing them raw makes the early return
-    /// unreachable on every GPU host, so a model switch that stages `gpu`
-    /// against a daemon already on CUDA unloads the running model and reloads
-    /// it on the same GPU — tens of seconds and a full VRAM churn — before the
-    /// model switch it was asked for even begins.
+    /// A switch is done when the model runs on what was asked: one stored but
+    /// fallen back to the CPU is retried, and another framework is a switch.
     #[test]
-    fn a_switch_to_the_accelerator_already_in_use_has_nothing_to_do() {
-        for actual in ["cuda", "rocm", "metal", "vulkan", "gpu"] {
-            assert!(
-                switch_is_satisfied("gpu", actual, "gpu"),
-                "gpu preference already resolved to {actual}"
-            );
-        }
+    fn a_switch_is_satisfied_only_by_running_on_the_framework_asked_for() {
+        assert!(switch_is_satisfied("cuda", "cuda", "cuda"));
         assert!(switch_is_satisfied("cpu", "cpu", "cpu"));
+        assert!(!switch_is_satisfied("cuda", "cpu", "cuda"), "fell back");
+        assert!(!switch_is_satisfied("cuda", "cuda", "vulkan"));
+        assert!(!switch_is_satisfied("vulkan", "vulkan", "cpu"));
     }
 
-    /// The deliberate exception the mapping must preserve: a `gpu` preference
-    /// that fell back to the CPU is *not* satisfied, so asking for it again
-    /// forces the retry.
     #[test]
-    fn a_gpu_preference_that_fell_back_to_the_cpu_is_retried() {
-        assert!(!switch_is_satisfied("gpu", "cpu", "gpu"));
-        assert!(!switch_is_satisfied("cpu", "cpu", "gpu"));
-        assert!(!switch_is_satisfied("gpu", "cuda", "cpu"));
-    }
-
-    /// A GPU switch that landed on an accelerator succeeded; reporting a
-    /// fallback to CPU on every working GPU host tells the user their machine
-    /// failed when it did exactly what they asked.
-    #[test]
-    fn a_successful_gpu_switch_does_not_report_a_fallback() {
-        for actual in ["cuda", "rocm", "metal", "vulkan"] {
-            assert_eq!(
-                device_switch_message("gpu", actual),
-                format!("Successfully switched to {actual} device"),
-                "resolved to {actual}"
-            );
-        }
+    fn only_a_gpu_framework_that_landed_on_the_cpu_is_a_fallback() {
+        assert_eq!(
+            device_switch_message("vulkan", "vulkan"),
+            "Successfully switched to vulkan"
+        );
         assert_eq!(
             device_switch_message("cpu", "cpu"),
-            "Successfully switched to cpu device"
+            "Successfully switched to cpu"
+        );
+        assert_eq!(
+            device_switch_message("cuda", "cpu"),
+            "Switch to cuda requested, but the model fell back to the CPU"
         );
     }
 
-    /// A GPU switch that really did land on the CPU still says so.
+    /// Every framework a published build would run on here is offered,
+    /// whichever one is installed: another build can be installed.
     #[test]
-    fn a_gpu_switch_that_fell_back_says_so() {
+    fn a_backend_offers_every_framework_its_builds_run_on_here() {
         assert_eq!(
-            device_switch_message("gpu", "cpu"),
-            "Device switch requested to GPU, but fell back to CPU: no usable accelerator"
+            backend_frameworks(&nvidia_host(), &three_builds(), &strings(&["vulkan"])),
+            strings(&["cuda", "vulkan", "cpu"])
+        );
+        let no_loader = Host {
+            cuda: cuda(),
+            ..bare_host()
+        };
+        assert_eq!(
+            backend_frameworks(&no_loader, &three_builds(), &strings(&["cuda"])),
+            strings(&["cuda", "cpu"]),
+            "no Vulkan loader, no Vulkan"
+        );
+        assert_eq!(
+            backend_frameworks(&bare_host(), &three_builds(), &[]),
+            strings(&["cpu"])
         );
     }
 
-    /// The mapping itself: every resolved accelerator collapses onto `gpu`,
-    /// and nothing else moves.
+    /// A CUDA build needing a newer runtime than the driver has does not run
+    /// here, so CUDA is not offered for it.
     #[test]
-    fn every_accelerator_collapses_onto_the_gpu_preference() {
-        for accel in ["cuda", "rocm", "metal", "vulkan"] {
-            assert_eq!(preference_axis(accel), "gpu", "{accel}");
-        }
-        assert_eq!(preference_axis("gpu"), "gpu");
-        assert_eq!(preference_axis("cpu"), "cpu");
-        assert_eq!(preference_axis("remote"), "remote");
-        assert_eq!(preference_axis("unknown"), "unknown");
-    }
-
-    fn both() -> Vec<String> {
-        vec!["cpu".to_string(), "gpu".to_string()]
-    }
-
-    /// The narrowing that makes a per-model list worth asking for: a model
-    /// declaring `gpu` on a backend whose installed asset is CPU-only can run
-    /// on no GPU here, whatever the host has.
-    #[test]
-    fn a_cpu_only_install_offers_no_gpu() {
+    fn a_build_the_host_cannot_run_offers_nothing() {
+        let builds = vec![
+            build(&[Accel::Cuda], Some(13)),
+            build(&[Accel::Vulkan], None),
+        ];
         assert_eq!(
-            model_available_devices(&both(), &[Device::Cpu, Device::Gpu], &["cpu".to_string()]),
-            vec!["cpu".to_string()]
+            backend_frameworks(&nvidia_host(), &builds, &[]),
+            strings(&["vulkan"])
+        );
+    }
+
+    /// With no builds named, the build on disk is all there is.
+    #[test]
+    fn without_builds_the_install_record_answers() {
+        assert_eq!(
+            backend_frameworks(&nvidia_host(), &[], &strings(&["vulkan", "cpu"])),
+            strings(&["vulkan", "cpu"])
         );
         assert_eq!(
-            model_available_devices(&both(), &[Device::Gpu], &["cpu".to_string()]),
+            backend_frameworks(&nvidia_host(), &[], &strings(&["wasm"])),
+            strings(&["cpu"]),
+            "a WASM component runs on the CPU"
+        );
+        assert_eq!(
+            backend_frameworks(&nvidia_host(), &[], &[]),
+            strings(&["cuda", "vulkan", "cpu"]),
+            "no record: taken at its word"
+        );
+    }
+
+    #[test]
+    fn a_model_is_offered_the_frameworks_on_its_axis() {
+        let frameworks = strings(&["cuda", "vulkan", "cpu"]);
+        assert_eq!(
+            model_available_devices(&[Device::Gpu], &frameworks),
+            strings(&["cuda", "vulkan"])
+        );
+        assert_eq!(
+            model_available_devices(&[Device::Cpu], &frameworks),
+            strings(&["cpu"])
+        );
+        assert_eq!(
+            model_available_devices(&[Device::Cpu, Device::Gpu], &frameworks),
+            frameworks
+        );
+        assert_eq!(
+            model_available_devices(&[Device::None], &frameworks),
             Vec::<String>::new(),
-            "a GPU-only model on a CPU-only install runs nowhere"
+            "an online model runs on nothing local"
         );
     }
 
-    /// A GPU install on a GPU host offers what the model declares, and the
-    /// host list still caps it: no GPU on the host, no GPU offered, even with
-    /// a GPU asset installed.
     #[test]
-    fn the_host_caps_what_the_install_can_offer() {
-        let cuda = vec!["cuda".to_string()];
-        assert_eq!(
-            model_available_devices(&both(), &[Device::Cpu, Device::Gpu], &cuda),
-            both()
-        );
-        assert_eq!(
-            model_available_devices(&["cpu".to_string()], &[Device::Cpu, Device::Gpu], &cuda),
-            vec!["cpu".to_string()]
-        );
-        assert_eq!(
-            model_available_devices(&both(), &[Device::Cpu], &cuda),
-            vec!["cpu".to_string()],
-            "a CPU-only model is not offered the GPU"
-        );
-    }
-
-    /// No record, or a WASM record naming a transport rather than an
-    /// accelerator, leaves the manifest as the only answer.
-    #[test]
-    fn without_an_accelerator_record_the_manifest_answers() {
-        assert_eq!(
-            model_available_devices(&both(), &[Device::Cpu, Device::Gpu], &[]),
-            both()
-        );
-        assert_eq!(
-            model_available_devices(&both(), &[Device::Cpu, Device::Gpu], &["wasm".to_string()]),
-            both()
-        );
-    }
-
-    /// An online model has no local device to offer.
-    #[test]
-    fn an_online_model_offers_nothing() {
-        assert_eq!(
-            model_available_devices(&both(), &[Device::None], &[]),
-            Vec::<String>::new()
-        );
-    }
-
-    /// A backend's list is the union of its models' lists: a CPU-only model
-    /// beside a GPU-capable one gives both, an online model contributes
-    /// nothing, and the order is always `cpu` then `gpu`.
-    #[test]
-    fn a_backends_devices_are_the_union_of_its_models() {
+    fn a_backends_frameworks_are_the_union_of_its_models_best_first() {
         assert_eq!(
             backend_available_devices([
-                vec!["gpu".to_string()],
-                vec!["cpu".to_string()],
-                Vec::new(),
-                both(),
+                strings(&["cpu"]),
+                strings(&["vulkan", "cuda"]),
+                Vec::new()
             ]),
-            both()
-        );
-        assert_eq!(
-            backend_available_devices([Vec::new(), Vec::new()]),
-            Vec::<String>::new(),
-            "a backend of online models runs on nothing local"
+            strings(&["cuda", "vulkan", "cpu"])
         );
         assert_eq!(backend_available_devices([]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_framework_is_installed_when_the_build_on_disk_runs_it() {
+        let vulkan_build = strings(&["vulkan"]);
+        assert!(build_installed("vulkan", &vulkan_build));
+        assert!(!build_installed("cuda", &vulkan_build));
+        assert!(
+            !build_installed("cpu", &strings(&["cuda"])),
+            "a CUDA build that does not declare the CPU has no CPU path"
+        );
+        assert!(build_installed("cpu", &strings(&["cuda", "cpu"])));
+        assert!(build_installed("cuda", &[]), "no record: taken at its word");
+        assert!(build_installed("cpu", &strings(&["wasm"])));
+    }
+
+    /// Whisper publishes a CPU build and CUDA builds that declare the CPU
+    /// too. With a CUDA one installed, the CPU is a move, not a download; with
+    /// the CPU one installed, CUDA is a download.
+    #[test]
+    fn a_build_declaring_the_cpu_moves_to_it_without_a_download() {
+        let builds = vec![
+            build(&[Accel::Cpu], None),
+            build(&[Accel::Cuda, Accel::Cpu], Some(12)),
+        ];
+        let cuda_build = strings(&["cuda", "cpu"]);
+        let offered = backend_frameworks(&nvidia_host(), &builds, &cuda_build);
+        assert_eq!(offered, strings(&["cuda", "cpu"]));
+        assert!(build_installed("cpu", &cuda_build));
+        assert_eq!(
+            effective_framework(Some("cpu"), &offered, &cuda_build).as_deref(),
+            Some("cpu")
+        );
+
+        let cpu_build = strings(&["cpu"]);
+        assert!(!build_installed("cuda", &cpu_build));
+        assert_eq!(
+            effective_framework(Some("cuda"), &offered, &cpu_build).as_deref(),
+            Some("cpu")
+        );
+    }
+
+    /// Qwen's builds each carry one GPU framework and no CPU path, so the CPU
+    /// is never offered, whatever its models declare.
+    #[test]
+    fn builds_declaring_no_cpu_offer_no_cpu() {
+        let builds = vec![
+            build(&[Accel::Cuda], Some(12)),
+            build(&[Accel::Vulkan], None),
+        ];
+        assert_eq!(
+            backend_frameworks(&nvidia_host(), &builds, &strings(&["cuda"])),
+            strings(&["cuda", "vulkan"])
+        );
+    }
+
+    #[test]
+    fn with_none_chosen_a_model_runs_on_the_best_installed_framework() {
+        let offered = strings(&["cuda", "vulkan", "cpu"]);
+        assert_eq!(
+            default_framework(&offered, &strings(&["vulkan"])).as_deref(),
+            Some("vulkan")
+        );
+        assert_eq!(
+            default_framework(&offered, &strings(&["cuda", "cpu"])).as_deref(),
+            Some("cuda")
+        );
+        assert_eq!(
+            default_framework(&strings(&["cpu"]), &strings(&["vulkan"])).as_deref(),
+            Some("cpu"),
+            "the best offered when none is installed"
+        );
+        assert_eq!(default_framework(&[], &[]), None);
+    }
+
+    #[test]
+    fn a_choice_whose_build_is_gone_loads_on_an_installed_one() {
+        let offered = strings(&["cuda", "vulkan", "cpu"]);
+        let vulkan = strings(&["vulkan"]);
+        let effective = |chosen| effective_framework(chosen, &offered, &vulkan);
+        assert_eq!(effective(Some("vulkan")).as_deref(), Some("vulkan"));
+        assert_eq!(
+            effective(Some("cuda")).as_deref(),
+            Some("vulkan"),
+            "the CUDA build is not installed"
+        );
+        assert_eq!(
+            effective(Some("metal")).as_deref(),
+            Some("vulkan"),
+            "not offered here"
+        );
+        assert_eq!(
+            effective_framework(Some("cpu"), &offered, &[]).as_deref(),
+            Some("cpu")
+        );
+        assert_eq!(effective_framework(Some("cuda"), &[], &[]), None);
+    }
+
+    /// With no choice of its own, a model runs on the best framework the
+    /// build on disk runs: Whisper on its CUDA build runs on CUDA, not on the
+    /// CPU it also lists.
+    #[test]
+    fn a_model_with_no_choice_runs_on_the_best_installed_framework() {
+        let offered = strings(&["cuda", "cpu"]);
+        let whisper = strings(&["cuda", "cpu"]);
+        assert_eq!(
+            effective_framework(None, &offered, &whisper).as_deref(),
+            Some("cuda")
+        );
+        assert_eq!(
+            effective_framework(None, &offered, &strings(&["cpu"])).as_deref(),
+            Some("cpu")
+        );
+        assert_eq!(effective_framework(None, &[], &whisper), None);
     }
 
     fn definition(devices: Vec<Device>) -> ModelDefinition<()> {
@@ -553,196 +656,23 @@ mod tests {
     }
 
     /// The manifest, and only the manifest, decides what a model may be set
-    /// to: the host's accelerators are a load-time fallback, not a rejection.
+    /// to.
     #[test]
     fn a_model_is_refused_only_what_its_manifest_rules_out() {
         let local = definition(vec![Device::Cpu, Device::Gpu]);
-        assert!(device_rejection(&local, "cpu").is_none());
-        assert!(device_rejection(&local, "gpu").is_none());
+        for framework in ["cpu", "cuda", "vulkan"] {
+            assert!(device_rejection(&local, framework).is_none(), "{framework}");
+        }
 
         let cpu_only = definition(vec![Device::Cpu]);
         assert!(device_rejection(&cpu_only, "cpu").is_none());
-        let rejection = device_rejection(&cpu_only, "gpu").expect("refused");
+        let rejection = device_rejection(&cpu_only, "cuda").expect("refused");
         assert!(rejection.contains("supports cpu"), "{rejection}");
 
         let online = definition(vec![Device::None]);
-        for device in ["cpu", "gpu"] {
-            let rejection = device_rejection(&online, device).expect("refused");
+        for framework in ["cpu", "cuda"] {
+            let rejection = device_rejection(&online, framework).expect("refused");
             assert!(rejection.contains("remote service"), "{rejection}");
         }
-    }
-}
-
-#[cfg(test)]
-mod resolve_accel_tests {
-    use super::{Host, resolve_accel};
-    use crate::registry::host::{CudaHost, MetalHost, RocmHost, VulkanHost};
-
-    fn nvidia_host() -> Host {
-        Host {
-            target_triple: "x86_64-unknown-linux-gnu".into(),
-            cuda: Some(CudaHost {
-                compute_capability: 86,
-                runtime_major: 13,
-                cudnn_present: true,
-            }),
-            rocm: None,
-            vulkan: None,
-            metal: None,
-        }
-    }
-
-    fn amd_host() -> Host {
-        Host {
-            target_triple: "x86_64-unknown-linux-gnu".into(),
-            cuda: None,
-            rocm: Some(RocmHost {
-                gfx_targets: vec![gpu_probe::GfxTarget::new(11, 0, 0)],
-                version: None,
-            }),
-            vulkan: None,
-            metal: None,
-        }
-    }
-
-    fn metal_host() -> Host {
-        Host {
-            target_triple: "aarch64-apple-darwin".into(),
-            cuda: None,
-            rocm: None,
-            vulkan: None,
-            metal: Some(MetalHost),
-        }
-    }
-
-    /// An asset declaring `["metal", "cpu"]` on a Mac must resolve to metal,
-    /// not fall through to the cpu entry. `host_can_run` is what decides
-    /// that, and a missing arm there is invisible: the function returns
-    /// `false`, the `find` skips metal, and the model silently loads on the
-    /// CPU on every Mac.
-    #[test]
-    fn a_mac_resolves_a_metal_asset_to_metal() {
-        let installed = vec!["metal".to_string(), "cpu".to_string()];
-        assert_eq!(
-            resolve_accel("gpu", &installed, Some(&metal_host())),
-            "metal"
-        );
-        // An explicit CPU preference still wins — the same rule every other
-        // accelerator follows.
-        assert_eq!(resolve_accel("cpu", &installed, Some(&metal_host())), "cpu");
-    }
-
-    /// The converse: a metal asset on a host without Metal must not resolve
-    /// to it.
-    #[test]
-    fn a_non_mac_does_not_resolve_metal() {
-        let installed = vec!["metal".to_string(), "cpu".to_string()];
-        assert_eq!(
-            resolve_accel("gpu", &installed, Some(&nvidia_host())),
-            "metal",
-            "with no host-runnable accel the first non-cpu entry is the fallback"
-        );
-        assert!(!super::host_can_run(&nvidia_host(), "metal"));
-    }
-
-    fn vulkan_only_host() -> Host {
-        Host {
-            target_triple: "x86_64-unknown-linux-gnu".into(),
-            cuda: None,
-            rocm: None,
-            vulkan: Some(VulkanHost {
-                api_version: gpu_probe::VulkanVersion::new(1, 3, 0),
-            }),
-            metal: None,
-        }
-    }
-
-    /// The user picks `cpu` or `gpu`; the backend is told which accelerator,
-    /// because a build carrying several runtimes has to be able to choose.
-    #[test]
-    fn a_gpu_preference_resolves_to_the_accel_the_host_can_run() {
-        assert_eq!(
-            resolve_accel("gpu", &["cuda".into()], Some(&nvidia_host())),
-            "cuda"
-        );
-        assert_eq!(
-            resolve_accel("gpu", &["rocm".into()], Some(&amd_host())),
-            "rocm"
-        );
-        assert_eq!(
-            resolve_accel("gpu", &["vulkan".into()], Some(&vulkan_only_host())),
-            "vulkan"
-        );
-    }
-
-    #[test]
-    fn a_cpu_preference_always_resolves_to_cpu() {
-        assert_eq!(
-            resolve_accel("cpu", &["cuda".into()], Some(&nvidia_host())),
-            "cpu"
-        );
-        assert_eq!(resolve_accel("cpu", &[], None), "cpu");
-    }
-
-    /// The bug this pins: `compat::select` chose this asset because the host
-    /// can run one of its declared families, never because of list position.
-    /// An asset declaring `["cuda", "rocm"]` must resolve to whichever the
-    /// *host* actually has — not to `cuda` just because it was declared
-    /// first — or the daemon tells a ROCm-only host to load a runtime it
-    /// cannot run.
-    #[test]
-    fn a_dual_runtime_asset_resolves_by_host_capability_not_list_position() {
-        assert_eq!(
-            resolve_accel("gpu", &["rocm".into(), "cuda".into()], Some(&nvidia_host())),
-            "cuda"
-        );
-        assert_eq!(
-            resolve_accel("gpu", &["cuda".into(), "rocm".into()], Some(&amd_host())),
-            "rocm"
-        );
-    }
-
-    /// Detection failure (`host: None`) degrades to the list-order heuristic
-    /// rather than blocking the load — a `gpu` preference stays meaningful to
-    /// a backend on its own.
-    #[test]
-    fn an_unknown_host_falls_back_to_list_order() {
-        assert_eq!(
-            resolve_accel("gpu", &["cpu".into(), "rocm".into()], None),
-            "rocm"
-        );
-    }
-
-    /// A host that matches none of the asset's declared entries (a stale or
-    /// hand-edited record) also degrades to list order rather than erroring.
-    #[test]
-    fn a_host_matching_nothing_declared_falls_back_to_list_order() {
-        assert_eq!(
-            resolve_accel("gpu", &["rocm".into()], Some(&nvidia_host())),
-            "rocm"
-        );
-    }
-
-    /// No record — a local-directory import, or every install predating the
-    /// record, which is the whole upgrade path. `gpu` is the user's
-    /// preference, and `docs/protocol/backend/contract.md` says `device`
-    /// carries the *resolved accelerator*, never the preference. When the
-    /// daemon cannot resolve one it says nothing rather than something false:
-    /// an omitted `device` is the documented "auto-select" signal, which is
-    /// exactly what "this daemon does not know which accelerator this build
-    /// targets" means.
-    #[test]
-    fn an_unresolvable_gpu_preference_sends_no_device_at_all() {
-        assert_eq!(resolve_accel("gpu", &[], None), "");
-        assert_eq!(
-            resolve_accel("gpu", &[], Some(&nvidia_host())),
-            "",
-            "a host with a GPU still says nothing about what the asset targets"
-        );
-        assert_eq!(
-            resolve_accel("gpu", &["cpu".into()], Some(&nvidia_host())),
-            "",
-            "a CPU-only asset provides no accelerator to name"
-        );
     }
 }

@@ -17,7 +17,7 @@
 use semver::Version;
 use super_engine_spec::arch::{GfxSpec, VulkanApi};
 use super_engine_spec::index::{IndexBackend, IndexSubprocessAsset};
-use super_engine_spec::manifest::{Accel, FileSpec, ModelEntry};
+use super_engine_spec::manifest::{Accel, FileSpec, ModelEntry, SubprocessAsset};
 use super_engine_spec::product::Product;
 use super_engine_spec::registry::SelectedAsset;
 
@@ -192,18 +192,22 @@ pub fn select<P: Product>(
     }
 
     // Capability-driven: the most optimal asset the host can run. Independent
-    // of the runtime device preference — a GPU build still runs on CPU when
-    // the user selects that device.
-    // `reduce` keeping a strict improvement, not `max_by_key`: that returns the
-    // *last* maximum. First-wins is the intended tiebreak — an asset's position
-    // in the manifest is the author's own preference order, and the CPU
-    // fallback already behaved this way as a `.find()`. It does change the CUDA
-    // path, which used `max_by_key` and so resolved a tie to the *last*
-    // declared asset; nothing pinned that, and one rule across every accel is
-    // worth more than preserving an accident on one of them.
+    // of the runtime device preference: a build runs on every framework its
+    // `accel` lists, so a CUDA build declaring the CPU too moves there later
+    // without another install.
+    //
+    // Between builds that serve the host equally well, the one declaring
+    // fewer frameworks wins: it carries less this host will not use. That is
+    // what keeps a CPU-only host on Whisper's CPU build rather than its
+    // `["cuda", "cpu"]` one, which scores the same there. A tie that remains
+    // goes to the first declared — `reduce` keeping a strict improvement, not
+    // `max_by_key`, which returns the *last* maximum — since an asset's
+    // position in the manifest is the author's own preference order.
     let best = by_target
         .iter()
-        .filter_map(|(idx, a)| score(host, &Requires::from(*a)).map(|s| (s, *idx)))
+        .filter_map(|(idx, a)| {
+            score(host, &Requires::from(*a)).map(|s| ((s, std::cmp::Reverse(a.accel.len())), *idx))
+        })
         .reduce(|best, next| if next.0 > best.0 { next } else { best });
     if let Some((_, idx)) = best {
         return Selection::Subprocess { index: idx };
@@ -211,6 +215,83 @@ pub fn select<P: Product>(
     Selection::Incompatible {
         reason: incompatible_reason(host, &by_target),
     }
+}
+
+/// Which build of `entry` this host should install to run on `accel`: the
+/// best build declaring it that the host can run there, ranked as [`select`]
+/// ranks them for a host with `accel` alone.
+///
+/// What switching a backend to another framework installs. `Incompatible`
+/// when no build of this target runs on `accel` here, which a client offered
+/// only [`runnable_index_accels`] never asks for.
+#[must_use]
+pub fn select_accel<P: Product>(
+    daemon: &Daemon,
+    host: &Host,
+    entry: &IndexBackend<P::IndexModel>,
+    accel: Accel,
+) -> Selection {
+    let selection = select::<P>(daemon, &host.restricted_to(accel), entry);
+    match selection {
+        Selection::Subprocess { index }
+            if !entry.assets.subprocess[index]
+                .accel
+                .iter()
+                .any(|a| parse_accel(a) == Some(accel)) =>
+        {
+            // The restricted host still runs whatever else a build declares,
+            // so a CPU build can win a Vulkan question. That is not a Vulkan
+            // build.
+            Selection::Incompatible {
+                reason: format!("no {accel} build of {} runs on this machine", entry.name),
+            }
+        }
+        other => other,
+    }
+}
+
+/// The frameworks the builds of a backend can run on `host`, best first: each
+/// framework the host has, kept when a build for this target declares it and
+/// would run there.
+///
+/// From the index, for a backend not yet installed or one being switched.
+#[must_use]
+pub fn runnable_index_accels(host: &Host, assets: &[IndexSubprocessAsset]) -> Vec<Accel> {
+    runnable_accels(
+        host,
+        &assets
+            .iter()
+            .filter(|a| a.target == host.target_triple)
+            .map(Requires::from)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// [`runnable_index_accels`], from an installed backend's own `backend.toml`,
+/// which names every build its release publishes. Needs no network.
+#[must_use]
+pub fn runnable_manifest_accels(host: &Host, assets: &[SubprocessAsset]) -> Vec<Accel> {
+    runnable_accels(
+        host,
+        &assets
+            .iter()
+            .filter(|a| a.target == host.target_triple)
+            .map(Requires::from)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn runnable_accels(host: &Host, candidates: &[Requires]) -> Vec<Accel> {
+    host.frameworks()
+        .into_iter()
+        .filter(|accel| {
+            let only = host.restricted_to(*accel);
+            candidates
+                .iter()
+                .filter(|r| r.accel.contains(accel))
+                .any(|r| score(&only, &r.for_accel(*accel)).is_some())
+        })
+        .collect()
 }
 
 /// What one candidate requires of the host, normalized out of whichever
@@ -221,7 +302,7 @@ pub fn select<P: Product>(
 /// per-architecture model file ask the same question of the same host, and a
 /// second copy of the answer would drift from this one the first time either
 /// changed.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Requires {
     accel: Vec<Accel>,
     cuda_major: Option<u32>,
@@ -256,14 +337,7 @@ struct Requires {
 /// what the string comparisons here did before `Requires` existed: an unknown
 /// family matches nothing and stays out of the way of the ones that do.
 fn parse_accel(text: &str) -> Option<Accel> {
-    match text {
-        "cpu" => Some(Accel::Cpu),
-        "cuda" => Some(Accel::Cuda),
-        "metal" => Some(Accel::Metal),
-        "rocm" => Some(Accel::Rocm),
-        "vulkan" => Some(Accel::Vulkan),
-        _ => None,
-    }
+    text.parse().ok()
 }
 
 impl From<&IndexSubprocessAsset> for Requires {
@@ -291,6 +365,37 @@ impl From<&IndexSubprocessAsset> for Requires {
             vulkan_api,
             vulkan_api_malformed,
             wildcard_when_absent: false,
+        }
+    }
+}
+
+impl From<&SubprocessAsset> for Requires {
+    /// The installed `backend.toml` names the same builds the index does, in
+    /// parsed types, so an installed backend can say what else it could run
+    /// without asking the registry.
+    fn from(a: &SubprocessAsset) -> Self {
+        Self {
+            accel: a.accel.clone(),
+            cuda_major: a.cuda_major,
+            cuda_sm: a.cuda_sm.into_iter().collect(),
+            cudnn: a.cudnn,
+            gfx: a.gfx.clone(),
+            vulkan_api: a.vulkan_api,
+            vulkan_api_malformed: false,
+            // A build, like an index asset: one that names no runtime or ISA
+            // matches nothing.
+            wildcard_when_absent: false,
+        }
+    }
+}
+
+impl Requires {
+    /// The same requirements, for one of the frameworks the candidate
+    /// declares: how it ranks when that framework is the one asked for.
+    fn for_accel(&self, accel: Accel) -> Self {
+        Self {
+            accel: vec![accel],
+            ..self.clone()
         }
     }
 }
@@ -1144,6 +1249,126 @@ mod tests {
         assert_eq!(
             select(&host_rocm(&[(10, 3, 0)]), &e),
             Selection::Subprocess { index: 1 }
+        );
+    }
+
+    /// An NVIDIA machine with a Vulkan loader, and a backend publishing a
+    /// CUDA, a Vulkan and a CPU build: all three run here.
+    fn nvidia_with_vulkan() -> (Host, IndexBackend) {
+        let mut host = host_cuda(86, 12, false);
+        host.vulkan = Some(crate::registry::host::VulkanHost {
+            api_version: gpu_probe::VulkanVersion::new(1, 3, 0),
+        });
+        let mut vk = sp("x86_64-unknown-linux-gnu", "cpu", None, None, false);
+        vk.accel = vec!["vulkan".into()];
+        let e = entry(
+            "subprocess",
+            vec![
+                sp("x86_64-unknown-linux-gnu", "cuda", None, Some(12), false),
+                vk,
+                sp("x86_64-unknown-linux-gnu", "cpu", None, None, false),
+            ],
+        );
+        (host, e)
+    }
+
+    #[test]
+    fn every_framework_a_build_runs_on_here_is_runnable_best_first() {
+        let (host, e) = nvidia_with_vulkan();
+        assert_eq!(
+            runnable_index_accels(&host, &e.assets.subprocess),
+            vec![Accel::Cuda, Accel::Vulkan, Accel::Cpu]
+        );
+        let cpu_only = host_cuda(86, 11, false);
+        assert_eq!(
+            runnable_index_accels(&cpu_only, &e.assets.subprocess),
+            vec![Accel::Cpu],
+            "a CUDA 12 build does not run on a CUDA 11 driver, and there is no loader"
+        );
+    }
+
+    /// Asking for a framework installs that framework's build, not the one
+    /// the host ranks first.
+    #[test]
+    fn a_framework_asked_for_selects_its_own_build() {
+        let (host, e) = nvidia_with_vulkan();
+        assert_eq!(select(&host, &e), Selection::Subprocess { index: 0 });
+        assert_eq!(
+            super::select_accel::<TestProduct>(&DAEMON, &host, &e, Accel::Vulkan),
+            Selection::Subprocess { index: 1 }
+        );
+        assert_eq!(
+            super::select_accel::<TestProduct>(&DAEMON, &host, &e, Accel::Cpu),
+            Selection::Subprocess { index: 2 }
+        );
+    }
+
+    /// Whisper's layout: a CPU build, and a CUDA build that runs on the CPU
+    /// too. Listed CUDA first, so only the tie rule keeps a CPU-only host off
+    /// the GPU build it scores the same on.
+    fn whisper_layout() -> IndexBackend {
+        let mut cuda = sp("x86_64-unknown-linux-gnu", "cuda", None, Some(12), false);
+        cuda.accel = vec!["cuda".into(), "cpu".into()];
+        entry(
+            "subprocess",
+            vec![
+                cuda,
+                sp("x86_64-unknown-linux-gnu", "cpu", None, None, false),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_build_declaring_fewer_frameworks() {
+        let e = whisper_layout();
+        assert_eq!(
+            select(&host_cpu(), &e),
+            Selection::Subprocess { index: 1 },
+            "a CPU-only host takes the CPU build, not the CUDA one"
+        );
+        let host = host_cuda(86, 12, false);
+        assert_eq!(select(&host, &e), Selection::Subprocess { index: 0 });
+        assert_eq!(
+            super::select_accel::<TestProduct>(&DAEMON, &host, &e, Accel::Cpu),
+            Selection::Subprocess { index: 1 },
+            "asking for the CPU installs the CPU build"
+        );
+    }
+
+    #[test]
+    fn a_build_runs_on_every_framework_it_declares() {
+        let mut only_cuda = whisper_layout();
+        only_cuda.assets.subprocess.truncate(1);
+        assert_eq!(
+            runnable_index_accels(&host_cuda(86, 12, false), &only_cuda.assets.subprocess),
+            vec![Accel::Cuda, Accel::Cpu]
+        );
+        let qwen = entry(
+            "subprocess",
+            vec![sp(
+                "x86_64-unknown-linux-gnu",
+                "cuda",
+                None,
+                Some(12),
+                false,
+            )],
+        );
+        assert_eq!(
+            runnable_index_accels(&host_cuda(86, 12, false), &qwen.assets.subprocess),
+            vec![Accel::Cuda],
+            "a CUDA build that does not declare the CPU does not run there"
+        );
+    }
+
+    /// The restricted host still runs the CPU, so a CPU build would win a
+    /// question about a framework nothing is built for. It is not an answer.
+    #[test]
+    fn a_framework_with_no_build_here_is_incompatible() {
+        let (host, e) = nvidia_with_vulkan();
+        let sel = super::select_accel::<TestProduct>(&DAEMON, &host, &e, Accel::Rocm);
+        assert!(
+            matches!(sel, Selection::Incompatible { ref reason } if reason.contains("rocm")),
+            "{sel:?}"
         );
     }
 
