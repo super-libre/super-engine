@@ -160,6 +160,7 @@ impl Product for TestProduct {
     type IndexModel = IndexModel;
 
     const SLUG: &'static str = "super-test";
+    const FORMER_SLUGS: &'static [&'static str] = &["super-test-before"];
 
     const CONTRACT_FIELDS: &'static [ContractField<Contract>] = &[
         ContractField {

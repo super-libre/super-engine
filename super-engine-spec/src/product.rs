@@ -34,12 +34,18 @@ pub trait Product: Clone + fmt::Debug + Send + Sync + 'static {
     /// `name` and `supported_devices`.
     type IndexModel: Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync;
 
-    /// The product's slug, e.g. `super-stt`: the one value a manifest's
-    /// `[backend].product` may name. [`Manifest::parse`] refuses any other,
+    /// The product's slug, e.g. `super-stt`: the value a manifest's
+    /// `[backend].product` names, beside its [`FORMER_SLUGS`](Self::FORMER_SLUGS).
+    /// [`Manifest::parse`] refuses any other,
     /// because nothing else in a manifest tells two products apart. Contract
     /// names like `v1` are per product, and each product's own keys are ones
     /// the other's parser ignores.
     const SLUG: &'static str;
+
+    /// The slugs of the products this one continues. A manifest naming one of
+    /// them is read as this product's own, so the backends published for it
+    /// keep installing. Empty for a product that continues none.
+    const FORMER_SLUGS: &'static [&'static str] = &[];
 
     /// Every field rule a generation introduces. See [`ContractField`].
     const CONTRACT_FIELDS: &'static [ContractField<Self::Contract>];

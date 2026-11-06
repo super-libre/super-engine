@@ -461,8 +461,9 @@ fn the_schema_gates_role_on_contract_v2() {
     );
 }
 
-/// A schema is one product's, so `product` takes that product's slug and
-/// nothing else, and the generation that requires it says so. The schema half
+/// A schema is one product's, so `product` takes that product's slug and the
+/// slugs of the products it continues, nothing else, and the generation that
+/// requires it says so. The schema half
 /// of `Manifest::parse`'s `OtherProduct` and `FieldRequiredByContract`.
 #[test]
 fn the_schema_takes_only_its_own_product() {
@@ -471,6 +472,15 @@ fn the_schema_takes_only_its_own_product() {
     let mut own = wasm_base();
     own["backend"]["product"] = json!(TestProduct::SLUG);
     assert!(v.is_valid(&own), "the product's own slug validates");
+
+    for former in TestProduct::FORMER_SLUGS {
+        let mut continued = wasm_base();
+        continued["backend"]["product"] = json!(former);
+        assert!(
+            v.is_valid(&continued),
+            "{former}, a product it continues, validates"
+        );
+    }
 
     let mut other = wasm_base();
     other["backend"]["product"] = json!("super-other");

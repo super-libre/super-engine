@@ -1057,7 +1057,7 @@ pub enum ManifestError {
     #[error("`[backend].id` is not a valid reverse-DNS id: {0}")]
     InvalidId(String),
     /// `[backend].product` names a product other than the one parsing the
-    /// manifest.
+    /// manifest, or one it continues.
     #[error("this backend is built for {declared}, not {expected}")]
     OtherProduct {
         /// The product the manifest names.
@@ -1347,6 +1347,7 @@ impl<P: Product> Manifest<P> {
     fn parse_inner(text: &str, fields: ContractFields) -> Result<Self, ManifestError> {
         if let Some(declared) = declared_product(text)
             && declared != P::SLUG
+            && !P::FORMER_SLUGS.contains(&declared.as_str())
         {
             return Err(ManifestError::OtherProduct {
                 declared,
@@ -1869,6 +1870,19 @@ mod tests {
             err.to_string(),
             "this backend is built for super-other, not super-test"
         );
+    }
+
+    /// A product it continues is this product's own: a manifest naming one
+    /// parses, and keeps the slug it declared.
+    #[test]
+    fn a_manifest_naming_a_former_slug_is_read_as_this_products() {
+        let text = manifest_with("v2", "").replace(
+            r#"product = "super-test""#,
+            r#"product = "super-test-before""#,
+        );
+        let m = Manifest::parse(&text).expect("a former slug parses");
+        assert_eq!(m.backend.product.as_deref(), Some("super-test-before"));
+        Manifest::parse_installed(&text).expect("and an installed one is discovered");
     }
 
     /// The product is checked before anything else, because another product's
