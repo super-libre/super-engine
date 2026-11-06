@@ -316,6 +316,37 @@ fn the_backend_reads_its_paths_from_the_products_variables() {
     assert!(env.contains(&("SUPER_TEST_BACKEND_DIR".to_string(), "/data/b".to_string())));
 }
 
+/// A backend built for a product this one continues reads that product's
+/// names, so the contract's three are set under each former prefix too, with
+/// the same values.
+#[test]
+fn a_backend_built_for_a_former_product_finds_its_names() {
+    let env = backend_env(
+        &TEST,
+        Path::new("/sock/m.sock"),
+        Path::new("/data/b"),
+        Path::new("/cache/b"),
+    );
+    assert!(
+        !TEST.former_env_prefixes.is_empty(),
+        "the test product continues one"
+    );
+    let prefixes = std::iter::once(TEST.env_prefix).chain(TEST.former_env_prefixes.iter().copied());
+    for prefix in prefixes {
+        for (name, value) in [
+            ("BACKEND_SOCKET", "/sock/m.sock"),
+            ("BACKEND_DIR", "/data/b"),
+            ("BACKEND_CACHE_DIR", "/cache/b"),
+        ] {
+            let key = format!("{prefix}_{name}");
+            assert!(
+                env.contains(&(key.clone(), value.to_string())),
+                "{key} must be {value}: {env:?}"
+            );
+        }
+    }
+}
+
 /// One instance, one live backend: a second hold on a held name is refused,
 /// and the name is free again once the first hold is let go.
 #[test]

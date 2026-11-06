@@ -927,6 +927,7 @@ mod tests {
                 slug: "super-merged",
                 short_name: "merged",
                 env_prefix: "SUPER_MERGED",
+                former_env_prefixes: &[],
                 tcp_port: 7307,
                 repo: "github.com/example/super-merged",
                 index_url: "https://example.com/super-merged/index.json",

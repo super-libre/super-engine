@@ -948,10 +948,19 @@ fn backend_env(
     cache_dir: &Path,
 ) -> Vec<(String, String)> {
     let path = |p: &Path| p.display().to_string();
-    vec![
-        (product.env("BACKEND_SOCKET"), path(socket)),
-        (product.env("BACKEND_DIR"), path(backend_dir)),
-        (product.env("BACKEND_CACHE_DIR"), path(cache_dir)),
+    // The contract's three, under the product's own prefix and under each
+    // prefix of a product it continues, whose backends read those names.
+    let mut env: Vec<(String, String)> = std::iter::once(product.env_prefix)
+        .chain(product.former_env_prefixes.iter().copied())
+        .flat_map(|prefix| {
+            [
+                (format!("{prefix}_BACKEND_SOCKET"), path(socket)),
+                (format!("{prefix}_BACKEND_DIR"), path(backend_dir)),
+                (format!("{prefix}_BACKEND_CACHE_DIR"), path(cache_dir)),
+            ]
+        })
+        .collect();
+    env.extend([
         ("XDG_CACHE_HOME".to_string(), path(cache_dir)),
         (
             "CUDA_CACHE_PATH".to_string(),
@@ -962,7 +971,8 @@ fn backend_env(
             NV_CACHE_MAXSIZE.to_string(),
         ),
         ("RUST_LOG".to_string(), "info".to_string()),
-    ]
+    ]);
+    env
 }
 
 /// The writable, durable cache directory granted to a backend's sandbox.
