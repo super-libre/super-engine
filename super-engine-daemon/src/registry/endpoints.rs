@@ -798,6 +798,7 @@ impl<E: CoreEvents + ?Sized> Drop for InFlightGuard<E> {
                 source: self.source.clone(),
                 phase: InstallPhase::Installing,
                 error: InstallError::InstallIoError,
+                reason: None,
             },
         );
     }
@@ -1046,11 +1047,12 @@ fn spawn_pipeline<H: RegistryHost>(
                     version,
                 }
             }
-            Err((phase, error)) => RegistryEvent::Failed {
+            Err(failure) => RegistryEvent::Failed {
                 install_id,
                 source,
-                phase,
-                error,
+                phase: failure.phase,
+                error: failure.error,
+                reason: failure.reason,
             },
         };
         publish(&*events, &event);
