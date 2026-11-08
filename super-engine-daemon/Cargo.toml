@@ -19,7 +19,9 @@
     # Frequency bands ride base64-encoded in their event.
     base64 = "0.22.1"
     bytes = { version = "1", optional = true }
-    cpal = { version = "0.17.3", optional = true }
+    # 0.18 is the floor: 0.17's ALSA worker reported a POLLERR and polled again
+    # without recovering, which spun the output thread forever.
+    cpal = { version = "0.18.2", optional = true }
     # Unpacking a subprocess backend's release tarball.
     flate2 = "1.1.9"
     chrono.workspace = true
