@@ -281,10 +281,13 @@ pub struct SubprocessAsset {
     /// Rust target triple, e.g. `x86_64-unknown-linux-gnu`. Tier-1/2 only;
     /// the indexer rejects unknown triples.
     pub target: String,
-    /// Acceleration backends this build carries. A single string is accepted
-    /// and read as a one-element list, which is what every published manifest
-    /// uses; an array declares a binary carrying several runtimes, and the
-    /// daemon tells it at load time which one to use. Must be non-empty.
+    /// Every framework this build runs on, and only those: the daemon offers a
+    /// framework, and moves a model to it without another install, only when
+    /// the installed build lists it. A GPU build that also runs on the CPU
+    /// lists both, `accel = ["cuda", "cpu"]`; one that does not lists its GPU
+    /// framework alone. A single string is read as a one-element list. The
+    /// daemon tells the binary at load time which one to use. Must be
+    /// non-empty.
     #[serde(deserialize_with = "one_or_many")]
     pub accel: Vec<Accel>,
     /// CUDA major version this build targets. Required when `accel` contains
@@ -382,6 +385,23 @@ pub enum Accel {
     Metal,
     Rocm,
     Vulkan,
+}
+
+impl std::str::FromStr for Accel {
+    type Err = String;
+
+    /// The id an accelerator goes by on the wire and in a manifest, the same
+    /// one [`Display`](fmt::Display) writes.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda),
+            "metal" => Ok(Self::Metal),
+            "rocm" => Ok(Self::Rocm),
+            "vulkan" => Ok(Self::Vulkan),
+            other => Err(format!("unknown accelerator `{other}`")),
+        }
+    }
 }
 
 impl fmt::Display for Accel {
@@ -1037,7 +1057,7 @@ pub enum ManifestError {
     #[error("`[backend].id` is not a valid reverse-DNS id: {0}")]
     InvalidId(String),
     /// `[backend].product` names a product other than the one parsing the
-    /// manifest.
+    /// manifest, or one it continues.
     #[error("this backend is built for {declared}, not {expected}")]
     OtherProduct {
         /// The product the manifest names.
@@ -1327,6 +1347,7 @@ impl<P: Product> Manifest<P> {
     fn parse_inner(text: &str, fields: ContractFields) -> Result<Self, ManifestError> {
         if let Some(declared) = declared_product(text)
             && declared != P::SLUG
+            && !P::FORMER_SLUGS.contains(&declared.as_str())
         {
             return Err(ManifestError::OtherProduct {
                 declared,
@@ -1849,6 +1870,19 @@ mod tests {
             err.to_string(),
             "this backend is built for super-other, not super-test"
         );
+    }
+
+    /// A product it continues is this product's own: a manifest naming one
+    /// parses, and keeps the slug it declared.
+    #[test]
+    fn a_manifest_naming_a_former_slug_is_read_as_this_products() {
+        let text = manifest_with("v2", "").replace(
+            r#"product = "super-test""#,
+            r#"product = "super-test-before""#,
+        );
+        let m = Manifest::parse(&text).expect("a former slug parses");
+        assert_eq!(m.backend.product.as_deref(), Some("super-test-before"));
+        Manifest::parse_installed(&text).expect("and an installed one is discovered");
     }
 
     /// The product is checked before anything else, because another product's

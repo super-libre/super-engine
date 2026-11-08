@@ -5,6 +5,8 @@
 //! version; whether Metal is available. Used by `compat::select` to pick a
 //! compatible asset, and surfaced in the install failure error path.
 
+use super_engine_spec::manifest::Accel;
+
 #[derive(Debug, Clone)]
 pub struct Host {
     pub target_triple: String,
@@ -12,6 +14,49 @@ pub struct Host {
     pub rocm: Option<RocmHost>,
     pub vulkan: Option<VulkanHost>,
     pub metal: Option<MetalHost>,
+}
+
+impl Host {
+    /// The frameworks this host can run something on, best first: the
+    /// vendors' own (CUDA, `ROCm`, Metal), then Vulkan, then the CPU, which
+    /// every host has. The order [`compat::select`](super::compat::select)
+    /// ranks builds in.
+    #[must_use]
+    pub fn frameworks(&self) -> Vec<Accel> {
+        let mut frameworks = Vec::with_capacity(5);
+        if self.cuda.is_some() {
+            frameworks.push(Accel::Cuda);
+        }
+        if self.rocm.is_some() {
+            frameworks.push(Accel::Rocm);
+        }
+        if self.metal.is_some() {
+            frameworks.push(Accel::Metal);
+        }
+        if self.vulkan.is_some() {
+            frameworks.push(Accel::Vulkan);
+        }
+        frameworks.push(Accel::Cpu);
+        frameworks
+    }
+
+    /// This host as though `accel` were the only framework it had: what
+    /// choosing a build, or a model file, for one framework asks of it. The
+    /// CPU keeps none, since every host runs on it.
+    ///
+    /// One host shape rather than a second scoring policy, so a build picked
+    /// for Vulkan on an NVIDIA machine is ranked by exactly the rules that
+    /// would rank it on a machine with Vulkan alone.
+    #[must_use]
+    pub fn restricted_to(&self, accel: Accel) -> Self {
+        Self {
+            target_triple: self.target_triple.clone(),
+            cuda: self.cuda.clone().filter(|_| accel == Accel::Cuda),
+            rocm: self.rocm.clone().filter(|_| accel == Accel::Rocm),
+            vulkan: self.vulkan.clone().filter(|_| accel == Accel::Vulkan),
+            metal: self.metal.clone().filter(|_| accel == Accel::Metal),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -393,6 +393,7 @@ fn install_body(
         repo_url: repo_url.map(str::to_owned),
         local_path: local_path.map(str::to_owned),
         forge: None,
+        accel: None,
     }))
 }
 
@@ -485,7 +486,7 @@ async fn an_incompatible_build_is_refused_with_its_reason() {
     let registry = registry_at(TestHost::new(root.path()), UNREACHABLE, root.path());
 
     let entry = wasm_entry("github.com/x/broken", "1.0.0", false);
-    let Err(resp) = select_install(&registry, &entry, None) else {
+    let Err(resp) = select_install(&registry, &entry, None, None) else {
         panic!("an entry with no asset has nothing to install");
     };
     let (status, v) = body_of(*resp).await;
@@ -496,7 +497,7 @@ async fn an_incompatible_build_is_refused_with_its_reason() {
     let mut entry = wasm_entry("github.com/x/future", "1.0.0", true);
     entry.contract = "v9".to_owned();
     entry.min_client = Some("2.0.0".to_owned());
-    let Err(resp) = select_install(&registry, &entry, None) else {
+    let Err(resp) = select_install(&registry, &entry, None, None) else {
         panic!("a contract this daemon predates is not installable");
     };
     let (_, v) = body_of(*resp).await;

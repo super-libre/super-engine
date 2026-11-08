@@ -5,11 +5,11 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use super_engine_protocol::{ProductSpec, SHARED_APPLET};
+use super_engine_protocol::SHARED_APPLET;
 use super_engine_spec::verify::{tar_budget_step, tar_entry_unsafe_reason, unpack_cap};
 
-use crate::Installer;
 use crate::errors::InstallError;
+use crate::{Installer, Retired};
 
 /// Which of the three installable components are selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,8 +82,9 @@ pub fn plan_components(
     explicit: Option<ComponentSelection>,
     prefix: &Path,
     cosmic_available: bool,
-    product: &ProductSpec,
+    installer: &Installer,
 ) -> Components {
+    let product = installer.product;
     if let Some(selection) = explicit {
         return match selection {
             ComponentSelection::All => Components {
@@ -111,22 +112,24 @@ pub fn plan_components(
         };
     }
 
-    let installed: Vec<String> = std::fs::read_dir(prefix.join("bin"))
+    let in_bin: Vec<String> = std::fs::read_dir(prefix.join("bin"))
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     let slug = product.slug;
-    let is_update = installed
+    let is_update = in_bin
         .iter()
         .any(|name| name.starts_with(&format!("{slug}-")));
 
     if is_update {
         Components {
             daemon: true,
-            app: installed.iter().any(|name| *name == format!("{slug}-app")),
-            applet: installed
+            app: in_bin
+                .iter()
+                .any(|name| installer.apps.contains(&name.as_str())),
+            applet: in_bin
                 .iter()
                 .any(|name| *name == format!("{slug}-cosmic-applet") || name == SHARED_APPLET),
         }
@@ -282,6 +285,23 @@ fn applet_desktop_files(staging: &Path, applet: &str) -> Result<Vec<PathBuf>, In
     Ok(files)
 }
 
+/// What installs of the products in `retired` left under `prefix` and in
+/// `unit_dir`, besides their applets (see [`product_applet_files`]).
+fn retired_files(prefix: &Path, unit_dir: &Path, retired: &Retired) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = retired
+        .binaries
+        .iter()
+        .map(|binary| prefix.join("bin").join(binary))
+        .collect();
+    files.extend(retired.units.iter().map(|unit| unit_dir.join(unit)));
+    for app in retired.apps {
+        files.push(prefix.join(format!("share/applications/{app}.desktop")));
+        files.push(prefix.join(format!("share/icons/hicolor/scalable/apps/{app}.svg")));
+        files.push(prefix.join(format!("share/metainfo/{app}.metainfo.xml")));
+    }
+    files
+}
+
 /// What a product's own COSMIC applet installed under `prefix`: its binary,
 /// its three launcher entries and its icon. The shared applet replaces them.
 fn product_applet_files(prefix: &Path, product_applet: &str) -> Vec<PathBuf> {
@@ -349,6 +369,7 @@ pub fn build_manifest(
     let product = installer.product;
     let slug = product.slug;
     let bin = prefix.join("bin");
+    let mut removals = Vec::new();
     let mut entries = vec![ManifestEntry {
         source: self_exe.to_path_buf(),
         dest: bin.join(product.installer_binary()),
@@ -387,11 +408,13 @@ pub fn build_manifest(
             unit_dir.join(&unit),
             0o644,
         )?);
+
+        removals.extend(retired_files(prefix, unit_dir, &installer.retired));
     }
 
-    if components.app {
-        let app = format!("{slug}-app");
-        entries.push(required_entry(staging, &app, bin.join(&app), 0o755)?);
+    let apps: &[&str] = if components.app { installer.apps } else { &[] };
+    for app in apps {
+        entries.push(required_entry(staging, app, bin.join(app), 0o755)?);
         entries.push(required_entry(
             staging,
             &format!("resources/{app}.desktop"),
@@ -416,14 +439,17 @@ pub fn build_manifest(
         }
     }
 
-    let mut removals = Vec::new();
     if components.applet {
-        // The shared applet replaces the product's own, whether this run
-        // installs it or finds it already current.
+        // The shared applet replaces the product's own, and those of the
+        // products it replaces, whether this run installs it or finds it
+        // already current.
         removals.extend(product_applet_files(
             prefix,
             &format!("{slug}-cosmic-applet"),
         ));
+        for applet in installer.retired.applets {
+            removals.extend(product_applet_files(prefix, applet));
+        }
         if let Some(applet) = applet {
             entries.push(required_entry(
                 applet,
@@ -686,23 +712,23 @@ mod tests {
     #[test]
     fn detection_update_mode_counts_the_shared_applet() {
         let prefix = mktree(&["bin/super-test-daemon", "bin/super-cosmic-applet"]);
-        let c = plan_components(None, &prefix, false, &TEST);
+        let c = plan_components(None, &prefix, false, &INSTALLER);
         assert!(c.daemon && c.applet);
     }
 
     #[test]
     fn detection_update_mode_only_updates_whats_present() {
         let prefix = mktree(&["bin/super-test-daemon", "bin/super-test-app"]); // helper: temp dir + touch files
-        let c = plan_components(None, &prefix, true, &TEST);
+        let c = plan_components(None, &prefix, true, &INSTALLER);
         assert!(c.daemon && c.app && !c.applet);
     }
 
     #[test]
     fn detection_fresh_install_takes_all_gated_on_cosmic() {
         let prefix = mktree(&[]); // empty bin/ (F6: `mktree` always creates it)
-        let c = plan_components(None, &prefix, false, &TEST);
+        let c = plan_components(None, &prefix, false, &INSTALLER);
         assert!(c.daemon && c.app && !c.applet);
-        let c = plan_components(None, &prefix, true, &TEST);
+        let c = plan_components(None, &prefix, true, &INSTALLER);
         assert!(c.applet);
     }
 
@@ -715,9 +741,9 @@ mod tests {
         // so this is still a fresh install.
         let prefix = test_dir(); // no `bin/` subdirectory created
         assert!(!prefix.join("bin").exists());
-        let c = plan_components(None, &prefix, false, &TEST);
+        let c = plan_components(None, &prefix, false, &INSTALLER);
         assert!(c.daemon && c.app && !c.applet);
-        let c = plan_components(None, &prefix, true, &TEST);
+        let c = plan_components(None, &prefix, true, &INSTALLER);
         assert!(c.daemon && c.app && c.applet);
     }
 
@@ -726,7 +752,7 @@ mod tests {
         // The daemon is always refreshed on an update (the core piece every
         // install has) even when only the applet binary is present.
         let prefix = mktree(&["bin/super-test-cosmic-applet"]);
-        let c = plan_components(None, &prefix, true, &TEST);
+        let c = plan_components(None, &prefix, true, &INSTALLER);
         assert!(c.daemon && !c.app && c.applet);
     }
 
@@ -737,21 +763,21 @@ mod tests {
             "bin/super-test-app",
             "bin/super-test-cosmic-applet",
         ]);
-        let c = plan_components(None, &prefix, false, &TEST); // cosmic gone, but applet was already installed
+        let c = plan_components(None, &prefix, false, &INSTALLER); // cosmic gone, but applet was already installed
         assert!(c.daemon && c.app && c.applet);
     }
 
     #[test]
     fn explicit_daemon_selects_only_daemon() {
         let prefix = mktree(&["bin/super-test-app"]);
-        let c = plan_components(Some(ComponentSelection::Daemon), &prefix, true, &TEST);
+        let c = plan_components(Some(ComponentSelection::Daemon), &prefix, true, &INSTALLER);
         assert!(c.daemon && !c.app && !c.applet);
     }
 
     #[test]
     fn explicit_app_selects_only_app() {
         let prefix = mktree(&[]);
-        let c = plan_components(Some(ComponentSelection::App), &prefix, true, &TEST);
+        let c = plan_components(Some(ComponentSelection::App), &prefix, true, &INSTALLER);
         assert!(!c.daemon && c.app && !c.applet);
     }
 
@@ -761,14 +787,14 @@ mod tests {
         // Explicit `--components=applet` bypasses the `cosmic_available`
         // gate entirely — unlike the interactive menu's option 4, the CLI
         // flag is trusted outright.
-        let c = plan_components(Some(ComponentSelection::Applet), &prefix, false, &TEST);
+        let c = plan_components(Some(ComponentSelection::Applet), &prefix, false, &INSTALLER);
         assert!(!c.daemon && !c.app && c.applet);
     }
 
     #[test]
     fn explicit_all_selects_everything_regardless_of_existing_state() {
         let prefix = mktree(&["bin/super-test-daemon"]);
-        let c = plan_components(Some(ComponentSelection::All), &prefix, true, &TEST);
+        let c = plan_components(Some(ComponentSelection::All), &prefix, true, &INSTALLER);
         assert!(c.daemon && c.app && c.applet);
     }
 
@@ -777,13 +803,18 @@ mod tests {
         let prefix = mktree(&[]);
         // `AllButApplet` (the interactive menu's "All (skip COSMIC applet)"
         // path) skips the applet even when a COSMIC panel is present.
-        let c = plan_components(Some(ComponentSelection::AllButApplet), &prefix, true, &TEST);
+        let c = plan_components(
+            Some(ComponentSelection::AllButApplet),
+            &prefix,
+            true,
+            &INSTALLER,
+        );
         assert!(c.daemon && c.app && !c.applet);
         // Explicit `All` (the `--components=all` CLI path) stays literally
         // all-inclusive regardless of `cosmic_available` — this must never
         // change, since the hermetic e2e test relies on it being
         // deterministic on a CI host with no cosmic-panel.
-        let c = plan_components(Some(ComponentSelection::All), &prefix, false, &TEST);
+        let c = plan_components(Some(ComponentSelection::All), &prefix, false, &INSTALLER);
         assert!(c.daemon && c.app && c.applet);
     }
 
@@ -833,6 +864,144 @@ mod tests {
         let content = std::fs::read_to_string(&wrapper.source).unwrap();
         assert!(content.starts_with("#!/bin/bash\n"));
         assert!(content.contains("exec \"/usr/local/bin/super-test-cli\" \"$@\""));
+    }
+
+    /// The tarball of a product that replaced two others: its daemon, and an
+    /// app of each.
+    fn merged_staging() -> TestDir {
+        let dir = test_dir();
+        for f in [
+            "super-test-daemon",
+            "super-test-cli",
+            "super-test-consent",
+            "systemd/super-test.service",
+            "super-a-app",
+            "super-b-app",
+            "resources/super-a-app.desktop",
+            "resources/super-b-app.desktop",
+            "resources/icons/hicolor/scalable/apps/super-a-app.svg",
+            "resources/icons/hicolor/scalable/apps/super-b-app.svg",
+        ] {
+            let full = dir.join(f);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, b"").unwrap();
+        }
+        dir
+    }
+
+    fn merged_manifest(components: Components) -> Result<Manifest, InstallError> {
+        build_manifest(
+            &merged_staging(),
+            None,
+            std::path::Path::new("/usr/local"),
+            std::path::Path::new("/usr/lib/systemd/user"),
+            &components,
+            std::path::Path::new("/proc/self/exe"),
+            &crate::tests::MERGED_INSTALLER,
+        )
+    }
+
+    /// Every app the installer names is installed, none of them named after
+    /// the slug.
+    #[test]
+    fn the_app_component_installs_every_named_app() {
+        let m = merged_manifest(Components {
+            daemon: false,
+            app: true,
+            applet: false,
+        })
+        .unwrap();
+        let dests: Vec<String> = m
+            .entries
+            .iter()
+            .map(|e| e.dest.display().to_string())
+            .collect();
+        for app in ["super-a-app", "super-b-app"] {
+            assert!(
+                dests.contains(&format!("/usr/local/bin/{app}")),
+                "{dests:?}"
+            );
+            assert!(
+                dests.contains(&format!("/usr/local/share/applications/{app}.desktop")),
+                "{dests:?}"
+            );
+            assert!(
+                dests.contains(&format!(
+                    "/usr/local/share/icons/hicolor/scalable/apps/{app}.svg"
+                )),
+                "{dests:?}"
+            );
+        }
+        assert!(!dests.iter().any(|d| d.ends_with("super-test-app")));
+    }
+
+    /// An install of the daemon takes away what the replaced products
+    /// installed: their binaries, their unit and their app's launcher entry.
+    #[test]
+    fn a_daemon_install_removes_what_the_replaced_products_left() {
+        let m = merged_manifest(Components {
+            daemon: true,
+            app: false,
+            applet: false,
+        })
+        .unwrap();
+        for gone in [
+            "/usr/local/bin/super-a-daemon",
+            "/usr/local/bin/super-a-cli",
+            "/usr/local/bin/a",
+            "/usr/lib/systemd/user/super-a.service",
+            "/usr/local/share/applications/super-old-app.desktop",
+            "/usr/local/share/icons/hicolor/scalable/apps/super-old-app.svg",
+            "/usr/local/share/metainfo/super-old-app.metainfo.xml",
+        ] {
+            assert!(
+                m.removals.contains(&PathBuf::from(gone)),
+                "{gone} stays: {:?}",
+                m.removals
+            );
+        }
+    }
+
+    /// Without the daemon, the replaced products' files stay: an app-only run
+    /// does not take the user's daemon away.
+    #[test]
+    fn an_app_only_install_leaves_the_replaced_products_alone() {
+        let m = merged_manifest(Components {
+            daemon: false,
+            app: true,
+            applet: false,
+        })
+        .unwrap();
+        assert!(m.removals.is_empty(), "{:?}", m.removals);
+    }
+
+    /// The shared applet replaces the replaced products' applets too.
+    #[test]
+    fn the_shared_applet_replaces_the_replaced_products_applets() {
+        let m = merged_manifest(Components {
+            daemon: false,
+            app: false,
+            applet: true,
+        })
+        .unwrap();
+        for gone in [
+            "/usr/local/bin/super-a-cosmic-applet",
+            "/usr/local/share/applications/super-a-cosmic-applet-full.desktop",
+            "/usr/local/share/icons/hicolor/scalable/apps/super-a-cosmic-applet.svg",
+        ] {
+            assert!(m.removals.contains(&PathBuf::from(gone)), "{gone} stays");
+        }
+    }
+
+    /// An update finds the app component by any app the installer names.
+    #[test]
+    fn detection_update_mode_finds_any_named_app() {
+        let prefix = mktree(&["bin/super-test-daemon", "bin/super-b-app"]);
+        let c = plan_components(None, &prefix, false, &crate::tests::MERGED_INSTALLER);
+        assert!(c.daemon && c.app);
+        let prefix = mktree(&["bin/super-test-daemon"]);
+        let c = plan_components(None, &prefix, false, &crate::tests::MERGED_INSTALLER);
+        assert!(!c.app);
     }
 
     #[test]

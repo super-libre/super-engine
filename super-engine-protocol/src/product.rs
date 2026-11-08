@@ -25,6 +25,12 @@ pub struct ProductSpec {
     pub short_name: &'static str,
     /// Prefix of the product's environment variables.
     pub env_prefix: &'static str,
+    /// The prefixes of the products this one continues. A backend built for
+    /// one reads its contract variables (`<PREFIX>_BACKEND_SOCKET`, `_DIR`,
+    /// `_CACHE_DIR`) under that prefix, so the daemon sets them under each of
+    /// these as well as [`env_prefix`](Self::env_prefix). Empty for a product
+    /// that continues none.
+    pub former_env_prefixes: &'static [&'static str],
     /// The loopback TCP port the daemon serves browsers on. Ports 7300–7309
     /// are the block reserved for the Super family, one per daemon.
     pub tcp_port: u16,
@@ -41,6 +47,14 @@ pub struct ProductSpec {
     /// [`CORE_TOPICS`](crate::scopes::CORE_TOPICS), each with the scope a
     /// subscriber needs for it.
     pub topics: &'static [(&'static str, &'static str)],
+    /// The product's own client binaries, by file name, that skip the
+    /// consent dialog when they sit beside the daemon: its apps and CLIs.
+    /// The COSMIC applet every product shares,
+    /// [`SHARED_APPLET`](crate::SHARED_APPLET), is trusted without being
+    /// listed. Named rather than derived from the slug, because a product's
+    /// clients need not carry its name: one daemon may serve clients that
+    /// were each a product of their own.
+    pub clients: &'static [&'static str],
 }
 
 impl ProductSpec {

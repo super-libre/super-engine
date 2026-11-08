@@ -12,6 +12,7 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The exclusive lock on `<socket>.lock`, held for as long as the daemon runs.
 ///
@@ -25,11 +26,21 @@ use std::path::{Path, PathBuf};
 /// ends, however it ends: a crash, `SIGKILL` and `process::exit` included. The
 /// file itself is never deleted. Deleting it would let a second daemon lock a
 /// new file at the same path while the first still held the old one.
-#[derive(Debug)]
+///
+/// A clone holds the same lock, and the lock is released when the last clone
+/// is dropped. That is how a daemon keeps it past [`serve`]: `serve` drops its
+/// copy once the socket is gone, but a daemon still stopping its backends
+/// after that holds a clone until they are down. Without it, a new daemon
+/// could start, and spawn a backend under the same instance name, while the
+/// old one was still stopping its own.
+///
+/// [`serve`]: crate::http::server::serve
+#[derive(Debug, Clone)]
 pub struct InstanceLock {
     socket_path: PathBuf,
-    /// Never read: the lock lasts as long as the open file does.
-    _file: File,
+    /// Never read: the lock lasts as long as the open file does, which is
+    /// as long as any clone of this lock.
+    _file: Arc<File>,
 }
 
 /// Why [`InstanceLock::acquire`] failed.
@@ -78,7 +89,7 @@ impl InstanceLock {
         match file.try_lock() {
             Ok(()) => Ok(Self {
                 socket_path: socket_path.to_owned(),
-                _file: file,
+                _file: Arc::new(file),
             }),
             Err(TryLockError::WouldBlock) => {
                 Err(AcquireError::AlreadyRunning(socket_path.to_owned()))
@@ -121,6 +132,28 @@ mod tests {
         drop(InstanceLock::acquire(&socket).unwrap());
         // The lock file is left in place, and taking it again works.
         assert!(dir.path().join("super-stt-http.sock.lock").exists());
+        InstanceLock::acquire(&socket).unwrap();
+    }
+
+    /// The lock is held until the last clone goes: dropping the one `serve`
+    /// was given leaves the daemon's own clone holding it.
+    #[test]
+    fn a_clone_holds_the_lock_until_it_is_dropped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("super-voice-http.sock");
+
+        let first = InstanceLock::acquire(&socket).unwrap();
+        let kept = first.clone();
+        drop(first);
+        assert!(
+            matches!(
+                InstanceLock::acquire(&socket),
+                Err(AcquireError::AlreadyRunning(_))
+            ),
+            "a clone still holds the lock"
+        );
+
+        drop(kept);
         InstanceLock::acquire(&socket).unwrap();
     }
 

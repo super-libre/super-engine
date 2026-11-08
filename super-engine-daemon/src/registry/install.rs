@@ -8,9 +8,10 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use ring::digest::SHA256;
 use super_engine_spec::index::{IndexAsset, IndexBackend};
+use super_engine_spec::installed_files::InstalledFiles;
 use super_engine_spec::manifest::Manifest;
 use super_engine_spec::product::Product;
-use super_engine_spec::registry::events::{InstallError, InstallPhase};
+use super_engine_spec::registry::events::{InstallError, InstallFailure, InstallPhase};
 use thiserror::Error;
 use tokio::fs;
 
@@ -85,13 +86,13 @@ pub struct Pipeline<F> {
 /// compat module. Returns the installed version on success.
 ///
 /// # Errors
-/// Returns `(InstallPhase, InstallError)` on failure, including an
-/// `Incompatible` error if `selection` does not match an asset on `entry`.
+/// Returns an [`InstallFailure`] on failure, including an `Incompatible`
+/// error if `selection` does not match an asset on `entry`.
 pub async fn run<Prod: Product, F>(
     p: &Pipeline<F>,
     entry: &IndexBackend<Prod::IndexModel>,
     selection: &Selection,
-) -> Result<String, (InstallPhase, InstallError)>
+) -> Result<String, InstallFailure>
 where
     F: Fn(InstallPhase, Option<(u64, Option<u64>)>) + Send + Sync,
 {
@@ -103,7 +104,10 @@ where
         Selection::Wasm => false,
         Selection::Subprocess { .. } => true,
         Selection::Incompatible { .. } | Selection::NeedsClientUpdate { .. } => {
-            return Err((P::Resolving, InstallError::Incompatible));
+            return Err(InstallFailure::new(
+                P::Resolving,
+                InstallError::Incompatible,
+            ));
         }
     };
 
@@ -148,10 +152,13 @@ where
     // verified here and written verbatim. Every installable entry carries a
     // pinned manifest asset; an entry without one is not installable. We never
     // trust whatever may have been packed inside the tarball.
-    let pin = entry
-        .manifest
-        .as_ref()
-        .ok_or((P::Installing, InstallError::ManifestInvalid))?;
+    let pin = entry.manifest.as_ref().ok_or_else(|| {
+        InstallFailure::because(
+            P::Installing,
+            InstallError::ManifestInvalid,
+            "the registry lists no backend manifest for it",
+        )
+    })?;
     let toml_text = fetch_verified_manifest::<Prod>(&p.http, entry, pin).await?;
     fs::write(staging.join("backend.toml"), toml_text)
         .await
@@ -270,7 +277,7 @@ where
 /// would be copied into the backend-readable install dir.
 ///
 /// # Errors
-/// Returns `(InstallPhase, InstallError)` on filesystem failure.
+/// Returns an [`InstallFailure`] on filesystem failure.
 ///
 /// # Panics
 /// None.
@@ -278,7 +285,7 @@ pub async fn run_local<Prod: Product, F>(
     p: &Pipeline<F>,
     entry: &IndexBackend<Prod::IndexModel>,
     src_dir: &Path,
-) -> Result<String, (InstallPhase, InstallError)>
+) -> Result<String, InstallFailure>
 where
     F: Fn(InstallPhase, Option<(u64, Option<u64>)>) + Send + Sync,
 {
@@ -502,7 +509,15 @@ async fn find_serving<Prod: Product>(
         if exclude.is_some_and(|e| dir == e) || !dir.is_dir() {
             continue;
         }
-        if Manifest::<Prod>::load(&dir).is_ok_and(|m| m.backend.source == source) {
+        // A directory whose manifest is not this product's — one a product
+        // this one replaced installed — still serves its source until an
+        // update replaces it, and is found by it so the update inherits its
+        // files and retires it.
+        let serves = match Manifest::<Prod>::load(&dir) {
+            Ok(m) => m.backend.source == source,
+            Err(_) => InstalledFiles::load(&dir).is_some_and(|old| old.source == source),
+        };
+        if serves {
             return Some(dir);
         }
     }
@@ -574,13 +589,21 @@ pub async fn retire_previous_dir<Prod: Product>(
 /// preserved. This is a known, accepted gap (end state is still correct
 /// content), not a bug to fix here.
 async fn preserve_models<Prod: Product>(staging: &Path, final_path: &Path) -> std::io::Result<u64> {
-    let (Ok(old), Ok(new)) = (
-        Manifest::<Prod>::load(final_path),
-        Manifest::<Prod>::load(staging),
-    ) else {
+    let Ok(new) = Manifest::<Prod>::load(staging) else {
         return Ok(0);
     };
-    let keep = crate::registry::carry_over::survivors(&old, &new);
+    let keep = match Manifest::<Prod>::load(final_path) {
+        Ok(old) => crate::registry::carry_over::survivors(&old, &new),
+        // Installed by a product this one replaced: its manifest is not this
+        // product's, but its files are still the ones on disk. Only the same
+        // backend's are carried over.
+        Err(_) => match InstalledFiles::load(final_path) {
+            Some(old) if old.source == new.backend.source => {
+                crate::registry::carry_over::survivors_from_installed(&old, &new)
+            }
+            _ => return Ok(0),
+        },
+    };
     if keep.is_empty() {
         return Ok(0);
     }
@@ -859,7 +882,7 @@ async fn fetch_verified_manifest<Prod: Product>(
     http: &reqwest::Client,
     entry: &IndexBackend<Prod::IndexModel>,
     pin: &IndexAsset,
-) -> Result<String, (InstallPhase, InstallError)> {
+) -> Result<String, InstallFailure> {
     let bytes = download_manifest_bytes(http, &pin.url)
         .await
         .map_err(|e| e.as_typed(InstallPhase::Downloading))?;
@@ -873,7 +896,7 @@ fn verify_manifest_bytes<Prod: Product>(
     bytes: &[u8],
     pin_sha256: &str,
     entry: &IndexBackend<Prod::IndexModel>,
-) -> Result<String, (InstallPhase, InstallError)> {
+) -> Result<String, InstallFailure> {
     use crate::backends::validate_runtime;
     use InstallPhase as P;
 
@@ -888,37 +911,45 @@ fn verify_manifest_bytes<Prod: Product>(
     } else {
         let actual = hex::encode(ring::digest::digest(&SHA256, bytes).as_ref());
         if !sha256_matches(&actual, pin_sha256) {
-            return Err((P::Verifying, InstallError::AssetHashMismatch));
+            return Err(InstallFailure::new(
+                P::Verifying,
+                InstallError::AssetHashMismatch,
+            ));
         }
     }
 
-    let reject = |reason: &str| {
+    // The reason goes to the client as well as the log: "missing or invalid"
+    // alone leaves the user nothing to act on.
+    let reject = |reason: String| {
         log::warn!(
             "install({}): pinned manifest rejected: {reason}",
             entry.source
         );
-        (P::Installing, InstallError::ManifestInvalid)
+        InstallFailure::because(P::Installing, InstallError::ManifestInvalid, reason)
     };
     let text = std::str::from_utf8(bytes)
-        .map_err(|_| reject("not valid UTF-8"))?
+        .map_err(|_| reject("its backend manifest is not valid UTF-8".to_string()))?
         .to_string();
     // `Manifest::parse` (not raw `toml::from_str`) so install-time verification
     // shares the canonical parser's safety guards — entrypoint + per-file
     // `destination` traversal rejection and the `file`-xor-`parts` / empty-`file`
     // normalization — instead of hand-reimplementing only a subset here. A future
     // guard added to `parse` then applies here automatically (audit 2 Tier 2 #11).
-    let m = Manifest::<Prod>::parse(&text).map_err(|e| reject(&format!("parse: {e}")))?;
-    validate_runtime(&m).map_err(|e| reject(&format!("validation: {e}")))?;
+    let m = Manifest::<Prod>::parse(&text).map_err(|e| reject(e.to_string()))?;
+    validate_runtime(&m).map_err(|e| reject(e.to_string()))?;
     if m.backend.source != entry.source {
-        return Err(reject(&format!(
-            "manifest source `{}` != index source `{}`",
+        return Err(reject(format!(
+            "its backend manifest names the source {}, not {}",
             m.backend.source, entry.source
         )));
     }
     // Index-consistency check only — the entrypoint's path safety is already
     // enforced by `Manifest::parse` above.
     if m.backend.entrypoint != entry.entrypoint {
-        return Err(reject("entrypoint inconsistent with index"));
+        return Err(reject(format!(
+            "its backend manifest names the entrypoint {}, and the registry {}",
+            m.backend.entrypoint, entry.entrypoint
+        )));
     }
     Ok(text)
 }
@@ -989,7 +1020,7 @@ supported_devices = ["cpu"]
         let err =
             verify_manifest_bytes::<TestProduct>(PINNED_MANIFEST.as_bytes(), "deadbeef", &entry)
                 .unwrap_err();
-        assert_eq!(err.1, InstallError::AssetHashMismatch);
+        assert_eq!(err.error, InstallError::AssetHashMismatch);
     }
 
     #[test]
@@ -1000,7 +1031,31 @@ supported_devices = ["cpu"]
         let spoofed = PINNED_MANIFEST.replace("github.com/x/y", "github.com/evil/z");
         let bytes = spoofed.as_bytes();
         let err = verify_manifest_bytes::<TestProduct>(bytes, &sha_hex(bytes), &entry).unwrap_err();
-        assert_eq!(err.1, InstallError::ManifestInvalid);
+        assert_eq!(err.error, InstallError::ManifestInvalid);
+    }
+
+    /// A refused manifest says why, so the client can show more than "missing
+    /// or invalid": here, the product rule the manifest broke.
+    #[test]
+    fn a_refused_manifest_carries_its_reason() {
+        let entry = minimal_entry();
+        let other = PINNED_MANIFEST.replace(
+            "contract = \"v1\"",
+            "contract = \"v1\"\nproduct = \"super-other\"",
+        );
+        assert_ne!(other, PINNED_MANIFEST, "the test named another product");
+        let bytes = other.as_bytes();
+        let err = verify_manifest_bytes::<TestProduct>(bytes, &sha_hex(bytes), &entry).unwrap_err();
+        assert_eq!(err.error, InstallError::ManifestInvalid);
+        assert_eq!(
+            err.reason.as_deref(),
+            Some("this backend is built for super-other, not super-test")
+        );
+        assert_eq!(
+            err.to_string(),
+            "this backend is built for super-other, not super-test",
+            "the reason is what a client shows"
+        );
     }
 
     #[test]
@@ -1008,7 +1063,7 @@ supported_devices = ["cpu"]
         let entry = minimal_entry();
         let bytes = b"this is not toml = = =";
         let err = verify_manifest_bytes::<TestProduct>(bytes, &sha_hex(bytes), &entry).unwrap_err();
-        assert_eq!(err.1, InstallError::ManifestInvalid);
+        assert_eq!(err.error, InstallError::ManifestInvalid);
     }
 
     fn minimal_entry() -> IndexBackend {
@@ -1148,12 +1203,12 @@ supported_devices = ["cpu"]
         let err = run::<TestProduct, _>(&pipeline, &entry, &Selection::Subprocess { index: 0 })
             .await
             .unwrap_err();
-        assert!(matches!(err.1, InstallError::Incompatible));
+        assert!(matches!(err.error, InstallError::Incompatible));
         // Wasm selection but the entry has no wasm asset.
         let err = run::<TestProduct, _>(&pipeline, &entry, &Selection::Wasm)
             .await
             .unwrap_err();
-        assert!(matches!(err.1, InstallError::Incompatible));
+        assert!(matches!(err.error, InstallError::Incompatible));
     }
 
     #[test]
@@ -1413,6 +1468,94 @@ supported_devices = ["cpu"]
         assert!(staging.join("models/m/a.bin").exists());
     }
 
+    /// A backend a replaced product installed has a manifest this product
+    /// refuses. Its update still keeps the weights already on disk, and finds
+    /// the directory to inherit from — but only for the same backend.
+    #[tokio::test]
+    async fn an_update_keeps_the_weights_of_a_backend_a_replaced_product_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".staging/y-1.0.1");
+        let old_dir = root.path().join("old-y");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(old_dir.join("models/m")).unwrap();
+        // Another product's manifest, in a shape no product today accepts.
+        let old = |source: &str| {
+            format!(
+                r#"
+[backend]
+    source   = "{source}"
+    product  = "super-replaced"
+    contract = "v4"
+
+[[models]]
+    name     = "m"
+    provider = "Legacy"
+    files = [
+        {{ url = "https://h/a.bin", destination = "models/m/a.bin" }},
+    ]
+"#
+            )
+        };
+        std::fs::write(
+            staging.join("backend.toml"),
+            r#"
+[backend]
+    source     = "github.com/x/y"
+    name       = "Y"
+    version    = "1.0.1"
+    kind       = "subprocess"
+    entrypoint = "y"
+    contract   = "v1"
+    license    = "Apache-2.0"
+    description = "Test backend."
+
+[[assets.subprocess]]
+    file   = "y.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel  = ["cpu"]
+
+[[models]]
+    name                = "m"
+    primary_language    = "en"
+    supported_languages = ["en"]
+    supported_devices   = ["cpu"]
+    files = [
+        { url = "https://h/a.bin", destination = "models/m/a.bin" },
+    ]
+"#,
+        )
+        .unwrap();
+        std::fs::write(old_dir.join("backend.toml"), old("github.com/x/y")).unwrap();
+        std::fs::write(old_dir.join("models/m/a.bin"), b"weights").unwrap();
+        assert!(
+            Manifest::<TestProduct>::load(&old_dir).is_err(),
+            "the old manifest is not this product's"
+        );
+
+        assert_eq!(
+            super::previous_dir_for::<TestProduct>(root.path(), "github.com/x/y").await,
+            Some(old_dir.clone()),
+            "the update finds the directory serving its source"
+        );
+        let moved = super::preserve_models::<TestProduct>(&staging, &old_dir)
+            .await
+            .unwrap();
+        assert_eq!(moved, 7);
+        assert!(staging.join("models/m/a.bin").exists());
+
+        // Another backend's files are never taken, whatever their names.
+        let staging_b = root.path().join(".staging/z-1.0.1");
+        std::fs::create_dir_all(&staging_b).unwrap();
+        std::fs::copy(staging.join("backend.toml"), staging_b.join("backend.toml")).unwrap();
+        std::fs::write(old_dir.join("backend.toml"), old("github.com/x/other")).unwrap();
+        std::fs::create_dir_all(old_dir.join("models/m")).unwrap();
+        std::fs::write(old_dir.join("models/m/a.bin"), b"weights").unwrap();
+        let moved = super::preserve_models::<TestProduct>(&staging_b, &old_dir)
+            .await
+            .unwrap();
+        assert_eq!(moved, 0);
+    }
+
     #[tokio::test]
     async fn preserve_models_is_a_no_op_without_an_installed_manifest() {
         let root = tempfile::tempdir().unwrap();
@@ -1597,8 +1740,8 @@ description = "Test backend."
             .await
             .expect_err("installing over another backend must be refused");
 
-        assert_eq!(err.1, InstallError::InstallDirConflict);
-        assert_eq!(err.0, InstallPhase::Installing);
+        assert_eq!(err.error, InstallError::InstallDirConflict);
+        assert_eq!(err.phase, InstallPhase::Installing);
         assert!(
             victim.join("models/m/a.bin").exists(),
             "the occupant's downloaded weights must survive untouched"
@@ -1692,7 +1835,7 @@ supported_devices = ["cpu"]
 
         asset_mock.assert_async().await;
         manifest_mock.assert_async().await;
-        assert_eq!(err.1, InstallError::InstallDirConflict);
+        assert_eq!(err.error, InstallError::InstallDirConflict);
         assert!(
             victim.join("models/m/a.bin").exists(),
             "the occupant's downloaded weights must survive untouched"

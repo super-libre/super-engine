@@ -318,12 +318,19 @@ where
         .expect("definitions");
     inject_definition_rules(defs);
 
-    // This schema is one product's, so `product` has one legal value: the
-    // parser refuses every other, and an editor says so where it is typed.
-    defs.get_mut("BackendMeta").expect("BackendMeta def")["properties"]["product"]
+    // This schema is one product's, so `product` takes its slug and the slugs
+    // of the products it continues: the parser refuses every other, and an
+    // editor says so where it is typed.
+    let product = defs.get_mut("BackendMeta").expect("BackendMeta def")["properties"]["product"]
         .as_object_mut()
-        .expect("product property")
-        .insert("const".into(), json!(P::SLUG));
+        .expect("product property");
+    if P::FORMER_SLUGS.is_empty() {
+        product.insert("const".into(), json!(P::SLUG));
+    } else {
+        let mut slugs = vec![P::SLUG];
+        slugs.extend_from_slice(P::FORMER_SLUGS);
+        product.insert("enum".into(), json!(slugs));
+    }
 
     close_objects(&mut root);
     root

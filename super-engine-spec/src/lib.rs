@@ -13,6 +13,7 @@ pub mod entry;
 pub mod forge;
 pub mod fs;
 pub mod index;
+pub mod installed_files;
 pub mod license;
 pub mod manifest;
 pub mod product;

@@ -22,17 +22,19 @@ use axum::response::{IntoResponse, Response};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use super_engine_spec::forge::Forge;
-use super_engine_spec::index::IndexBackend;
+use super_engine_spec::index::{IndexBackend, IndexSubprocessAsset};
+use super_engine_spec::manifest::Accel;
 use super_engine_spec::product::Product;
 use super_engine_spec::registry::events::{InstallError, InstallPhase, RegistryEvent};
 use super_engine_spec::registry::{
-    Compatibility, InstallAccepted, PreviewResponse, RefreshResponse, RegistryBackend,
+    Build, Compatibility, InstallAccepted, PreviewResponse, RefreshResponse, RegistryBackend,
     RegistryListResponse, RegistryModel, SelectedAsset, UpdateResponse,
 };
 use utoipa::ToSchema;
 
 use super::client::Client;
 use super::compat::{self, Selection};
+use super::host::Host;
 use super::{Daemon, custom_repo, host, install_dir_name, local_dir};
 use crate::backends::{DiscoveredBackend, installed_version};
 use crate::events::CoreEvents;
@@ -211,6 +213,9 @@ pub struct InstallBody {
     pub repo_url: Option<String>,
     pub local_path: Option<String>,
     pub forge: Option<Forge>,
+    /// The framework to install the build for. Absent picks the best one.
+    #[serde(default)]
+    pub accel: Option<String>,
 }
 
 /// The body of an update.
@@ -261,11 +266,13 @@ pub async fn list<H: RegistryHost>(registry: &Registry<H>, query: &ListQuery) ->
             continue;
         }
 
-        result.push(map_entry(
+        let mut listed = map_entry(
             entry,
             compatibility,
             installed_version_for_source(&backends, &entry.source),
-        ));
+        );
+        listed.builds = builds::<H::Product>(&daemon, &host, entry);
+        result.push(listed);
     }
 
     json(
@@ -306,6 +313,38 @@ fn passes_filters<M>(entry: &IndexBackend<M>, query: &ListQuery) -> bool {
     true
 }
 
+/// The frameworks `host` can run a build of `entry` on, best first, with the
+/// download each one's build takes.
+fn builds<P: Product>(
+    daemon: &Daemon,
+    host: &Host,
+    entry: &IndexBackend<P::IndexModel>,
+) -> Vec<Build> {
+    compat::runnable_index_accels(host, &entry.assets.subprocess)
+        .into_iter()
+        .filter_map(|accel| {
+            let Selection::Subprocess { index } =
+                compat::select_accel::<P>(daemon, host, entry, accel)
+            else {
+                return None;
+            };
+            Some(Build {
+                accel: accel.to_string(),
+                size: asset_size(&entry.assets.subprocess[index]),
+            })
+        })
+        .collect()
+}
+
+/// The bytes downloading `asset` takes: its one file, or every part.
+fn asset_size(asset: &IndexSubprocessAsset) -> u64 {
+    if asset.parts.is_empty() {
+        asset.size.unwrap_or(0)
+    } else {
+        asset.parts.iter().map(|p| p.size).sum()
+    }
+}
+
 /// How `sel`, the build this host would get of `entry`, reads on the wire.
 fn compatibility<M>(entry: &IndexBackend<M>, sel: &Selection) -> Compatibility {
     Compatibility {
@@ -314,6 +353,28 @@ fn compatibility<M>(entry: &IndexBackend<M>, sel: &Selection) -> Compatibility {
         reason: sel.reason().map(ToOwned::to_owned),
         needs_client_update: sel.needs_client_update(),
     }
+}
+
+/// The framework the installed build of the backend serving `source` runs on,
+/// from its install record: the first it declares that is not the CPU, or
+/// the CPU for a CPU build. `None` with no record, as for a local import.
+fn installed_accel_for_source<P: Product>(
+    backends: &[DiscoveredBackend<P>],
+    source: &str,
+) -> Option<Accel> {
+    let b = backends.iter().find(|b| b.source == source)?;
+    let record = super::installed::read(&b.dir)?;
+    let accels: Vec<Accel> = record
+        .selected
+        .accel
+        .iter()
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    accels
+        .iter()
+        .copied()
+        .find(|a| *a != Accel::Cpu)
+        .or_else(|| accels.first().copied())
 }
 
 /// The installed version of the backend serving `source`, or `None` when no
@@ -401,6 +462,7 @@ fn map_entry<M: Clone>(
         compatibility,
         installed_version,
         index_stale: entry.index_stale.clone(),
+        builds: Vec::new(),
     }
 }
 
@@ -736,6 +798,7 @@ impl<E: CoreEvents + ?Sized> Drop for InFlightGuard<E> {
                 source: self.source.clone(),
                 phase: InstallPhase::Installing,
                 error: InstallError::InstallIoError,
+                reason: None,
             },
         );
     }
@@ -743,17 +806,24 @@ impl<E: CoreEvents + ?Sized> Drop for InFlightGuard<E> {
 
 /// The build of `entry` to install, or `422 incompatible` with the reason
 /// [`compat::select`] gave. A local import (`local_src`) selects nothing: its
-/// bytes are already on disk.
+/// bytes are already on disk. `accel` asks for the build of one framework
+/// rather than the best one.
 fn select_install<H: RegistryHost>(
     registry: &Registry<H>,
     entry: &Entry<H>,
     local_src: Option<&Path>,
+    accel: Option<Accel>,
 ) -> Result<(Selection, SelectedAsset), ErrResp> {
     if local_src.is_some() {
         // `run_local` ignores the selection.
         return Ok((Selection::Wasm, local_asset()));
     }
-    let sel = compat::select::<H::Product>(&registry.host.daemon(), &host::detect(), entry);
+    let daemon = registry.host.daemon();
+    let host = host::detect();
+    let sel = match accel {
+        Some(accel) => compat::select_accel::<H::Product>(&daemon, &host, entry, accel),
+        None => compat::select::<H::Product>(&daemon, &host, entry),
+    };
     let Some(asset) = compat::to_selected_asset(entry, &sel) else {
         return Err(Box::new(incompatible(&sel)));
     };
@@ -794,7 +864,14 @@ pub async fn install<H: RegistryHost>(
         Err(r) => return *r,
     };
     let local_src = body.local_path.as_deref().map(PathBuf::from);
-    let (sel, selected_asset) = match select_install(registry, &entry, local_src.as_deref()) {
+    let accel = match body.accel.as_deref().map(str::parse::<Accel>).transpose() {
+        Ok(accel) => accel,
+        Err(message) => {
+            return error_with_message(StatusCode::BAD_REQUEST, "bad_request", &message);
+        }
+    };
+    let (sel, selected_asset) = match select_install(registry, &entry, local_src.as_deref(), accel)
+    {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -838,9 +915,12 @@ pub async fn update<H: RegistryHost>(
     };
     // Matched by `source`, the same key the listing uses to decide
     // `update_available`, and the same helper, so the two never drift.
-    let installed = {
+    let (installed, installed_accel) = {
         let backends = registry.host.backends().read().await;
-        installed_version_for_source(&backends, &entry.source)
+        (
+            installed_version_for_source(&backends, &entry.source),
+            installed_accel_for_source(&backends, &entry.source),
+        )
     };
     let Some(from_version) = installed else {
         return error(StatusCode::NOT_FOUND, "not_installed");
@@ -860,9 +940,21 @@ pub async fn update<H: RegistryHost>(
         );
     }
 
-    let sel = match select_install(registry, &entry, None) {
-        Ok((sel, _)) => sel,
-        Err(r) => return *r,
+    // The framework installed stays: someone who switched to the Vulkan
+    // build keeps it across an update, rather than being moved back to the
+    // CUDA one the host ranks first. When the new release no longer has a
+    // build for it, the best one it has is the update.
+    let kept = installed_accel.and_then(|accel| {
+        select_install(registry, &entry, None, Some(accel))
+            .ok()
+            .map(|(sel, _)| sel)
+    });
+    let sel = match kept {
+        Some(sel) => sel,
+        None => match select_install(registry, &entry, None, None) {
+            Ok((sel, _)) => sel,
+            Err(r) => return *r,
+        },
     };
 
     let install_id = new_install_id();
@@ -955,11 +1047,12 @@ fn spawn_pipeline<H: RegistryHost>(
                     version,
                 }
             }
-            Err((phase, error)) => RegistryEvent::Failed {
+            Err(failure) => RegistryEvent::Failed {
                 install_id,
                 source,
-                phase,
-                error,
+                phase: failure.phase,
+                error: failure.error,
+                reason: failure.reason,
             },
         };
         publish(&*events, &event);

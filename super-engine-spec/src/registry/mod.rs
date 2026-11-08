@@ -65,6 +65,14 @@ pub struct RegistryBackend<Model> {
     pub secrets: Vec<RegistrySecret>,
     pub options: Vec<RegistryOption>,
     pub compatibility: Compatibility,
+    /// The frameworks this machine can run a build of this backend on, best
+    /// first, each with its build's download size. `selected_asset` is the
+    /// first: the build an install picks when none is asked for. A client
+    /// offering to switch an installed backend to another framework reads the
+    /// download it would cost from here. Empty for a WASM backend, which has
+    /// one build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builds: Vec<Build>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     /// Whether `version` is newer than `installed_version`, decided by the
@@ -134,12 +142,26 @@ pub struct SelectedAsset {
 
 pub use crate::index::IndexStale;
 
+/// One framework a backend has a build for that this machine can run.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Build {
+    /// The framework: `cuda`, `rocm`, `metal`, `vulkan` or `cpu`.
+    pub accel: String,
+    /// The bytes downloading the build takes, every part counted.
+    pub size: u64,
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum InstallRequest {
     BySource {
         source: String,
+        /// The framework to install the build for, one of the listing's
+        /// `builds`. Absent installs the best build this machine can run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accel: Option<String>,
     },
     ByRepoUrl {
         repo_url: String,

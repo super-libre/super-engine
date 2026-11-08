@@ -11,11 +11,13 @@ pub static TEST: ProductSpec = ProductSpec {
     slug: "super-test",
     short_name: "test",
     env_prefix: "SUPER_TEST",
+    former_env_prefixes: &["SUPER_BEFORE"],
     tcp_port: 7308,
     repo: "github.com/example/super-test",
     index_url: "https://example.com/super-test/index.json",
     scopes: &["test", "test_events"],
     topics: &[("test_started", "test_events")],
+    clients: &["super-test-app", "super-test-cli"],
 };
 
 /// A second product, to show two stay apart.
@@ -24,9 +26,11 @@ pub static OTHER: ProductSpec = ProductSpec {
     slug: "super-other",
     short_name: "other",
     env_prefix: "SUPER_OTHER",
+    former_env_prefixes: &[],
     tcp_port: 7309,
     repo: "github.com/example/super-other",
     index_url: "https://example.com/super-other/index.json",
     scopes: &["other", "other_events"],
     topics: &[("other_started", "other_events")],
+    clients: &["super-other-app", "super-other-cli"],
 };
