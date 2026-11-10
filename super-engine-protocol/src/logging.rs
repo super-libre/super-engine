@@ -22,10 +22,27 @@ pub fn init_with(default_level: log::LevelFilter) {
     if std::env::var_os("RUST_LOG").is_some() {
         env_logger::init();
     } else {
-        env_logger::Builder::from_default_env()
-            .filter_level(default_level)
-            .init();
+        quiet_by_default(&mut env_logger::Builder::from_default_env(), default_level).init();
     }
+}
+
+/// Where only warnings and errors are worth reading at the default level.
+/// zbus logs each step of connecting to the session bus at `info`, and the
+/// spans it opens arrive through `tracing`'s bridge as `tracing::span`: a
+/// dozen lines on every start of every binary that uses the bus.
+const QUIET: [&str; 2] = ["zbus", "tracing::span"];
+
+/// `default_level` for everything but [`QUIET`], which says only what went
+/// wrong. `RUST_LOG` brings any of it back, e.g. `RUST_LOG=info,zbus=debug`.
+fn quiet_by_default(
+    builder: &mut env_logger::Builder,
+    default_level: log::LevelFilter,
+) -> &mut env_logger::Builder {
+    builder.filter_level(default_level);
+    for target in QUIET {
+        builder.filter_module(target, default_level.min(log::LevelFilter::Warn));
+    }
+    builder
 }
 
 /// Send stdout and stderr to the file `<PREFIX>_LOG_FILE` names, relative to
@@ -85,5 +102,64 @@ pub fn redirect_stdio(product: &ProductSpec) {
             );
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quiet_by_default;
+    use log::{Level, LevelFilter, Log, Metadata};
+
+    fn enabled(default_level: LevelFilter, target: &str, level: Level) -> bool {
+        quiet_by_default(&mut env_logger::Builder::new(), default_level)
+            .build()
+            .enabled(&Metadata::builder().target(target).level(level).build())
+    }
+
+    #[test]
+    fn zbus_says_only_what_went_wrong() {
+        let handshake = "zbus::connection::handshake::common";
+        assert!(!enabled(LevelFilter::Info, handshake, Level::Info));
+        assert!(!enabled(LevelFilter::Info, "tracing::span", Level::Info));
+        assert!(enabled(LevelFilter::Info, "zbus::connection", Level::Warn));
+    }
+
+    /// `--verbose` raises the default to debug, and zbus stays at warnings.
+    #[test]
+    fn verbose_leaves_zbus_quiet() {
+        assert!(!enabled(
+            LevelFilter::Debug,
+            "zbus::connection",
+            Level::Debug
+        ));
+        assert!(enabled(
+            LevelFilter::Debug,
+            "super_engine_daemon::subprocess",
+            Level::Debug
+        ));
+    }
+
+    #[test]
+    fn everything_else_keeps_the_default_level() {
+        assert!(enabled(
+            LevelFilter::Info,
+            "super_voice_daemon::daemon_main",
+            Level::Info
+        ));
+        assert!(!enabled(
+            LevelFilter::Info,
+            "super_voice_daemon::daemon_main",
+            Level::Debug
+        ));
+    }
+
+    /// A default quieter than warnings quiets zbus as far.
+    #[test]
+    fn a_quieter_default_quiets_zbus_too() {
+        assert!(!enabled(
+            LevelFilter::Error,
+            "zbus::connection",
+            Level::Warn
+        ));
     }
 }
