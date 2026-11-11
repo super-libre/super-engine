@@ -119,15 +119,7 @@ where
             InstallError::Incompatible,
         ));
     };
-    // Every installable entry carries a pinned manifest asset; an entry
-    // without one is not installable.
-    let pin = entry.manifest.as_ref().ok_or_else(|| {
-        InstallFailure::because(
-            P::Installing,
-            InstallError::ManifestInvalid,
-            "the registry lists no backend manifest for it",
-        )
-    })?;
+    let pin = entry.manifest.as_ref();
     let dir_name = crate::registry::install_dir_name(entry);
 
     let staging = p
@@ -139,8 +131,12 @@ where
     }
     // A build of this release that an install of another framework's build
     // replaced was kept: moving it back is the whole install.
-    let toml_text = match kept::find(&p.backends_dir, dir_name, &pin.sha256, &selected).await {
-        Some(kept) => {
+    let kept = match pin {
+        Some(pin) => kept::find(&p.backends_dir, dir_name, &pin.sha256, &selected).await,
+        None => None,
+    };
+    let toml_text = match kept.zip(pin) {
+        Some((kept, pin)) => {
             log::info!(
                 "Installing {} from the build kept at {}; nothing to download",
                 entry.source,
@@ -199,7 +195,7 @@ async fn stage_download<Prod: Product, F>(
     selection: &Selection,
     staging: &Path,
     kind_subdir: bool,
-    pin: &IndexAsset,
+    pin: Option<&IndexAsset>,
 ) -> Result<String, InstallFailure>
 where
     F: Fn(InstallPhase, Option<(u64, Option<u64>)>) + Send + Sync,
@@ -237,8 +233,16 @@ where
     let _ = fs::remove_file(&partial_path).await;
 
     // Install the backend's own manifest — the exact bytes pinned in the index,
-    // verified here and written verbatim. We never trust whatever may have
-    // been packed inside the tarball.
+    // verified here and written verbatim. Every installable entry carries a
+    // pinned manifest asset; an entry without one is not installable. We never
+    // trust whatever may have been packed inside the tarball.
+    let pin = pin.ok_or_else(|| {
+        InstallFailure::because(
+            P::Installing,
+            InstallError::ManifestInvalid,
+            "the registry lists no backend manifest for it",
+        )
+    })?;
     let toml_text = fetch_verified_manifest::<Prod>(&p.http, entry, pin).await?;
     fs::write(staging.join("backend.toml"), &toml_text)
         .await
