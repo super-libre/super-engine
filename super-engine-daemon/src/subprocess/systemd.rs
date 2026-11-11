@@ -366,7 +366,7 @@ pub(super) async fn spawn_sandboxed(s: &Sandbox<'_>) -> Result<Unit> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    warn!("spawned sandboxed backend unit {unit}");
+    info!("spawned sandboxed backend unit {unit}");
     Ok(Unit {
         name: unit,
         stopped: false,
