@@ -26,9 +26,17 @@ use crate::{AfterInstall, Installer, Retired};
 
 /// Run `bin` with `args`, discarding output, returning whether it exited 0.
 /// A spawn failure (binary missing, etc.) also counts as "not ok".
+///
+/// The output goes nowhere: left to the terminal, `pgrep` printed the PIDs
+/// it found and `systemctl` said each retired unit "does not exist", in the
+/// middle of the installer's own lines. Each caller logs its own warning
+/// when a step it cares about fails.
 async fn cmd_ok(bin: &str, args: &[&str]) -> bool {
     tokio::process::Command::new(bin)
         .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .await
         .is_ok_and(|s| s.success())
@@ -478,6 +486,13 @@ mod tests {
             .lines()
             .filter_map(|l| l.trim().parse().ok())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_command_is_ok_only_when_it_exits_zero() {
+        assert!(cmd_ok("sh", &["-c", "echo out; echo err >&2"]).await);
+        assert!(!cmd_ok("sh", &["-c", "echo err >&2; exit 1"]).await);
+        assert!(!cmd_ok("super-engine-no-such-command", &[]).await);
     }
 
     #[test]
