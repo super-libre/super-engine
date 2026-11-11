@@ -212,7 +212,7 @@ impl<M> IndexBackend<M> {
                 .models
                 .into_iter()
                 .map(|md| IndexModel {
-                    product: P::index_model(&md),
+                    product: P::index_model(&m.capabilities.product, &md),
                     name: md.name,
                     provider: String::new(),
                     supported_devices: md

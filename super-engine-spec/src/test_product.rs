@@ -196,7 +196,7 @@ impl Product for TestProduct {
         registry_title: "Test backend registry",
     };
 
-    fn index_model(model: &ModelEntry<Model>) -> IndexModel {
+    fn index_model(_capabilities: &Capabilities, model: &ModelEntry<Model>) -> IndexModel {
         IndexModel {
             role: model.product.role.to_string(),
         }

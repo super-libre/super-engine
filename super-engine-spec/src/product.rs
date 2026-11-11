@@ -65,7 +65,15 @@ pub trait Product: Clone + fmt::Debug + Send + Sync + 'static {
 
     /// The index fields for one model, as the indexer and the daemon's
     /// install paths publish them.
-    fn index_model(model: &ModelEntry<Self::Model>) -> Self::IndexModel;
+    ///
+    /// `capabilities` are the product's `[capabilities]` keys of the backend
+    /// serving the model. They describe the code that serves every model, so a
+    /// product that wants the index to tell a client about one, before the
+    /// backend is installed, says it on the models it applies to.
+    fn index_model(
+        capabilities: &Self::Capabilities,
+        model: &ModelEntry<Self::Model>,
+    ) -> Self::IndexModel;
 }
 
 /// A backend-protocol contract generation: the one thing a manifest declares
