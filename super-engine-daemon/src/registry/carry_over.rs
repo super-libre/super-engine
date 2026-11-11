@@ -140,8 +140,9 @@ fn survivors_of<P: Product>(
 ///
 /// A destination missing under `from_dir` is skipped, and one that already
 /// exists under `to_dir` is left alone — the staged copy is the newer one.
-/// Both directories live under the backends directory, so these are
-/// same-filesystem renames: constant-time, with no multi-gigabyte copy.
+/// Each file's verified stamp moves with it. Both directories live under the
+/// backends directory, so these are same-filesystem renames: constant-time,
+/// with no multi-gigabyte copy.
 ///
 /// Destinations are moved one at a time with no rollback. If an error occurs
 /// partway through — a permissions failure, a full disk — the destinations
@@ -210,6 +211,15 @@ pub async fn carry(
             )
         })?;
         moved += meta.len();
+        // The file's verified stamp goes with it, or the next load hashes
+        // every byte again to reach the answer the stamp already holds. A
+        // rename keeps the mtime the stamp was written against. Best effort:
+        // a stamp left behind costs that hash and nothing else.
+        let _ = fs::rename(
+            crate::download::stamp_path(&src),
+            crate::download::stamp_path(&dst),
+        )
+        .await;
     }
     Ok(moved)
 }
@@ -447,6 +457,36 @@ mod tests {
             !from.path().join("models/m/a.bin").exists(),
             "moved, not copied"
         );
+    }
+
+    /// A file's verified stamp moves with it, so the next load does not hash
+    /// the file again. A file with no stamp moves all the same.
+    #[tokio::test]
+    async fn carry_moves_each_files_verified_stamp_with_it() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(from.path().join("models/m")).unwrap();
+        std::fs::write(from.path().join("models/m/a.bin"), b"aaaa").unwrap();
+        std::fs::write(from.path().join("models/m/.a.bin.verified"), b"{}").unwrap();
+        std::fs::write(from.path().join("models/m/b.bin"), b"bb").unwrap();
+
+        let moved = carry(
+            from.path(),
+            to.path(),
+            &["models/m/a.bin".to_string(), "models/m/b.bin".to_string()],
+        )
+        .await
+        .expect("carry succeeds");
+
+        assert_eq!(moved, 6, "the stamp's bytes are not counted");
+        assert_eq!(
+            std::fs::read(to.path().join("models/m/.a.bin.verified")).unwrap(),
+            b"{}"
+        );
+        assert!(!from.path().join("models/m/.a.bin.verified").exists());
+        assert!(to.path().join("models/m/b.bin").exists());
+        assert!(!to.path().join("models/m/.b.bin.verified").exists());
     }
 
     /// `carry` has no rollback: a failure partway through must leave earlier
