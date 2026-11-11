@@ -120,7 +120,7 @@ pub struct Compatibility {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedAsset {
     pub target: String,
     /// Acceleration backends the selected build carries. A single entry is
@@ -150,6 +150,11 @@ pub struct Build {
     pub accel: String,
     /// The bytes downloading the build takes, every part counted.
     pub size: u64,
+    /// Whether the build is on this machine already: the one installed, or
+    /// one an earlier install of another framework's build replaced and the
+    /// daemon kept. Installing it downloads nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_disk: bool,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

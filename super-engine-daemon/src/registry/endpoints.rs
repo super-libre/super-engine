@@ -244,6 +244,7 @@ pub async fn list<H: RegistryHost>(registry: &Registry<H>, query: &ListQuery) ->
 
     let daemon = registry.host.daemon();
     let host = host::detect();
+    let backends_dir = registry.host.backends_dir().await;
     let backends = registry.host.backends().read().await;
 
     let mut result = Vec::new();
@@ -271,7 +272,7 @@ pub async fn list<H: RegistryHost>(registry: &Registry<H>, query: &ListQuery) ->
             compatibility,
             installed_version_for_source(&backends, &entry.source),
         );
-        listed.builds = builds::<H::Product>(&daemon, &host, entry);
+        listed.builds = builds::<H::Product>(&daemon, &host, entry, &backends_dir).await;
         result.push(listed);
     }
 
@@ -314,26 +315,33 @@ fn passes_filters<M>(entry: &IndexBackend<M>, query: &ListQuery) -> bool {
 }
 
 /// The frameworks `host` can run a build of `entry` on, best first, with the
-/// download each one's build takes.
-fn builds<P: Product>(
+/// download each one's build takes, and whether it is on disk already (see
+/// [`super::kept`]).
+async fn builds<P: Product>(
     daemon: &Daemon,
     host: &Host,
     entry: &IndexBackend<P::IndexModel>,
+    backends_dir: &Path,
 ) -> Vec<Build> {
-    compat::runnable_index_accels(host, &entry.assets.subprocess)
-        .into_iter()
-        .filter_map(|accel| {
-            let Selection::Subprocess { index } =
-                compat::select_accel::<P>(daemon, host, entry, accel)
-            else {
-                return None;
-            };
-            Some(Build {
-                accel: accel.to_string(),
-                size: asset_size(&entry.assets.subprocess[index]),
-            })
-        })
-        .collect()
+    let dir_name = install_dir_name(entry);
+    let pin = entry.manifest.as_ref().map_or("", |m| m.sha256.as_str());
+    let mut builds = Vec::new();
+    for accel in compat::runnable_index_accels(host, &entry.assets.subprocess) {
+        let sel = compat::select_accel::<P>(daemon, host, entry, accel);
+        let Selection::Subprocess { index } = sel else {
+            continue;
+        };
+        let on_disk = match compat::to_selected_asset(entry, &sel) {
+            Some(asset) => super::kept::on_disk(backends_dir, dir_name, pin, &asset).await,
+            None => false,
+        };
+        builds.push(Build {
+            accel: accel.to_string(),
+            size: asset_size(&entry.assets.subprocess[index]),
+            on_disk,
+        });
+    }
+    builds
 }
 
 /// The bytes downloading `asset` takes: its one file, or every part.

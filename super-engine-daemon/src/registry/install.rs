@@ -17,6 +17,7 @@ use tokio::fs;
 
 use crate::download_stream::{StreamError, stream_body_to_writer};
 use crate::registry::compat::{self, Selection};
+use crate::registry::kept;
 use super_engine_spec::verify::{
     MAX_MANIFEST_BYTES, sha256_matches, tar_budget_step, tar_entry_unsafe_reason, unpack_cap,
 };
@@ -111,6 +112,100 @@ where
         }
     };
 
+    // A selection that names no asset of the entry has nothing to install.
+    let Some(selected) = compat::to_selected_asset(entry, selection) else {
+        return Err(InstallFailure::new(
+            P::Resolving,
+            InstallError::Incompatible,
+        ));
+    };
+    // Every installable entry carries a pinned manifest asset; an entry
+    // without one is not installable.
+    let pin = entry.manifest.as_ref().ok_or_else(|| {
+        InstallFailure::because(
+            P::Installing,
+            InstallError::ManifestInvalid,
+            "the registry lists no backend manifest for it",
+        )
+    })?;
+    let dir_name = crate::registry::install_dir_name(entry);
+
+    let staging = p
+        .backends_dir
+        .join(STAGING_DIR_NAME)
+        .join(format!("{dir_name}-{}", entry.version));
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging).await;
+    }
+    // A build of this release that an install of another framework's build
+    // replaced was kept: moving it back is the whole install.
+    let toml_text = match kept::find(&p.backends_dir, dir_name, &pin.sha256, &selected).await {
+        Some(kept) => {
+            log::info!(
+                "Installing {} from the build kept at {}; nothing to download",
+                entry.source,
+                kept.display()
+            );
+            // From here the build is in staging: an install that fails
+            // after this loses the kept copy, and the next one downloads it.
+            stage_kept::<Prod>(&kept, &staging, entry, pin).await?
+        }
+        None => stage_download::<Prod, F>(p, entry, selection, &staging, kind_subdir, pin).await?,
+    };
+
+    // Record which variant this is. `backend.toml` lists them all, so without
+    // this the daemon cannot tell a CUDA install from a CPU one after the fact.
+    crate::registry::installed::write(&staging, &selected)
+        .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
+
+    (p.on_progress)(P::Installing, None);
+    let final_path = p.backends_dir.join(dir_name);
+    // Before anything else touches the filesystem outside `staging`: the
+    // swap below replaces whatever sits at `final_path`, and `preserve_models`
+    // moves model files out of the directory currently serving this `source`.
+    // Bailing here leaves both of those untouched.
+    ensure_dir_free_for::<Prod>(&final_path, &entry.source)?;
+    let inherit_from = previous_dir_for::<Prod>(&p.backends_dir, &entry.source)
+        .await
+        .unwrap_or_else(|| final_path.clone());
+    preserve_models::<Prod>(&staging, &inherit_from)
+        .await
+        .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
+    // The build this replaces is kept when it is another framework's build of
+    // the same release, so a switch back downloads nothing.
+    let keep_to = kept::keep_destination(
+        &p.backends_dir,
+        dir_name,
+        &final_path,
+        toml_text.as_bytes(),
+        &selected,
+    )
+    .await;
+    swap_into_place(&staging, &final_path, keep_to.as_deref())
+        .await
+        .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
+    kept::prune(&p.backends_dir, dir_name, toml_text.as_bytes()).await;
+
+    (p.on_progress)(P::Rescanning, None);
+    Ok(entry.version.clone())
+}
+
+/// Download and verify the build `selection` names, unpack it into
+/// `staging`, and write the backend's own manifest beside it, returning the
+/// manifest's text.
+async fn stage_download<Prod: Product, F>(
+    p: &Pipeline<F>,
+    entry: &IndexBackend<Prod::IndexModel>,
+    selection: &Selection,
+    staging: &Path,
+    kind_subdir: bool,
+    pin: &IndexAsset,
+) -> Result<String, InstallFailure>
+where
+    F: Fn(InstallPhase, Option<(u64, Option<u64>)>) + Send + Sync,
+{
+    use InstallPhase as P;
+
     let partial_name = format!(
         "{}-{}.{}.partial",
         entry.id,
@@ -128,71 +223,47 @@ where
     download_and_verify(p, entry, selection, &partial_path).await?;
 
     (p.on_progress)(P::Extracting, None);
-    let staging = p.backends_dir.join(STAGING_DIR_NAME).join(format!(
-        "{}-{}",
-        crate::registry::install_dir_name(entry),
-        entry.version
-    ));
-    if staging.exists() {
-        let _ = fs::remove_dir_all(&staging).await;
-    }
-    fs::create_dir_all(&staging)
+    fs::create_dir_all(staging)
         .await
         .map_err(|e| PipelineError::Io(e).as_typed(P::Extracting))?;
     if kind_subdir {
-        extract_tarball(&partial_path, &staging).map_err(|e| e.as_typed(P::Extracting))?;
+        extract_tarball(&partial_path, staging).map_err(|e| e.as_typed(P::Extracting))?;
     } else {
         let dest = staging.join(&entry.entrypoint);
         fs::copy(&partial_path, &dest)
             .await
             .map_err(|e| PipelineError::Io(e).as_typed(P::Extracting))?;
     }
-
-    // Install the backend's own manifest — the exact bytes pinned in the index,
-    // verified here and written verbatim. Every installable entry carries a
-    // pinned manifest asset; an entry without one is not installable. We never
-    // trust whatever may have been packed inside the tarball.
-    let pin = entry.manifest.as_ref().ok_or_else(|| {
-        InstallFailure::because(
-            P::Installing,
-            InstallError::ManifestInvalid,
-            "the registry lists no backend manifest for it",
-        )
-    })?;
-    let toml_text = fetch_verified_manifest::<Prod>(&p.http, entry, pin).await?;
-    fs::write(staging.join("backend.toml"), toml_text)
-        .await
-        .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
-
-    // Record which variant this is. `backend.toml` lists them all, so without
-    // this the daemon cannot tell a CUDA install from a CPU one after the fact.
-    if let Some(selected) = compat::to_selected_asset(entry, selection) {
-        crate::registry::installed::write(&staging, &selected)
-            .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
-    }
-
-    (p.on_progress)(P::Installing, None);
-    let final_path = p
-        .backends_dir
-        .join(crate::registry::install_dir_name(entry));
-    // Before anything else touches the filesystem outside `staging`: the
-    // swap below replaces whatever sits at `final_path`, and `preserve_models`
-    // moves model files out of the directory currently serving this `source`.
-    // Bailing here leaves both of those untouched.
-    ensure_dir_free_for::<Prod>(&final_path, &entry.source)?;
-    let inherit_from = previous_dir_for::<Prod>(&p.backends_dir, &entry.source)
-        .await
-        .unwrap_or_else(|| final_path.clone());
-    preserve_models::<Prod>(&staging, &inherit_from)
-        .await
-        .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
-    swap_into_place(&staging, &final_path)
-        .await
-        .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
     let _ = fs::remove_file(&partial_path).await;
 
-    (p.on_progress)(P::Rescanning, None);
-    Ok(entry.version.clone())
+    // Install the backend's own manifest — the exact bytes pinned in the index,
+    // verified here and written verbatim. We never trust whatever may have
+    // been packed inside the tarball.
+    let toml_text = fetch_verified_manifest::<Prod>(&p.http, entry, pin).await?;
+    fs::write(staging.join("backend.toml"), &toml_text)
+        .await
+        .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
+    Ok(toml_text)
+}
+
+/// Move the kept build at `kept` into `staging`, returning its manifest's
+/// text. [`kept::find`] matched that manifest to the pin already; it is held
+/// to the rest of what a downloaded one is held to here.
+async fn stage_kept<Prod: Product>(
+    kept: &Path,
+    staging: &Path,
+    entry: &IndexBackend<Prod::IndexModel>,
+    pin: &IndexAsset,
+) -> Result<String, InstallFailure> {
+    use InstallPhase as P;
+    let io = |e| PipelineError::Io(e).as_typed(P::Installing);
+
+    if let Some(parent) = staging.parent() {
+        fs::create_dir_all(parent).await.map_err(io)?;
+    }
+    fs::rename(kept, staging).await.map_err(io)?;
+    let bytes = fs::read(staging.join("backend.toml")).await.map_err(io)?;
+    verify_manifest_bytes::<Prod>(&bytes, &pin.sha256, entry)
 }
 
 /// Download the artifact `selection` names into `partial_path` and verify its
@@ -332,7 +403,7 @@ where
     preserve_models::<Prod>(&staging, &inherit_from)
         .await
         .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
-    swap_into_place(&staging, &final_path)
+    swap_into_place(&staging, &final_path, None)
         .await
         .map_err(|e| PipelineError::Io(e).as_typed(P::Installing))?;
 
@@ -560,6 +631,13 @@ pub async fn retire_previous_dir<Prod: Product>(
             dir.display()
         ),
     }
+    // Builds kept under the old name are of the release it held, not the one
+    // installed now.
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str())
+        && let Err(e) = kept::remove_all(backends_dir, name).await
+    {
+        log::warn!("Could not drop the builds kept for {}: {e}", dir.display());
+    }
     Some(dir)
 }
 
@@ -659,9 +737,14 @@ fn ensure_dir_free_for<Prod: Product>(
 
 /// Move `staging` into `final_path` as atomically as the filesystem allows:
 /// move any existing dir aside to a `.old` sidecar, rename staging into place,
-/// then delete the sidecar. A crash mid-swap leaves at most a recoverable
+/// then delete the sidecar, or move it to `keep_to` when the build it holds is
+/// kept ([`kept`]). A crash mid-swap leaves at most a recoverable
 /// `<final>.old` rather than a missing backend; a rename failure rolls back.
-async fn swap_into_place(staging: &Path, final_path: &Path) -> std::io::Result<()> {
+async fn swap_into_place(
+    staging: &Path,
+    final_path: &Path,
+    keep_to: Option<&Path>,
+) -> std::io::Result<()> {
     let mut sidecar_os = final_path.as_os_str().to_owned();
     sidecar_os.push(".old");
     let sidecar = PathBuf::from(sidecar_os);
@@ -677,7 +760,7 @@ async fn swap_into_place(staging: &Path, final_path: &Path) -> std::io::Result<(
     match fs::rename(staging, final_path).await {
         Ok(()) => {
             if moved_aside {
-                let _ = fs::remove_dir_all(&sidecar).await;
+                retire_sidecar(&sidecar, keep_to).await;
             }
             Ok(())
         }
@@ -688,6 +771,30 @@ async fn swap_into_place(staging: &Path, final_path: &Path) -> std::io::Result<(
             Err(e)
         }
     }
+}
+
+/// Dispose of the directory a swap moved aside: keep it at `keep_to`, or
+/// delete it. A build that cannot be kept is deleted; keeping it only saves a
+/// download later.
+async fn retire_sidecar(sidecar: &Path, keep_to: Option<&Path>) {
+    if let Some(keep_to) = keep_to {
+        let _ = fs::remove_dir_all(keep_to).await; // an older copy of the same build
+        let kept = match keep_to.parent() {
+            Some(parent) => fs::create_dir_all(parent).await,
+            None => Ok(()),
+        };
+        match kept.and(fs::rename(sidecar, keep_to).await) {
+            Ok(()) => {
+                log::info!("Kept the replaced build at {}", keep_to.display());
+                return;
+            }
+            Err(e) => log::warn!(
+                "Could not keep the replaced build at {}: {e}",
+                keep_to.display()
+            ),
+        }
+    }
+    let _ = fs::remove_dir_all(sidecar).await;
 }
 
 async fn stream_download<F>(
@@ -978,7 +1085,7 @@ async fn download_manifest_bytes(
 mod tests {
     use super::*;
     use crate::registry::install_dir_name;
-    use super_engine_spec::index::IndexAssets;
+    use super_engine_spec::index::{IndexAssets, IndexSubprocessAsset};
     use super_engine_spec::test_product::{self, TestProduct};
 
     type IndexBackend = super_engine_spec::index::IndexBackend<test_product::IndexModel>;
@@ -1846,6 +1953,141 @@ supported_devices = ["cpu"]
         );
     }
 
+    /// A release tarball holding one file, `y`, whose contents say which
+    /// build it is.
+    fn build_tarball(contents: &[u8]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, "y", contents).unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// Moving to another framework's build and back: the first build is kept
+    /// when the second replaces it, and installing it again moves it back
+    /// rather than downloading it. The models follow whichever build is in.
+    #[tokio::test]
+    async fn a_build_replaced_by_another_frameworks_is_kept_and_installed_again_from_disk() {
+        super_engine_forge::install_crypto_provider();
+        let root = tempfile::tempdir().unwrap();
+        let backends_dir = root.path().join("backends");
+        let manifest = r#"
+[backend]
+source = "github.com/x/y"
+id = "app.example.y"
+name = "Y"
+version = "1.0.0"
+kind = "subprocess"
+entrypoint = "y"
+contract = "v1"
+description = "Test backend."
+
+[[models]]
+name = "m"
+primary_language = "en"
+supported_languages = ["en"]
+supported_devices = ["cpu", "gpu"]
+files = [
+    { url = "https://h/a.bin", destination = "models/m/a.bin" },
+]
+"#;
+        let (cuda, vulkan) = (build_tarball(b"cuda build"), build_tarball(b"vulkan build"));
+        let mut server = mockito::Server::new_async().await;
+        // Each build is downloaded once, and the manifest once per download.
+        let cuda_mock = server
+            .mock("GET", "/cuda.tar.gz")
+            .with_body(cuda.as_slice())
+            .expect(1)
+            .create_async()
+            .await;
+        let vulkan_mock = server
+            .mock("GET", "/vulkan.tar.gz")
+            .with_body(vulkan.as_slice())
+            .expect(1)
+            .create_async()
+            .await;
+        let manifest_mock = server
+            .mock("GET", "/backend.toml")
+            .with_body(manifest)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let asset = |accel: &str, cuda_major: Option<u32>, bytes: &[u8]| IndexSubprocessAsset {
+            target: "x86_64-unknown-linux-gnu".into(),
+            accel: vec![accel.into()],
+            cuda_major,
+            cuda_sm: None,
+            cudnn: false,
+            gfx: vec![],
+            vulkan_api: None,
+            url: Some(format!("{}/{accel}.tar.gz", server.url())),
+            size: Some(bytes.len() as u64),
+            sha256: Some(sha_hex(bytes)),
+            parts: vec![],
+        };
+        let mut entry = minimal_entry();
+        entry.id = "y".into();
+        entry.backend_id = Some("app.example.y".into());
+        entry.entrypoint = "y".into();
+        entry.assets.subprocess = vec![
+            asset("cuda", Some(13), &cuda),
+            asset("vulkan", None, &vulkan),
+        ];
+        entry.manifest = Some(IndexAsset {
+            url: format!("{}/backend.toml", server.url()),
+            size: manifest.len() as u64,
+            sha256: sha_hex(manifest.as_bytes()),
+        });
+        let pipeline = Pipeline {
+            backends_dir: backends_dir.clone(),
+            cache_dir: root.path().join("cache"),
+            http: reqwest::Client::new(),
+            on_progress: Arc::new(|_, _| {}),
+        };
+        let install = |index| {
+            let (pipeline, entry) = (&pipeline, &entry);
+            async move {
+                run::<TestProduct, _>(pipeline, entry, &Selection::Subprocess { index })
+                    .await
+                    .expect("installs")
+            }
+        };
+        let installed = backends_dir.join("app.example.y");
+        let kept = backends_dir.join(".builds/app.example.y");
+
+        install(0).await;
+        std::fs::create_dir_all(installed.join("models/m")).unwrap();
+        std::fs::write(installed.join("models/m/a.bin"), b"weights").unwrap();
+
+        install(1).await;
+        assert_eq!(std::fs::read(installed.join("y")).unwrap(), b"vulkan build");
+        assert_eq!(
+            std::fs::read(kept.join("cuda-cuda13/y")).unwrap(),
+            b"cuda build",
+            "the CUDA build is kept"
+        );
+        assert!(installed.join("models/m/a.bin").exists());
+        assert!(!kept.join("cuda-cuda13/models/m/a.bin").exists());
+
+        install(0).await;
+        assert_eq!(std::fs::read(installed.join("y")).unwrap(), b"cuda build");
+        assert!(!kept.join("cuda-cuda13").exists(), "moved back, not copied");
+        assert_eq!(
+            std::fs::read(kept.join("vulkan/y")).unwrap(),
+            b"vulkan build",
+            "the Vulkan build is kept in turn"
+        );
+        assert!(installed.join("models/m/a.bin").exists());
+
+        cuda_mock.assert_async().await;
+        vulkan_mock.assert_async().await;
+        manifest_mock.assert_async().await;
+    }
+
     #[tokio::test]
     async fn retire_previous_dir_removes_the_superseded_directory() {
         let root = tempfile::tempdir().unwrap();
@@ -2109,7 +2351,7 @@ description = "Test backend."
         std::fs::create_dir_all(&final_path).unwrap();
         std::fs::write(final_path.join("old.txt"), b"old").unwrap();
 
-        swap_into_place(&staging, &final_path).await.unwrap();
+        swap_into_place(&staging, &final_path, None).await.unwrap();
 
         assert!(final_path.join("new.txt").exists());
         assert!(!final_path.join("old.txt").exists());
