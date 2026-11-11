@@ -89,12 +89,13 @@ fn registry_at(host: TestHost, index_url: &str, cache: &Path) -> Registry<TestHo
     )
 }
 
-/// A `wasm` entry for `source` at `version`; with `asset`, one any host can
-/// install.
+/// A `wasm` entry for `source` at `version`, with the backend id the registry
+/// requires; with `asset`, one any host can install.
 fn wasm_entry(source: &str, version: &str, asset: bool) -> IndexBackend<IndexModel> {
+    let key = source.rsplit('/').next().unwrap_or(source).to_owned();
     IndexBackend {
-        id: source.rsplit('/').next().unwrap_or(source).to_owned(),
-        backend_id: None,
+        backend_id: Some(format!("app.example.{key}")),
+        id: key,
         source: source.to_owned(),
         version: version.to_owned(),
         tag: format!("v{version}"),

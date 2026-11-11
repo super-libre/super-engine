@@ -19,7 +19,6 @@ use super_engine_spec::test_product::TestProduct;
 const INDEXER: Indexer = Indexer {
     name: "indexer",
     user_agent: "super-engine-indexer-tests",
-    grandfathered: &[],
 };
 
 /// Run the indexer with `args` after its name, as its binary would.

@@ -14,15 +14,9 @@ use crate::forge::Forge;
 pub struct Entry {
     /// Reverse-DNS identifier for the backend, e.g. `com.example.backend`.
     /// Must equal the `[backend].id` of the release manifest this entry points
-    /// at. Required — the generated `registry.schema.json` says so, and the
-    /// indexer refuses an entry without one.
-    ///
-    /// `Option` only because some entries predate the requirement and their
-    /// published manifests declare no `[backend].id` to match against. A
-    /// product's indexer tolerates exactly those so its catalog keeps
-    /// building; the schema flags them, which is the backlog.
-    #[serde(default)]
-    pub id: Option<String>,
+    /// at, which names the directory the backend installs into. Required of
+    /// every entry: the indexer pins each release to it.
+    pub id: String,
     /// Repository hosting the backend, as `<host>/<owner>/<repo>` (e.g.
     /// `github.com/<owner>/<repo>`). The indexer queries this repo's releases
     /// to discover versions.

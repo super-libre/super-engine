@@ -63,11 +63,12 @@ pub fn warn_if_client_too_old<M>(index: &Index<M>, product: &ProductSpec, curren
 /// such values, so a stray one — e.g. from a poisoned `<PREFIX>_REGISTRY_URL`
 /// — is sanitized here rather than failing the whole index.
 ///
-/// `backend_id` is optional and its absence has a well-defined meaning (fall
-/// back to the registry key), so a rejected value is cleared to `None` rather
-/// than dropping the backend over it. `id` and `entrypoint` are required and
-/// have no such fallback, so an entry with an unsafe one of those is dropped
-/// outright.
+/// Every registry entry must carry a valid `backend_id`: the registry requires
+/// an `id`, and it names the directory the backend installs into. An entry
+/// without one, or with one that breaks the format, is dropped like an entry
+/// with an unsafe `id` or `entrypoint`, rather than installed under its
+/// registry key. A well-formed index has none; an index built before the
+/// requirement, or a poisoned one, might.
 ///
 /// `backend_id` is held to the full `[backend].id` format rule
 /// ([`super_engine_spec::backend_id::is_valid`]) rather than to
@@ -79,18 +80,19 @@ pub fn warn_if_client_too_old<M>(index: &Index<M>, product: &ProductSpec, curren
 /// staging root every install stages through.
 pub fn retain_safe_backends<M>(index: &mut Index<M>) {
     use super_engine_spec::{is_safe_component, is_safe_relative_path};
-    for b in &mut index.backends {
-        if let Some(id) = b.backend_id.as_deref()
-            && !super_engine_spec::backend_id::is_valid(id)
+    index.backends.retain(|b| {
+        if !b
+            .backend_id
+            .as_deref()
+            .is_some_and(super_engine_spec::backend_id::is_valid)
         {
             log::warn!(
-                "registry: clearing backend `{}` malformed backend_id {id:?}",
-                b.id
+                "registry: dropping backend `{}` with a missing or malformed backend_id {:?}",
+                b.id,
+                b.backend_id
             );
-            b.backend_id = None;
+            return false;
         }
-    }
-    index.backends.retain(|b| {
         let ok = is_safe_component(&b.id) && is_safe_relative_path(&b.entrypoint);
         if !ok {
             log::warn!(
@@ -190,12 +192,10 @@ mod tests {
     }
 
     /// `backend_id` arrives over the network via `index.json`. An unsafe value
-    /// (here, path traversal) must not survive to reach the install pipeline —
-    /// but the entry itself, whose required `id`/`entrypoint` are fine, must
-    /// not be dropped over it: the field is optional and clearing it just
-    /// falls back to the registry key.
+    /// (here, path traversal) must not reach the install pipeline, and with no
+    /// fallback to install under, the entry goes with it.
     #[test]
-    fn retain_safe_backends_clears_an_unsafe_backend_id_but_keeps_the_entry() {
+    fn retain_safe_backends_drops_an_entry_with_an_unsafe_backend_id() {
         let mut index = Index {
             schema_version: 1,
             generated_at: "now".into(),
@@ -203,22 +203,34 @@ mod tests {
             backends: vec![safe_backend("example", Some("../../../../home/jorge/.ssh"))],
         };
         retain_safe_backends(&mut index);
-        assert_eq!(index.backends.len(), 1, "the entry itself must survive");
-        assert_eq!(index.backends[0].id, "example");
-        assert!(
-            index.backends[0].backend_id.is_none(),
-            "an unsafe backend_id must be cleared, not passed through"
-        );
+        assert!(index.backends.is_empty());
+    }
+
+    /// The registry requires an `id` of every entry, so an entry without a
+    /// `backend_id` is not installed under its registry key: it is dropped.
+    #[test]
+    fn retain_safe_backends_drops_an_entry_without_a_backend_id() {
+        let mut index = Index {
+            schema_version: 1,
+            generated_at: "now".into(),
+            min_client: "0.1.0".into(),
+            backends: vec![
+                safe_backend("old", None),
+                safe_backend("new", Some("com.example.new")),
+            ],
+        };
+        retain_safe_backends(&mut index);
+        assert_eq!(index.backends.len(), 1);
+        assert_eq!(index.backends[0].id, "new");
     }
 
     /// `.staging` passes a component-level safety check but names the shared
     /// staging root every install stages through, so an index that published
     /// it would resolve an install directory onto that root. The boundary
     /// holds `backend_id` to the `[backend].id` format rule, which rejects
-    /// it — and the entry itself still survives, falling back to its
-    /// registry key.
+    /// it, and the entry with it.
     #[test]
-    fn retain_safe_backends_clears_the_shared_staging_root_as_a_backend_id() {
+    fn retain_safe_backends_drops_the_shared_staging_root_as_a_backend_id() {
         assert!(
             super_engine_spec::is_safe_component(".staging"),
             "the premise: a component-level check accepts .staging"
@@ -230,9 +242,8 @@ mod tests {
             backends: vec![safe_backend("example", Some(".staging"))],
         };
         retain_safe_backends(&mut index);
-        assert_eq!(index.backends.len(), 1, "the entry itself must survive");
         assert!(
-            index.backends[0].backend_id.is_none(),
+            index.backends.is_empty(),
             ".staging must never reach the install pipeline as a directory name"
         );
     }
@@ -241,7 +252,7 @@ mod tests {
     /// `Manifest::parse`, which enforces the `[backend].id` format. This
     /// boundary must not be more lenient than the daemon's own contract.
     #[test]
-    fn retain_safe_backends_clears_a_malformed_backend_id() {
+    fn retain_safe_backends_drops_an_entry_with_a_malformed_backend_id() {
         for malformed in ["example", "com.backend", "com.example_x.backend", "APP.X.Y"] {
             let mut index = Index {
                 schema_version: 1,
@@ -251,8 +262,8 @@ mod tests {
             };
             retain_safe_backends(&mut index);
             assert!(
-                index.backends[0].backend_id.is_none(),
-                "malformed backend_id {malformed:?} must be cleared"
+                index.backends.is_empty(),
+                "an entry with malformed backend_id {malformed:?} must be dropped"
             );
         }
     }
@@ -272,16 +283,15 @@ mod tests {
         );
     }
 
-    /// Pre-existing behavior, now under explicit test: an unsafe `id` or
-    /// `entrypoint` drops the whole entry, since `id` is required and has no
-    /// well-defined fallback the way `backend_id` does.
+    /// An unsafe `id` or `entrypoint` drops the whole entry, however good its
+    /// `backend_id`.
     #[test]
     fn retain_safe_backends_still_drops_an_entry_with_an_unsafe_id() {
         let mut index = Index {
             schema_version: 1,
             generated_at: "now".into(),
             min_client: "0.1.0".into(),
-            backends: vec![safe_backend("../evil", None)],
+            backends: vec![safe_backend("../evil", Some("com.example.evil"))],
         };
         retain_safe_backends(&mut index);
         assert!(index.backends.is_empty());

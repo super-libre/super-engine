@@ -26,8 +26,6 @@ pub enum ParseError {
         "entries `{a}` and `{b}` share repo `{repo}` and one `tag_prefix` is a prefix of the other"
     )]
     PrefixOverlap { a: String, b: String, repo: String },
-    #[error("entry `{key}` must declare an `id` (see registry/README.md)")]
-    MissingId { key: String },
     #[error("entry `{key}`: `id = {id:?}` is not a valid reverse-DNS id")]
     InvalidId { key: String, id: String },
     #[error("entries `{a}` and `{b}` both declare `id = {id:?}`")]
@@ -40,23 +38,18 @@ pub enum ParseError {
 pub struct Registry(pub BTreeMap<String, Entry>);
 
 impl Registry {
-    /// Parse and validate a registry file.
-    ///
-    /// Every entry must declare an `id`, except those whose key is in
-    /// `grandfathered`: entries that predate the requirement and are still
-    /// being migrated. A product lists its own, with the reason each is
-    /// there; a registry that has none passes `&[]`.
+    /// Parse and validate a registry file. Every entry must declare an `id`.
     ///
     /// # Errors
     /// The first entry, or pair of entries, that breaks a rule.
-    pub fn parse(input: &str, grandfathered: &[&str]) -> Result<Self, ParseError> {
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
         let raw: BTreeMap<String, Entry> = toml::from_str(input)?;
         for (id, e) in &raw {
-            validate_entry(id, e, grandfathered)?;
+            validate_entry(id, e)?;
         }
         let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
         for (key, e) in &raw {
-            let Some(id) = e.id.as_deref() else { continue };
+            let id = e.id.as_str();
             if let Some(prev) = seen.insert(id, key) {
                 return Err(ParseError::DuplicateId {
                     a: prev.to_string(),
@@ -70,7 +63,7 @@ impl Registry {
     }
 }
 
-fn validate_entry(id_key: &str, e: &Entry, grandfathered: &[&str]) -> Result<(), ParseError> {
+fn validate_entry(id_key: &str, e: &Entry) -> Result<(), ParseError> {
     if !id_key
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
@@ -94,17 +87,11 @@ fn validate_entry(id_key: &str, e: &Entry, grandfathered: &[&str]) -> Result<(),
             reason: format!("`subdir = {sd:?}` is not a safe relative path"),
         });
     }
-    match &e.id {
-        Some(id) if !super_engine_spec::backend_id::is_valid(id) => {
-            return Err(ParseError::InvalidId {
-                key: id_key.into(),
-                id: id.clone(),
-            });
-        }
-        None if !grandfathered.contains(&id_key) => {
-            return Err(ParseError::MissingId { key: id_key.into() });
-        }
-        _ => {}
+    if !super_engine_spec::backend_id::is_valid(&e.id) {
+        return Err(ParseError::InvalidId {
+            key: id_key.into(),
+            id: e.id.clone(),
+        });
     }
     Ok(())
 }
@@ -174,7 +161,6 @@ mod tests {
             subdir = "backends/openai"
             tag_prefix = "openai-"
         "#,
-            &[],
         )
         .unwrap();
         let e = r.0.get("openai").unwrap();
@@ -188,11 +174,11 @@ mod tests {
         let err = Registry::parse(
             r#"
             [bad]
+            id = "com.example.bad"
             repo = "github.com/x/y"
             forge = "github"
             subdir = "../escape"
         "#,
-            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::Entry { .. }));
@@ -206,9 +192,8 @@ mod tests {
         for bad in ["a//b", "./x", "models/", "a/../b"] {
             let err = Registry::parse(
                 &format!(
-                    "[bad]\nrepo = \"github.com/x/y\"\nforge = \"github\"\nsubdir = \"{bad}\"\n"
+                    "[bad]\nid = \"com.example.bad\"\nrepo = \"github.com/x/y\"\nforge = \"github\"\nsubdir = \"{bad}\"\n"
                 ),
-                &[],
             )
             .unwrap_err();
             assert!(
@@ -218,7 +203,6 @@ mod tests {
         }
         let ok = Registry::parse(
             "[good]\nid = \"com.example.good\"\nrepo = \"github.com/x/y\"\nforge = \"github\"\nsubdir = \"my..backend/v2\"\n",
-            &[],
         )
         .unwrap();
         assert_eq!(
@@ -240,7 +224,6 @@ mod tests {
             repo = "github.com/x/mono"
             forge = "github"
         "#,
-            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::MonorepoMissingPrefix { .. }));
@@ -261,7 +244,6 @@ mod tests {
             forge = "github"
             tag_prefix = "v"
         "#,
-            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::PrefixCollision { .. }));
@@ -282,7 +264,6 @@ mod tests {
             forge = "github"
             tag_prefix = "big-mini-"
         "#,
-            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::PrefixOverlap { .. }));
@@ -303,7 +284,6 @@ mod tests {
             forge = "github"
             tag_prefix = "b-"
         "#,
-            &[],
         )
         .unwrap();
         assert_eq!(r.0.len(), 2);
@@ -324,7 +304,6 @@ mod tests {
             forge = "github"
             removed = true
         "#,
-            &[],
         )
         .unwrap();
         assert_eq!(r.0.len(), 2);
@@ -344,34 +323,24 @@ mod id_tests {
 
     #[test]
     fn accepts_a_new_entry_with_a_valid_unique_id() {
-        let r = Registry::parse(NEW_ENTRY, &[]).expect("parses");
-        assert_eq!(
-            r.0["brand-new"].id.as_deref(),
-            Some("com.example.brand-new")
-        );
+        let r = Registry::parse(NEW_ENTRY).expect("parses");
+        assert_eq!(r.0["brand-new"].id, "com.example.brand-new");
     }
 
     #[test]
     fn rejects_a_new_entry_without_an_id() {
         let text = "[brand-new]\n    repo = \"github.com/example/x\"\n    forge = \"github\"\n";
-        let err = Registry::parse(text, &[]).unwrap_err();
-        assert!(matches!(err, ParseError::MissingId { .. }), "{err:?}");
-    }
-
-    /// A product still migrating its oldest entries lets their keys through
-    /// without an `id`, and only those keys.
-    #[test]
-    fn a_grandfathered_key_may_omit_its_id() {
-        let text = "[legacy]\n    repo = \"github.com/example/legacy\"\n    forge = \"github\"\n";
-        Registry::parse(text, &["legacy"]).expect("a grandfathered key is exempt");
-        let err = Registry::parse(text, &["other"]).unwrap_err();
-        assert!(matches!(err, ParseError::MissingId { .. }), "{err:?}");
+        let err = Registry::parse(text).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Toml(e) if e.to_string().contains("missing field `id`")),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn rejects_a_malformed_id() {
         let text = NEW_ENTRY.replace("com.example.brand-new", "brandnew");
-        let err = Registry::parse(&text, &[]).unwrap_err();
+        let err = Registry::parse(&text).unwrap_err();
         assert!(matches!(err, ParseError::InvalidId { .. }), "{err:?}");
     }
 
@@ -380,7 +349,7 @@ mod id_tests {
         let text = format!(
             "{NEW_ENTRY}\n[other]\n    id    = \"com.example.brand-new\"\n    repo  = \"github.com/example/other\"\n    forge = \"github\"\n"
         );
-        let err = Registry::parse(&text, &[]).unwrap_err();
+        let err = Registry::parse(&text).unwrap_err();
         assert!(matches!(err, ParseError::DuplicateId { .. }), "{err:?}");
     }
 }

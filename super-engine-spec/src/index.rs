@@ -38,9 +38,14 @@ pub struct Index<M> {
 pub struct IndexBackend<M> {
     pub id: String,
     /// The backend's reverse-DNS identifier from its release manifest. Names
-    /// the install directory. `None` for an entry that predates the field;
-    /// `id` remains the registry key and is unchanged, so a client that does
-    /// not read this field installs exactly where it always did.
+    /// the install directory.
+    ///
+    /// Every registry entry carries one: the registry requires an `id` and
+    /// pins each release's manifest to it, and a daemon drops a fetched entry
+    /// without a valid one. `None` only on an entry a daemon builds itself to
+    /// install from a custom repository or a local directory, when the `v1`
+    /// manifest there declares no id; that install goes under `id`, which
+    /// those routes derive from the backend's `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_id: Option<String>,
     pub source: String,
