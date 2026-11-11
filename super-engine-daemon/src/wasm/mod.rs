@@ -12,9 +12,14 @@
 //! [`REALTIME_PACKAGE`]; a product that published backends under a name of
 //! its own before that package existed passes the old name in, and those
 //! backends keep loading.
+//!
+//! A backend that imports `wasi:filesystem` sees one directory, its
+//! [private `/tmp`](private_tmp), for keeping state from one request to the
+//! next while its model is loaded. It sees nothing else of the disk.
 
 pub mod base_url;
 pub mod host;
+pub mod private_tmp;
 pub mod realtime;
 
 use std::future::Future;
@@ -23,9 +28,10 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use http_body_util::BodyExt;
+use super_engine_protocol::ProductSpec;
 use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::WasiCtx;
+use wasmtime_wasi::{FsPerms, WasiCtx};
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
@@ -39,16 +45,23 @@ use realtime::{ConsumerStreamResource, ConsumerStreamTransport, WsError};
 pub const REALTIME_PACKAGE: &str = "super-engine:realtime@0.1.0";
 
 /// The interfaces a WASM backend may import, by prefix: what its Rust
-/// runtime and the `/v1` contract need. `wasi:sockets` and `wasi:filesystem`
-/// are not among them, so the only network egress is the allowlisted
-/// `wasi:http/outgoing-handler`.
+/// runtime and the `/v1` contract need. `wasi:sockets` is not among them, so
+/// the only network egress is the allowlisted `wasi:http/outgoing-handler`.
+///
+/// `wasi:filesystem` is, because importing it grants nothing by itself: a
+/// component reaches only the directories its store preopens, and the only
+/// one preopened is its own [private `/tmp`](private_tmp).
 const ALLOWED_IMPORTS: &[&str] = &[
     "wasi:cli/",
+    "wasi:filesystem/",
     "wasi:http/",
     "wasi:io/",
     "wasi:clocks/",
     "wasi:random/",
 ];
+
+/// Where a component sees its private `/tmp`.
+const PRIVATE_TMP_GUEST_PATH: &str = "/tmp";
 
 /// A realtime package, split into its name and version.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +110,9 @@ pub struct WasmComponent {
     /// [`Self::user_allowed_hosts`], and behind a lock because every request
     /// path holds only `&self`.
     request_headers: RwLock<Vec<(String, String)>>,
+    /// The component's private `/tmp`, when it imports `wasi:filesystem`.
+    /// Dropped, and so removed, with the component.
+    private_tmp: Option<private_tmp::PrivateTmp>,
 }
 
 impl WasmComponent {
@@ -113,10 +129,15 @@ impl WasmComponent {
     /// under [`REALTIME_PACKAGE`] or whichever of `legacy_realtime_packages`
     /// (`<name>@<version>`) it was built against.
     ///
+    /// A backend importing `wasi:filesystem` gets a
+    /// [private `/tmp`](private_tmp) under `product`'s runtime directory.
+    ///
     /// # Errors
-    /// Returns an error if the component cannot be loaded or linked, or
-    /// imports an interface a sandboxed backend may not have.
+    /// Returns an error if the component cannot be loaded or linked, imports
+    /// an interface a sandboxed backend may not have, or needs a private
+    /// `/tmp` that cannot be created.
     pub fn load(
+        product: &ProductSpec,
         component_path: &Path,
         allowed_hosts: Vec<String>,
         user_allowed_hosts: Vec<String>,
@@ -146,14 +167,19 @@ impl WasmComponent {
             None
         };
         verify_imports(&engine, &component, realtime.as_ref())?;
+        let private_tmp = if imports_filesystem(&engine, &component) {
+            Some(private_tmp::PrivateTmp::create(product)?)
+        } else {
+            None
+        };
 
         let mut linker: Linker<Host> = Linker::new(&engine);
         // Link the full wasi command world (the component's Rust std runtime
         // imports `wasi:cli/environment` etc.) plus http. Capabilities remain
-        // gated by the locked-down `WasiCtx` below — no preopened directories
-        // and no granted sockets — so the component cannot touch the disk or
-        // open raw connections; its only egress is the allowlisted
-        // `wasi:http/outgoing-handler`. That world includes
+        // gated by the locked-down `WasiCtx` of `store` — no granted sockets,
+        // and no preopened directory but the private `/tmp` — so the component
+        // cannot reach the rest of the disk or open raw connections; its only
+        // egress is the allowlisted `wasi:http/outgoing-handler`. That world includes
         // `wasi:cli/exit.exit-with-code`, which Rust's wasm32-wasip2 std imports;
         // WASI 0.2.12 made it stable, so the linker carries it without an opt-in.
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
@@ -177,7 +203,14 @@ impl WasmComponent {
             user_allowed_hosts: RwLock::new(user_allowed_hosts.into()),
             allow_loopback: false,
             request_headers: RwLock::new(request_headers),
+            private_tmp,
         })
+    }
+
+    /// Where the component's private `/tmp` is on the host, when it has one.
+    #[must_use]
+    pub fn private_tmp(&self) -> Option<&Path> {
+        self.private_tmp.as_ref().map(private_tmp::PrivateTmp::path)
     }
 
     /// Permit this backend's egress to loopback addresses (`127.0.0.1`, `::1`).
@@ -256,15 +289,21 @@ impl WasmComponent {
             .unwrap_or_else(PoisonError::into_inner) = user_allowed_hosts.into();
     }
 
-    /// A fresh store for one call, carrying the egress policy as of now.
-    fn store(&self) -> Store<Host> {
+    /// A fresh store for one call, carrying the egress policy as of now and,
+    /// when the component has one, its private `/tmp`.
+    fn store(&self) -> Result<Store<Host>> {
+        let mut wasi = WasiCtx::builder();
+        if let Some(tmp) = &self.private_tmp {
+            wasi.preopened_dir(tmp.path(), PRIVATE_TMP_GUEST_PATH, FsPerms::ReadWrite)
+                .map_err(|e| anyhow!("opening {}: {e}", tmp.path().display()))?;
+        }
         let host = Host {
             table: ResourceTable::new(),
-            wasi: WasiCtx::builder().build(),
+            wasi: wasi.build(),
             http: WasiHttpCtx::new(),
             hooks: self.allowlist_hooks(),
         };
-        Store::new(&self.engine, host)
+        Ok(Store::new(&self.engine, host))
     }
 
     /// Drive one `/v1` request through the component in-process and return
@@ -314,7 +353,7 @@ impl WasmComponent {
         F: FnOnce(hyper::Response<HyperOutgoingBody>) -> Fut,
         Fut: Future<Output = Result<R>>,
     {
-        let mut store = self.store();
+        let mut store = self.store()?;
 
         let mut builder = hyper::Request::builder()
             .method(method)
@@ -397,7 +436,7 @@ impl WasmComponent {
         let Some(package) = &self.realtime else {
             bail!("backend is not websocket-capable");
         };
-        let mut store = self.store();
+        let mut store = self.store()?;
         let consumer = store
             .data_mut()
             .table
@@ -444,6 +483,15 @@ fn realtime_package(
         .cloned()
 }
 
+/// Whether the component imports any of `wasi:filesystem`, and so needs a
+/// directory to see.
+fn imports_filesystem(engine: &Engine, component: &Component) -> bool {
+    component
+        .component_type()
+        .imports(engine)
+        .any(|(name, _)| name.starts_with("wasi:filesystem/"))
+}
+
 /// Reject a component that imports interfaces a sandboxed backend must not
 /// have — see [`ALLOWED_IMPORTS`]. A websocket-capable one may also import
 /// its realtime package; a non-ws backend simply won't.
@@ -462,7 +510,7 @@ fn verify_imports(
         if !allowed {
             bail!(
                 "backend imports disallowed interface `{name}`: WASM backends \
-                 may not access raw sockets or the filesystem"
+                 may not access raw sockets"
             );
         }
     }
