@@ -367,14 +367,19 @@ assert_installed_tree() {
     # The installed binaries are the real release binaries, so they must run —
     # and the version they report is what proves a release of the requested
     # channel landed, not merely that some files did.
+    # A CLI names itself by its binary (`super-stt-cli 0.2.4`) or by the short
+    # name it is typed as (`voice 0.3.0`). Either is followed by the version.
     local cli_out version
     cli_out=$("/usr/local/bin/$SLUG-cli" --version 2>&1)
     version="${cli_out#"$SLUG-cli "}"
+    if [ "$version" = "$cli_out" ]; then
+        version="${cli_out#"$SHORT_NAME "}"
+    fi
     if [ "$cli_out" != "$version" ] && is_accepted "v$version" "$accepted"; then
         pass "$label: the installed CLI runs and reports $version"
     else
         fail "$label: the installed CLI runs and reports its version" \
-            "$SLUG-cli <$(accepted_desc "$accepted")>" "$cli_out"
+            "$SLUG-cli or $SHORT_NAME <$(accepted_desc "$accepted")>" "$cli_out"
     fi
 
     # The generated short-name wrapper is what keyboard shortcuts invoke; a
