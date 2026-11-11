@@ -379,10 +379,11 @@ pub fn run(manifest_path: &Path) -> u8 {
     // Best-effort: a missing gtk-update-icon-cache or a failing refresh is
     // not an install failure, just a stale icon until the next refresh. The
     // tool is invoked by its absolute path only — never by bare name, which
-    // would implicitly consult `$PATH`.
+    // would implicitly consult `$PATH`. `-q` keeps its "Cache file created
+    // successfully." out of the installer's output; failures still print.
     if Path::new(GTK_UPDATE_ICON_CACHE).is_file() {
         let _ = std::process::Command::new(GTK_UPDATE_ICON_CACHE)
-            .args(["-f", "-t", "/usr/local/share/icons/hicolor"])
+            .args(["-q", "-f", "-t", "/usr/local/share/icons/hicolor"])
             .status();
     }
 
