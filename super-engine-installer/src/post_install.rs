@@ -270,8 +270,15 @@ fn parent_pid(stat: &str) -> Option<u32> {
         .ok()
 }
 
+/// `pgrep`/`pkill` arguments that match the COSMIC panel itself: the process
+/// named `cosmic-panel`. `-f cosmic-panel` matched any process whose command
+/// line merely contains it, as each `cosmic-panel-button` does, and as a
+/// terminal running `journalctl | grep cosmic-panel` would, so restarting the
+/// panel killed those as well.
+const PANEL_PROCESS: [&str; 2] = ["-x", "cosmic-panel"];
+
 async fn step_restart_panel() {
-    if !cmd_ok("pkill", &["-f", "cosmic-panel"]).await {
+    if !cmd_ok("pkill", &PANEL_PROCESS).await {
         log::warn!("failed to restart cosmic-panel to load the updated applet");
     }
 }
@@ -395,7 +402,7 @@ pub async fn run(
     // `plan` re-checks the same `components.applet && applet_changes`
     // guard itself, so passing `false` when it doesn't apply is equivalent.
     let panel_running =
-        components.applet && applet_changes && cmd_ok("pgrep", &["-f", "cosmic-panel"]).await;
+        components.applet && applet_changes && cmd_ok("pgrep", &PANEL_PROCESS).await;
     // Each app with the windows still running the binary the root phase
     // replaced.
     let running_apps: Vec<(PathBuf, Vec<u32>)> = if components.app {
@@ -460,6 +467,37 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PIDs `pgrep` lists for `args`.
+    fn pgrep(args: &[&str]) -> Vec<u32> {
+        let out = std::process::Command::new("pgrep")
+            .args(args)
+            .output()
+            .expect("pgrep runs");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    #[test]
+    fn the_panel_match_skips_processes_that_only_mention_it() {
+        // A shell whose command line names the panel without being it, as a
+        // `cosmic-panel-button` or a `grep cosmic-panel` does. The trailing
+        // `:` keeps the shell from exec'ing `sleep` in its place, which
+        // would drop the name from the command line.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; :", "cosmic-panel-button"])
+            .spawn()
+            .expect("sh spawns");
+        let pid = child.id();
+        let mentioned = pgrep(&["-f", "cosmic-panel-button"]).contains(&pid);
+        let matched = pgrep(&PANEL_PROCESS).contains(&pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(mentioned, "the old -f pattern matched it");
+        assert!(!matched, "the panel match must not");
+    }
 
     fn all_three() -> Components {
         Components {
