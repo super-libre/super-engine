@@ -94,10 +94,11 @@ struct VerifiedStamp {
     mtime_ns: u64,
 }
 
-/// Where `dest`'s stamp lives: a dotfile beside it, so it is carried and
-/// removed with the model directory rather than kept in a separate cache that
-/// could outlive the file it describes.
-fn stamp_path(dest: &Path) -> PathBuf {
+/// Where `dest`'s stamp lives: a dotfile beside it, so it is removed with the
+/// model directory rather than kept in a separate cache that could outlive the
+/// file it describes. Moving the file to another backend directory moves its
+/// stamp too (`registry::carry_over::carry`).
+pub(crate) fn stamp_path(dest: &Path) -> PathBuf {
     let mut name = OsString::from(".");
     match dest.file_name() {
         Some(base) => name.push(base),
