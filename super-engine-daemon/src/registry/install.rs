@@ -703,11 +703,10 @@ async fn preserve_models<Prod: Product>(staging: &Path, final_path: &Path) -> st
 ///
 /// [`crate::registry::install_dir_name`] names `final_path` from the entry's
 /// `backend_id`, and that value is only ever pinned to the backend it claims
-/// to be on part of one route: the registry pins it for an entry whose
-/// `registry.toml` row declares an `id`. A custom repository, a locally
-/// staged directory, and a registry entry that predates the identifier all
-/// publish whatever `[backend].id` their manifest declares — so any of them
-/// can name a directory another backend is already installed in.
+/// to be on one route: the registry pins it to the `id` its `registry.toml`
+/// row declares. A custom repository and a locally staged directory publish
+/// whatever `[backend].id` their manifest declares, so either can name a
+/// directory another backend is already installed in.
 /// [`swap_into_place`] renames whatever sits there aside and deletes it, so
 /// without this check an install could destroy an unrelated backend and the
 /// multi-gigabyte model files under it. `source` is the identity the daemon
@@ -1217,8 +1216,11 @@ supported_devices = ["cpu"]
         assert_eq!(install_dir_name(&e), "app.example.voxtral");
     }
 
+    /// A custom-repository or local-directory install of a `v1` manifest that
+    /// declares no id goes under the entry's `id`, which those routes derive
+    /// from the backend's `source`.
     #[test]
-    fn the_install_dir_falls_back_to_the_registry_key() {
+    fn the_install_dir_falls_back_to_the_entry_id_without_a_backend_id() {
         let e = index_entry("voxtral", None);
         assert_eq!(install_dir_name(&e), "voxtral");
     }

@@ -431,23 +431,6 @@ pub fn registry_schema<P: Product>() -> Value {
 
     close_objects(&mut entry);
 
-    // `id` is `Option` on the Rust type only because some entries predate the
-    // requirement, not because a new entry may omit it. The schema states the
-    // rule for everyone — including those, so the backlog shows up in an
-    // editor rather than only in the indexer's tolerance list. The indexer
-    // still resolves them, or publishing this rule would take the catalog down
-    // with it.
-    if let Some(obj) = entry.as_object_mut() {
-        let required = obj
-            .entry("required")
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .expect("required list");
-        if !required.iter().any(|v| v == "id") {
-            required.push(json!("id"));
-        }
-    }
-
     let mut definitions = hoisted;
     definitions.insert("entry".into(), entry);
 

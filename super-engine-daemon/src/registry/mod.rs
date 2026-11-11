@@ -41,17 +41,19 @@ pub struct Daemon {
 
 /// The directory name a backend installs into.
 ///
-/// The reverse-DNS `[backend].id` when the entry carries one, so every install
-/// route — registry, custom repository, local directory — lands on the same
-/// path for the same backend. Falls back to the registry key for an entry that
-/// predates the identifier, which is where such a backend is already
-/// installed.
+/// The reverse-DNS `[backend].id`, so every install route — registry, custom
+/// repository, local directory — lands on the same path for the same backend.
 ///
-/// `backend_id` arrives from `index.json` over the network. This function
-/// does not assume the registry-client boundary
-/// ([`retain_safe_backends`](index::retain_safe_backends)) already sanitized
-/// it: it re-checks the value itself and falls back to the registry key
-/// whenever `backend_id` is absent or malformed.
+/// A registry entry always carries one: the registry requires an `id`, and
+/// [`retain_safe_backends`](index::retain_safe_backends) drops a fetched
+/// entry without a valid one. Only an entry built for a custom-repository or
+/// local-directory install can lack it, when the `v1` manifest there declares
+/// no id; it installs under `entry.id`, which those routes derive from the
+/// backend's `source`.
+///
+/// This function does not assume the boundary already sanitized the value:
+/// it re-checks it and falls back to `entry.id` whenever `backend_id` is
+/// absent or malformed.
 ///
 /// The check is the full `[backend].id` format rule
 /// ([`super_engine_spec::backend_id::is_valid`]), not merely "usable as a

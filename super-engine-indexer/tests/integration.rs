@@ -15,7 +15,6 @@ use super_engine_spec::test_product::TestProduct;
 const INDEXER: Indexer = Indexer {
     name: "indexer",
     user_agent: "super-engine-indexer-tests",
-    grandfathered: &[],
 };
 
 const MANIFEST_OK: &str = r#"

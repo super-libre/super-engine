@@ -270,9 +270,7 @@ fn base_url_may_be_declared_without_a_default() {
 ///
 /// "Closed" means unlisted keys are not waved through. `additionalProperties:
 /// false` is one way; a *schema* there is the other, and is stricter rather
-/// than looser — the registry root uses it to hold every entry that is not a
-/// grandfathered key to the id-requiring definition. Only a missing or `true`
-/// `additionalProperties` is open.
+/// than looser. Only a missing or `true` `additionalProperties` is open.
 #[test]
 fn every_data_object_is_closed() {
     fn walk(v: &Value, path: &str, errors: &mut Vec<String>) {

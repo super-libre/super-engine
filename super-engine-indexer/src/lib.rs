@@ -42,9 +42,6 @@ pub struct Indexer {
     pub name: &'static str,
     /// What the indexer calls itself to forges and download hosts.
     pub user_agent: &'static str,
-    /// Registry keys that may still omit `id`. See
-    /// [`registry_toml::Registry::parse`].
-    pub grandfathered: &'static [&'static str],
 }
 
 /// The indexer's command line.
@@ -116,7 +113,7 @@ pub async fn run<P: Product>(indexer: &Indexer, args: Args) -> anyhow::Result<()
 async fn run_build<P: Product>(indexer: &Indexer, args: BuildArgs) -> anyhow::Result<()> {
     let registry_text = std::fs::read_to_string(&args.registry)
         .with_context(|| format!("reading {}", args.registry.display()))?;
-    let registry = registry_toml::Registry::parse(&registry_text, indexer.grandfathered)?;
+    let registry = registry_toml::Registry::parse(&registry_text)?;
 
     let prior = match args.prior_index.as_ref() {
         Some(p) if p.exists() => {
@@ -234,8 +231,7 @@ async fn build_entry<P: Product>(
     let text = String::from_utf8(bytes).map_err(|e| fail(&e))?;
     let m = Manifest::<P>::parse(&text).map_err(|e| fail(&e))?;
     let manifest_pin = Some(IndexAsset { url, size, sha256 });
-    manifest::validate(&m, &resolved.version, &entry.repo, entry.id.as_deref())
-        .map_err(|e| fail(&e))?;
+    manifest::validate(&m, &resolved.version, &entry.repo, &entry.id).map_err(|e| fail(&e))?;
     let idx_assets = resolve_index_assets(http, &m, &resolved.release.assets)
         .await
         .map_err(|e| fail(&e))?;
@@ -393,14 +389,18 @@ fn ensure_unique_sources<M>(backends: &[IndexBackend<M>]) -> anyhow::Result<()> 
 /// [`ensure_unique_sources`], the collision is only visible across the
 /// assembled index, so it is checked here and fails the build.
 ///
-/// An entry without a `backend_id` installs under its registry key, which
-/// [`ensure_unique_sources`]' own key space already keeps distinct, so those
-/// entries are skipped rather than grouped together under a shared absence.
+/// Every entry must carry a `backend_id` at all. The registry requires an
+/// `id` and [`manifest::validate`] pins the release to it, so a fresh entry
+/// always has one; only an entry carried forward from an index built before
+/// the requirement could lack it, and a daemon would refuse to install it.
 fn ensure_unique_backend_ids<M>(backends: &[IndexBackend<M>]) -> anyhow::Result<()> {
     let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for b in backends {
         let Some(backend_id) = b.backend_id.as_deref() else {
-            continue;
+            anyhow::bail!(
+                "entry `{}` publishes no backend id; every backend must declare a [backend].id",
+                b.id,
+            );
         };
         if let Some(prev_id) = seen.insert(backend_id, b.id.as_str()) {
             anyhow::bail!(
@@ -496,16 +496,14 @@ mod tests {
         ensure_unique_backend_ids(&[a, b]).unwrap();
     }
 
-    /// Entries that predate `[backend].id` install under their registry key,
-    /// which is already unique. Several of them sharing a `None` must not be
-    /// mistaken for a collision.
+    /// An entry without a backend id names no install directory a daemon will
+    /// use, so publishing it fails the build rather than the install.
     #[test]
-    fn entries_without_a_backend_id_never_collide() {
-        let backends = vec![
-            backend("mistral", "github.com/x/mistral"),
-            backend("openai", "github.com/x/openai"),
-        ];
-        assert!(backends.iter().all(|b| b.backend_id.is_none()));
-        ensure_unique_backend_ids(&backends).unwrap();
+    fn an_entry_without_a_backend_id_fails_the_build() {
+        let mut a = backend("small", "github.com/x/small");
+        a.backend_id = Some("com.example.small".into());
+        let b = backend("old", "github.com/x/old");
+        let err = ensure_unique_backend_ids(&[a, b]).unwrap_err();
+        assert!(err.to_string().contains("`old`"), "{err}");
     }
 }

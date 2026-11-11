@@ -116,7 +116,7 @@ mod tests {
 
     fn entry(prefix: Option<&str>, max: Option<&str>) -> Entry {
         Entry {
-            id: None,
+            id: "com.example.y".into(),
             repo: "github.com/x/y".into(),
             forge: super_engine_spec::forge::Forge::Github,
             subdir: None,
