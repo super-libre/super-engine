@@ -22,6 +22,8 @@
 //!   the global setting offers.
 //! - [`load_gate`]: one model load at a time per slot, and the newest
 //!   request wins.
+//! - [`model_slot`]: one model a daemon holds, with its loads, unloads,
+//!   idle unload and load on demand.
 //! - [`http`]: the Unix socket and loopback TCP listeners, what the daemon
 //!   knows about each caller, and the error bodies the guards answer with.
 //! - [`openapi`]: checks on the `OpenAPI` document a daemon generates.
@@ -53,6 +55,7 @@ pub mod http;
 pub mod instance;
 pub mod language;
 pub mod load_gate;
+pub mod model_slot;
 #[cfg(feature = "beeper")]
 mod num_cast;
 pub mod openapi;
