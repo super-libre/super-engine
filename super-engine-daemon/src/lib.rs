@@ -64,6 +64,7 @@ pub mod resource_management;
 pub mod secrets;
 pub mod self_update;
 pub mod shutdown;
+pub mod stage;
 #[cfg(feature = "subprocess")]
 pub mod subprocess;
 #[cfg(feature = "wasm")]
