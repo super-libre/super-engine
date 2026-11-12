@@ -46,6 +46,15 @@ impl LoadGate {
             .wrapping_add(1)
     }
 
+    /// The newest ticket handed out, without taking one.
+    ///
+    /// For a request that must not supersede anyone: a load on demand only
+    /// fills a slot nobody else is filling. Entering with this admits it only
+    /// if no ticket was taken since, so a request that arrives meanwhile wins.
+    pub(crate) fn newest(&self) -> u64 {
+        self.newest.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Wait for the gate, then report whether `ticket` is still the newest.
     ///
     /// `None` means a later request arrived while this one waited. That one
