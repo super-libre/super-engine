@@ -502,7 +502,7 @@ async fn run(
 ///
 /// # Panics
 /// If the tokio runtime cannot be built.
-#[must_use]
+#[must_use = "the installer's binary exits with this code"]
 pub fn main(installer: &Installer) -> std::process::ExitCode {
     super_engine_forge::install_crypto_provider();
     env_logger::Builder::from_default_env()
