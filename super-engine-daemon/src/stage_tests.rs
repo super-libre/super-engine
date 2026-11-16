@@ -214,8 +214,22 @@ impl Stage for Fake {
         let said = match event {
             StageEvent::Loading { model } => format!("loading {model}"),
             StageEvent::Loaded { model, device } => format!("loaded {model} on {device}"),
-            StageEvent::Unloaded => "unloaded".to_string(),
-            StageEvent::LoadFailed { model, .. } => format!("{model} failed"),
+            StageEvent::Unloaded {
+                loads_on_demand: false,
+            } => "unloaded".to_string(),
+            StageEvent::Unloaded {
+                loads_on_demand: true,
+            } => "unloaded, loads on demand".to_string(),
+            StageEvent::LoadFailed {
+                model,
+                loads_on_demand: false,
+                ..
+            } => format!("{model} failed"),
+            StageEvent::LoadFailed {
+                model,
+                loads_on_demand: true,
+                ..
+            } => format!("{model} failed, loads on demand"),
             StageEvent::SwitchingDevice { model, from, to } => {
                 format!("moving {model} from {from} to {to}")
             }
@@ -306,7 +320,7 @@ async fn a_failed_load_says_which_model_and_why() {
         loaded,
         Err("a did not load: a cannot run on cpu".to_string())
     );
-    assert_eq!(stage.events(), ["loading a", "a failed"]);
+    assert_eq!(stage.events(), ["loading a", "a failed, loads on demand"]);
     assert_eq!(stage.loaded().await, None);
 }
 
@@ -554,7 +568,7 @@ async fn an_unload_during_a_load_unloads_what_it_loaded() {
 #[tokio::test]
 async fn an_idle_unload_leaves_a_model_in_use() {
     let after = Duration::from_secs(30);
-    let stage = Fake::new("a");
+    let stage = Fake::new("a").unloaded_on_idle();
     stage.put("a", "cpu").await;
     stage.slot().backdate(Duration::from_secs(60));
 
@@ -566,7 +580,23 @@ async fn an_idle_unload_leaves_a_model_in_use() {
     stage.slot().backdate(Duration::from_secs(60));
     assert!(stage.unload_if_idle(after).await);
     assert!(stage.is_on(), "an idle unload keeps the stage on");
-    assert_eq!(stage.events(), ["unloaded"]);
+    assert_eq!(stage.events(), ["unloaded, loads on demand"]);
+}
+
+/// A failed load says whether the next request tries again: with models
+/// unloaded on idle it does, and with them kept loaded nothing loads the
+/// model until a client asks.
+#[tokio::test]
+async fn a_failed_load_says_whether_the_next_request_tries_again() {
+    let kept = Fake::new("a");
+    kept.fail("a");
+    assert!(matches!(kept.load_selected().await, Load::Failed { .. }));
+    assert_eq!(kept.events(), ["loading a", "a failed"]);
+
+    let on_idle = Fake::new("a").unloaded_on_idle();
+    on_idle.fail("a");
+    assert!(matches!(on_idle.load_selected().await, Load::Failed { .. }));
+    assert_eq!(on_idle.events(), ["loading a", "a failed, loads on demand"]);
 }
 
 /// A load gives up when the daemon starts shutting down, rather than keep the

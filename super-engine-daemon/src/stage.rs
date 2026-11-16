@@ -77,9 +77,20 @@ pub enum StageEvent<'a> {
     Loaded { model: &'a ModelId, device: &'a str },
     /// The model was unloaded, on request or for being idle: the stage holds
     /// none.
-    Unloaded,
+    ///
+    /// `loads_on_demand` is whether the next request that needs a model loads
+    /// one, as [`StageExt::loads_on_demand`] answers once the slot is empty:
+    /// true after an idle unload, false after an unload, which switches the
+    /// stage off. A client tells "idle" from "not loaded" by it.
+    Unloaded { loads_on_demand: bool },
     /// The load of `model` failed with `error`: the stage holds no model.
-    LoadFailed { model: &'a ModelId, error: &'a str },
+    /// `loads_on_demand` is whether the next request that needs one tries
+    /// again, as for [`Self::Unloaded`].
+    LoadFailed {
+        model: &'a ModelId,
+        error: &'a str,
+        loads_on_demand: bool,
+    },
     /// The loaded `model` is moving from the framework `from` to `to`.
     SwitchingDevice {
         model: &'a ModelId,
@@ -388,7 +399,8 @@ impl<S: Stage> StageExt for S {
             if model.is_none() && !was_on {
                 return Unload::NothingToUnload;
             }
-            stage.announce(StageEvent::Unloaded);
+            let loads_on_demand = stage.loads_on_demand().await;
+            stage.announce(StageEvent::Unloaded { loads_on_demand });
             drop(unloaded);
             match &model {
                 Some(model) => info!("Unloaded {model}"),
@@ -405,6 +417,9 @@ impl<S: Stage> StageExt for S {
             self.slot().touch();
             return false;
         }
+        // Read before the slot is locked, since the unload announces under the
+        // lock, so the next load's announcement comes after it.
+        let loads_on_demand = self.loads_on_demand().await;
         self.slot()
             .unload_if_idle(after, |model| {
                 info!(
@@ -412,7 +427,7 @@ impl<S: Stage> StageExt for S {
                     model.id(),
                     after.as_secs()
                 );
-                self.announce(StageEvent::Unloaded);
+                self.announce(StageEvent::Unloaded { loads_on_demand });
             })
             .await
     }
@@ -467,11 +482,13 @@ async fn load<S: Stage>(stage: &S, turn: LoadTurn<'_, S::Model>, model: ModelId)
         Some(Err(error)) => {
             let shown = format!("{error:#}");
             warn!("Failed to load {model}: {shown}");
+            let loads_on_demand = stage.loads_on_demand().await;
             // Before the turn ends, so the next load's announcement comes
             // after this one.
             stage.announce(StageEvent::LoadFailed {
                 model: &model,
                 error: &shown,
+                loads_on_demand,
             });
             drop(turn);
             Load::Failed { model, error }
@@ -551,9 +568,11 @@ async fn switch_device_on_turn<S: Stage>(
         Some(Err(recovery)) => {
             let shown = format!("{recovery:#}");
             warn!("Failed to load {model} again on {fallback}: {shown}");
+            let loads_on_demand = stage.loads_on_demand().await;
             stage.announce(StageEvent::LoadFailed {
                 model: &model,
                 error: &shown,
+                loads_on_demand,
             });
             drop(turn);
             DeviceSwitch::Failed { error, recovery }
