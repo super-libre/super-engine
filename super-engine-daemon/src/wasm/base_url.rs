@@ -74,7 +74,7 @@ pub fn normalize(value: &str) -> Option<String> {
     let uri = parse(value)?;
     let host = uri.host().filter(|h| !h.is_empty())?;
     let scheme = uri.scheme_str().unwrap_or("https").to_ascii_lowercase();
-    let port = uri.port_u16().map(|p| format!(":{p}")).unwrap_or_default();
+    let port = uri.port_u16().map_or_default(|p| format!(":{p}"));
     // `path()` is `/` when the value carried none, and already excludes the
     // query and fragment.
     let path = uri.path().trim_end_matches('/');

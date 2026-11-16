@@ -213,8 +213,7 @@ impl Unit {
             .args(["--user", "-u", &self.name, "--no-pager", "-n", "30"])
             .output()
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default()
+            .map_or_default(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     }
 
     /// Stop the unit, awaiting its exit.
