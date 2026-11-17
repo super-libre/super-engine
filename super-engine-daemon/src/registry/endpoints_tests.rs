@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::*;
 use super_engine_protocol::test_product::TEST;
 use super_engine_spec::index::{Index, IndexAsset, IndexAssets};
-use super_engine_spec::test_product::{IndexModel, TestProduct};
+use super_engine_spec::test_product::{IndexBackend as ProductFields, IndexModel, TestProduct};
 use tokio::sync::RwLock;
 
 // A bus with the core topics only.
@@ -91,7 +91,7 @@ fn registry_at(host: TestHost, index_url: &str, cache: &Path) -> Registry<TestHo
 
 /// A `wasm` entry for `source` at `version`, with the backend id the registry
 /// requires; with `asset`, one any host can install.
-fn wasm_entry(source: &str, version: &str, asset: bool) -> IndexBackend<IndexModel> {
+fn wasm_entry(source: &str, version: &str, asset: bool) -> IndexBackend<IndexModel, ProductFields> {
     let key = source.rsplit('/').next().unwrap_or(source).to_owned();
     IndexBackend {
         backend_id: Some(format!("app.example.{key}")),
@@ -110,6 +110,7 @@ fn wasm_entry(source: &str, version: &str, asset: bool) -> IndexBackend<IndexMod
         online: false,
         supports_gpu: false,
         supports_cpu: true,
+        product: ProductFields::default(),
         models: vec![],
         secrets: vec![],
         options: vec![],
@@ -201,6 +202,25 @@ fn only_an_installed_older_version_has_an_update() {
     // Neither side is guessed at when it cannot be parsed.
     assert!(!update_available(Some("1.0.0"), "nightly", true));
     assert!(!update_available(Some(""), "1.0.0", true));
+}
+
+/// The listing relays the product's backend-level fields as the index carries
+/// them, flattened beside `supports_cpu`: a client reads what a backend can do
+/// before installing it, and a daemon that dropped them would hide it.
+#[test]
+fn the_listing_carries_the_products_backend_fields() {
+    let mut entry = wasm_entry("github.com/x/thing", "0.1.0", true);
+    entry.product.post_processes = true;
+    let compatibility = Compatibility {
+        compatible: true,
+        selected_asset: None,
+        reason: None,
+        needs_client_update: false,
+    };
+    let listed = map_entry(&entry, compatibility, None);
+    assert!(listed.product.post_processes);
+    let v = serde_json::to_value(&listed).expect("serializes");
+    assert_eq!(v["post_processes"], serde_json::json!(true), "{v}");
 }
 
 /// A newer release this daemon cannot install is not an update on offer. The

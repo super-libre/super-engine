@@ -91,7 +91,7 @@ pub struct Pipeline<F> {
 /// error if `selection` does not match an asset on `entry`.
 pub async fn run<Prod: Product, F>(
     p: &Pipeline<F>,
-    entry: &IndexBackend<Prod::IndexModel>,
+    entry: &IndexBackend<Prod::IndexModel, Prod::IndexBackend>,
     selection: &Selection,
 ) -> Result<String, InstallFailure>
 where
@@ -191,7 +191,7 @@ where
 /// manifest's text.
 async fn stage_download<Prod: Product, F>(
     p: &Pipeline<F>,
-    entry: &IndexBackend<Prod::IndexModel>,
+    entry: &IndexBackend<Prod::IndexModel, Prod::IndexBackend>,
     selection: &Selection,
     staging: &Path,
     kind_subdir: bool,
@@ -256,7 +256,7 @@ where
 async fn stage_kept<Prod: Product>(
     kept: &Path,
     staging: &Path,
-    entry: &IndexBackend<Prod::IndexModel>,
+    entry: &IndexBackend<Prod::IndexModel, Prod::IndexBackend>,
     pin: &IndexAsset,
 ) -> Result<String, InstallFailure> {
     use InstallPhase as P;
@@ -273,9 +273,9 @@ async fn stage_kept<Prod: Product>(
 /// Download the artifact `selection` names into `partial_path` and verify its
 /// integrity: a single hashed download for a wasm or single-file subprocess
 /// asset, or a per-part download + concatenation for a multi-part archive.
-async fn download_and_verify<M, F>(
+async fn download_and_verify<M, B, F>(
     p: &Pipeline<F>,
-    entry: &IndexBackend<M>,
+    entry: &IndexBackend<M, B>,
     selection: &Selection,
     partial_path: &Path,
 ) -> Result<(), (InstallPhase, InstallError)>
@@ -358,7 +358,7 @@ where
 /// None.
 pub async fn run_local<Prod: Product, F>(
     p: &Pipeline<F>,
-    entry: &IndexBackend<Prod::IndexModel>,
+    entry: &IndexBackend<Prod::IndexModel, Prod::IndexBackend>,
     src_dir: &Path,
 ) -> Result<String, InstallFailure>
 where
@@ -990,7 +990,7 @@ fn extract_tarball(src: &Path, dest_dir: &Path) -> Result<(), PipelineError> {
 /// path that escapes its install dir.
 async fn fetch_verified_manifest<Prod: Product>(
     http: &reqwest::Client,
-    entry: &IndexBackend<Prod::IndexModel>,
+    entry: &IndexBackend<Prod::IndexModel, Prod::IndexBackend>,
     pin: &IndexAsset,
 ) -> Result<String, InstallFailure> {
     let bytes = download_manifest_bytes(http, &pin.url)
@@ -1005,7 +1005,7 @@ async fn fetch_verified_manifest<Prod: Product>(
 fn verify_manifest_bytes<Prod: Product>(
     bytes: &[u8],
     pin_sha256: &str,
-    entry: &IndexBackend<Prod::IndexModel>,
+    entry: &IndexBackend<Prod::IndexModel, Prod::IndexBackend>,
 ) -> Result<String, InstallFailure> {
     use crate::backends::validate_runtime;
     use InstallPhase as P;
@@ -1091,7 +1091,10 @@ mod tests {
     use super_engine_spec::index::{IndexAssets, IndexSubprocessAsset};
     use super_engine_spec::test_product::{self, TestProduct};
 
-    type IndexBackend = super_engine_spec::index::IndexBackend<test_product::IndexModel>;
+    type IndexBackend = super_engine_spec::index::IndexBackend<
+        test_product::IndexModel,
+        test_product::IndexBackend,
+    >;
 
     const PINNED_MANIFEST: &str = r#"
 [backend]
@@ -1194,6 +1197,7 @@ supported_devices = ["cpu"]
             online: false,
             supports_gpu: false,
             supports_cpu: true,
+            product: test_product::IndexBackend::default(),
             models: vec![],
             secrets: vec![],
             options: vec![],

@@ -43,7 +43,11 @@ pub fn check_min_client(client_version: &str, min_client: &str) -> MinClientStat
 /// Warn when this index's `min_client` floor is newer than the running
 /// daemon, `product` at `current_version`. The registry stays usable —
 /// `min_client` is a soft floor.
-pub fn warn_if_client_too_old<M>(index: &Index<M>, product: &ProductSpec, current_version: &str) {
+pub fn warn_if_client_too_old<M, B>(
+    index: &Index<M, B>,
+    product: &ProductSpec,
+    current_version: &str,
+) {
     if let MinClientStatus::TooOld { client, min_client } =
         check_min_client(current_version, &index.min_client)
     {
@@ -78,7 +82,7 @@ pub fn warn_if_client_too_old<M>(index: &Index<M>, product: &ProductSpec, curren
 /// its own contract. `.staging` shows why that matters: it is a legal path
 /// component, so a component-level check passes it, but it names the shared
 /// staging root every install stages through.
-pub fn retain_safe_backends<M>(index: &mut Index<M>) {
+pub fn retain_safe_backends<M, B>(index: &mut Index<M, B>) {
     use super_engine_spec::{is_safe_component, is_safe_relative_path};
     index.backends.retain(|b| {
         if !b
@@ -109,13 +113,13 @@ pub fn retain_safe_backends<M>(index: &mut Index<M>) {
 mod tests {
     use super::*;
     use super_engine_spec::index::{IndexAssets, IndexBackend};
-    use super_engine_spec::test_product::IndexModel;
+    use super_engine_spec::test_product::{IndexBackend as ProductFields, IndexModel};
 
-    type Index = super_engine_spec::index::Index<IndexModel>;
+    type Index = super_engine_spec::index::Index<IndexModel, ProductFields>;
 
     /// A minimal-but-safe backend entry, for exercising `retain_safe_backends`
     /// without constructing the full field list every time.
-    fn safe_backend(id: &str, backend_id: Option<&str>) -> IndexBackend<IndexModel> {
+    fn safe_backend(id: &str, backend_id: Option<&str>) -> IndexBackend<IndexModel, ProductFields> {
         IndexBackend {
             id: id.into(),
             backend_id: backend_id.map(String::from),
@@ -133,6 +137,7 @@ mod tests {
             online: false,
             supports_gpu: false,
             supports_cpu: true,
+            product: ProductFields::default(),
             models: vec![],
             secrets: vec![],
             options: vec![],

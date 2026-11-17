@@ -84,7 +84,7 @@ fn build_entry<P: Product>(
     out_dir: &Path,
     base: &str,
     allow_missing: bool,
-) -> anyhow::Result<IndexBackend<P::IndexModel>> {
+) -> anyhow::Result<IndexBackend<P::IndexModel, P::IndexBackend>> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let m = Manifest::<P>::parse(&text)?;
@@ -277,8 +277,10 @@ mod tests {
         run::<TestProduct>(&args).unwrap();
 
         let json = std::fs::read_to_string(dir.path().join("index.json")).unwrap();
-        let index: Index<<TestProduct as Product>::IndexModel> =
-            serde_json::from_str(&json).unwrap();
+        let index: Index<
+            <TestProduct as Product>::IndexModel,
+            <TestProduct as Product>::IndexBackend,
+        > = serde_json::from_str(&json).unwrap();
         assert_eq!(index.backends.len(), 1);
         let b = &index.backends[0];
         assert_eq!(b.id, "dummy");

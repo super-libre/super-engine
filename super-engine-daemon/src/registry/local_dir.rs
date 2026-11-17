@@ -45,7 +45,9 @@ pub enum ResolveError {
 /// Returns a [`ResolveError`] when the path is missing, not a directory,
 /// has no `backend.toml`, does not contain the file `[backend].entrypoint`
 /// names, or the manifest fails to parse or validate.
-pub fn resolve<P: Product>(local_path: &Path) -> Result<IndexBackend<P::IndexModel>, ResolveError> {
+pub fn resolve<P: Product>(
+    local_path: &Path,
+) -> Result<IndexBackend<P::IndexModel, P::IndexBackend>, ResolveError> {
     if !local_path.is_absolute() {
         return Err(ResolveError::NotAbsolute(local_path.display().to_string()));
     }
@@ -105,7 +107,13 @@ mod tests {
     /// [`super::resolve`] for the test product.
     fn resolve(
         local_path: &Path,
-    ) -> Result<IndexBackend<super_engine_spec::test_product::IndexModel>, ResolveError> {
+    ) -> Result<
+        IndexBackend<
+            super_engine_spec::test_product::IndexModel,
+            super_engine_spec::test_product::IndexBackend,
+        >,
+        ResolveError,
+    > {
         super::resolve::<TestProduct>(local_path)
     }
     use std::fs;
