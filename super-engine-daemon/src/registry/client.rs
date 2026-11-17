@@ -35,9 +35,10 @@ pub enum ClientError {
 }
 
 /// A product's registry index, fetched over the network and cached on disk.
-/// Generic over the product's index-model fields, as [`Index`] is.
+/// Generic over the product's index fields, of each model and of each
+/// backend, as [`Index`] is.
 #[derive(Clone)]
-pub struct Client<M> {
+pub struct Client<M, B> {
     /// Whose index this is, and the version its `min_client` floor is held
     /// against.
     daemon: Daemon,
@@ -45,7 +46,7 @@ pub struct Client<M> {
     http: reqwest::Client,
     cache_path: PathBuf,
     ttl: Duration,
-    state: Arc<RwLock<Option<Cached<M>>>>,
+    state: Arc<RwLock<Option<Cached<M, B>>>>,
     /// Held across a fetch, so only one is in flight at a time.
     fetching: Arc<tokio::sync::Mutex<()>>,
     /// How many fetches have finished, so a refresh that waited on one can
@@ -54,8 +55,8 @@ pub struct Client<M> {
 }
 
 #[derive(Clone)]
-struct Cached<M> {
-    index: Index<M>,
+struct Cached<M, B> {
+    index: Index<M, B>,
     etag: Option<String>,
     fetched_at: SystemTime,
 }
@@ -67,7 +68,11 @@ struct CacheFile {
     index: serde_json::Value,
 }
 
-impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
+impl<M, B> Client<M, B>
+where
+    M: Clone + DeserializeOwned + Send + Sync + 'static,
+    B: Clone + DeserializeOwned + Send + Sync + 'static,
+{
     /// # Panics
     /// Panics if the `reqwest` client cannot be built (should never happen with default settings).
     #[must_use]
@@ -115,7 +120,7 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
     /// # Errors
     /// Returns `ClientError::Unavailable` when the network is unreachable and there is no
     /// cached index on disk.
-    pub async fn get(&self) -> Result<Index<M>, ClientError> {
+    pub async fn get(&self) -> Result<Index<M, B>, ClientError> {
         {
             let guard = self.state.read();
             if let Some(c) = guard.as_ref()
@@ -148,7 +153,7 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
     /// Returns a `ClientError` on network failure, I/O error, or JSON parse error.
     /// Returns `ClientError::Unavailable` if the server answers with an unsolicited
     /// `304 Not Modified` and there is no cached index to fall back on.
-    pub async fn refresh(&self) -> Result<Index<M>, ClientError> {
+    pub async fn refresh(&self) -> Result<Index<M, B>, ClientError> {
         let finished_before = self.fetches.load(Ordering::Acquire);
         let _fetching = self.fetching.lock().await;
         if self.fetches.load(Ordering::Acquire) != finished_before
@@ -163,9 +168,10 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
             if need_load {
                 // Read + parse the on-disk cache off the async worker (Tier 3 #3).
                 let cache_path = self.cache_path.clone();
-                let loaded = tokio::task::spawn_blocking(move || load_from_disk::<M>(&cache_path))
-                    .await
-                    .map_err(|e| ClientError::Io(std::io::Error::other(e)))??;
+                let loaded =
+                    tokio::task::spawn_blocking(move || load_from_disk::<M, B>(&cache_path))
+                        .await
+                        .map_err(|e| ClientError::Io(std::io::Error::other(e)))??;
                 if let Some((mut idx, etag)) = loaded {
                     warn_if_client_too_old(&idx, self.daemon.product, self.daemon.version);
                     retain_safe_backends(&mut idx);
@@ -210,7 +216,7 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
         let bytes = resp.bytes().await?;
-        let mut index: Index<M> = serde_json::from_slice(&bytes)?;
+        let mut index: Index<M, B> = serde_json::from_slice(&bytes)?;
         retain_safe_backends(&mut index);
         warn_if_client_too_old(&index, self.daemon.product, self.daemon.version);
         let cached = Cached {
@@ -233,22 +239,22 @@ impl<M: Clone + DeserializeOwned + Send + Sync + 'static> Client<M> {
 
 /// An index read back from the disk cache, with the `ETag` it was fetched
 /// under.
-type Loaded<M> = (Index<M>, Option<String>);
+type Loaded<M, B> = (Index<M, B>, Option<String>);
 
 /// Read + parse the on-disk index cache. Synchronous `std::fs` + `serde_json`, so
 /// the async refresh path runs it on a blocking thread (audit 2 Tier 3 #3).
 ///
 /// The index comes back unfiltered; the caller applies the same policy as to
 /// a fetched one.
-fn load_from_disk<M: DeserializeOwned>(
+fn load_from_disk<M: DeserializeOwned, B: DeserializeOwned>(
     cache_path: &std::path::Path,
-) -> Result<Option<Loaded<M>>, ClientError> {
+) -> Result<Option<Loaded<M, B>>, ClientError> {
     if !cache_path.exists() {
         return Ok(None);
     }
     let bytes = std::fs::read(cache_path)?;
     let file: CacheFile = serde_json::from_slice(&bytes)?;
-    let index: Index<M> = serde_json::from_value(file.index)?;
+    let index: Index<M, B> = serde_json::from_value(file.index)?;
     Ok(Some((index, file.etag)))
 }
 
@@ -281,7 +287,7 @@ fn persist_to_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super_engine_spec::test_product::IndexModel;
+    use super_engine_spec::test_product::{IndexBackend, IndexModel};
     use tempfile::tempdir;
 
     const DAEMON: Daemon = Daemon {
@@ -290,7 +296,7 @@ mod tests {
         user_agent: "super-engine-daemon-tests",
     };
 
-    fn client(url: impl Into<String>, cache_path: PathBuf) -> Client<IndexModel> {
+    fn client(url: impl Into<String>, cache_path: PathBuf) -> Client<IndexModel, IndexBackend> {
         Client::new(DAEMON, url, cache_path, DEFAULT_TTL)
     }
 
