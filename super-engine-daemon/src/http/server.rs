@@ -264,35 +264,42 @@ async fn serve_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // 503 connection_rejected if the per-client cap is hit. We have to
-    // write the response by hand here since axum isn't in the picture
-    // yet — we never hand the stream to `serve_connection`.
+    // 503 connection_rejected when `max_connections` connections are already
+    // open. We have to write the response by hand here since axum isn't in
+    // the picture yet — we never hand the stream to `serve_connection`.
     //
-    // Registration is idempotent per client_id (uid:pid, or the origin
-    // for a web caller): each call upserts the entry, the cap-check
-    // passes when the entry already exists, and we deliberately do NOT
-    // call `unregister_connection` on conn-close. The same client_id may
-    // have multiple concurrent connections (e.g., /v1/events open while
-    // /v1/ping fires), and an eager unregister would brick the sibling's
-    // rate-limit lookup. Stale entries are pruned by
-    // `ResourceManager::cleanup_task` after the configured idle timeout.
+    // The slot is held by the task below and freed when the connection
+    // closes. A connection upgraded to a WebSocket stops holding one once
+    // hyper hands it to its handler: the cap is a backstop against a client
+    // stuck in a loop, and a loop opening WebSockets still passes through
+    // here once per socket.
     let client_id = peer.client_id();
-    if let Err(e) = resource_manager
-        .register_connection(client_id.clone(), None)
-        .await
-    {
-        warn!("connection rejected for {client_id}: {e}; sending 503 connection_rejected");
-        let _ = write_oneshot_response(
-            stream,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "connection_rejected",
-        )
-        .await;
-        return;
-    }
+    let slot = match resource_manager.open_connection() {
+        Ok(slot) => slot,
+        Err(e) => {
+            warn!("connection rejected for {client_id}: {e}; sending 503 connection_rejected");
+            let _ = write_oneshot_response(
+                stream,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connection_rejected",
+            )
+            .await;
+            return;
+        }
+    };
+
+    // The client's rate-limit window. Idempotent per client_id (uid:pid, or
+    // the origin for a web caller), and deliberately NOT removed on
+    // conn-close: the same client_id may have multiple concurrent
+    // connections (e.g., /v1/events open while /v1/ping fires), and an eager
+    // unregister would brick the sibling's rate-limit lookup. Stale entries
+    // are pruned by `ResourceManager::cleanup_task` after the configured idle
+    // timeout.
+    resource_manager.register_connection(client_id, None).await;
 
     let app_for_conn = app.clone().layer(axum::Extension(peer));
     tokio::spawn(async move {
+        let _slot = slot;
         let io = hyper_util::rt::TokioIo::new(stream);
         let svc = hyper_util::service::TowerToHyperService::new(app_for_conn);
         // `.with_upgrades()` is what makes an HTTP/1.1 protocol upgrade

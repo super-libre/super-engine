@@ -6,14 +6,20 @@ use log::{debug, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 /// Resource manager for tracking connections and enforcing limits
 #[derive(Debug)]
 pub struct ResourceManager {
     /// Resource limits configuration
     limits: ResourceLimits,
-    /// Active connections
+    /// One permit per connection that may be open at once. A connection holds
+    /// its [`ConnectionSlot`] until it closes.
+    slots: Arc<Semaphore>,
+    /// Each client's rate-limit window, keyed by client id. An entry outlives
+    /// the client's connections and is pruned once it has been idle for
+    /// `connection_timeout_seconds`, so it says nothing about how many
+    /// connections are open.
     connections: Arc<RwLock<HashMap<String, ConnectionInfo>>>,
     /// Background cleanup task handle
     cleanup_handle: Option<tokio::task::JoinHandle<()>>,
@@ -39,6 +45,7 @@ impl ResourceManager {
         });
 
         Self {
+            slots: Arc::new(Semaphore::new(limits.max_connections)),
             limits,
             connections,
             cleanup_handle: Some(cleanup_handle),
@@ -57,7 +64,39 @@ impl ResourceManager {
         Self::with_limits(ResourceLimits::production())
     }
 
-    /// Register a connection for `client_id`, enforcing the connection cap.
+    /// Take one of the `max_connections` slots for a connection that has just
+    /// been accepted. The connection holds the slot until it closes, and
+    /// dropping the slot frees it.
+    ///
+    /// This, not [`register_connection`](Self::register_connection), is the
+    /// connection cap. The cap counted clients once: a client's entry stays
+    /// until it has been idle for `connection_timeout_seconds`, so every
+    /// process that had made one request in that window held a place, open
+    /// connection or not, and forty one-shot commands locked every new
+    /// client out for minutes.
+    ///
+    /// # Errors
+    /// [`ResourceError::ConnectionLimitExceeded`] when `max_connections`
+    /// connections are already open.
+    pub fn open_connection(&self) -> Result<ConnectionSlot, ResourceError> {
+        Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map(|permit| ConnectionSlot { _permit: permit })
+            .map_err(|_| ResourceError::ConnectionLimitExceeded {
+                current: self.open_connections(),
+                max: self.limits.max_connections,
+            })
+    }
+
+    /// How many connections hold a slot right now.
+    #[must_use]
+    pub fn open_connections(&self) -> usize {
+        self.limits
+            .max_connections
+            .saturating_sub(self.slots.available_permits())
+    }
+
+    /// Start tracking `client_id`'s requests, if it is not tracked already.
     ///
     /// **Idempotent per `client_id`.** A client (keyed by `uid:pid`) may
     /// open several connections over its lifetime — a long-lived
@@ -66,36 +105,15 @@ impl ResourceManager {
     /// no-op: its [`ConnectionInfo`] — and crucially its rolling
     /// `request_history` — is preserved, so the rate-limit window spans all
     /// of that client's connections rather than being reset by each new one.
-    /// Only a genuinely new `client_id` allocates an entry and is subject to
-    /// the connection cap (an existing client is already counted).
     ///
-    /// # Errors
-    /// Returns an error if registering a *new* client would exceed
-    /// `max_connections`.
-    pub async fn register_connection(
-        &self,
-        client_id: String,
-        client_addr: Option<SocketAddr>,
-    ) -> Result<(), ResourceError> {
-        let mut connections = self.connections.write().await;
-
-        // Existing client → keep its accumulated state untouched.
-        if connections.contains_key(&client_id) {
-            return Ok(());
-        }
-
-        // New client → enforce the cap before allocating its entry.
-        if connections.len() >= self.limits.max_connections {
-            return Err(ResourceError::ConnectionLimitExceeded {
-                current: connections.len(),
-                max: self.limits.max_connections,
-            });
-        }
-
-        let conn_info = ConnectionInfo::new(client_id.clone(), client_addr);
-        connections.insert(client_id, conn_info);
-
-        Ok(())
+    /// Never refused: how many connections may be open is
+    /// [`open_connection`](Self::open_connection)'s to decide.
+    pub async fn register_connection(&self, client_id: String, client_addr: Option<SocketAddr>) {
+        self.connections
+            .write()
+            .await
+            .entry(client_id.clone())
+            .or_insert_with(|| ConnectionInfo::new(client_id, client_addr));
     }
 
     /// Unregister a connection
@@ -119,8 +137,8 @@ impl ResourceManager {
         }
     }
 
-    /// Get current connection count
-    pub async fn connection_count(&self) -> usize {
+    /// How many clients have a rate-limit window, idle or not.
+    pub async fn client_count(&self) -> usize {
         self.connections.read().await.len()
     }
 
@@ -131,11 +149,11 @@ impl ResourceManager {
 
         let mut total_requests_last_minute = 0;
         let mut total_requests_last_hour = 0;
-        let mut active_connections = 0;
+        let mut active_clients = 0;
 
         for conn in connections.values() {
             if !conn.is_timed_out(self.limits.connection_timeout_seconds) {
-                active_connections += 1;
+                active_clients += 1;
                 total_requests_last_minute +=
                     conn.request_history.count_requests_in_window(now, 60);
                 total_requests_last_hour +=
@@ -144,8 +162,9 @@ impl ResourceManager {
         }
 
         ResourceStats {
-            total_connections: connections.len(),
-            active_connections,
+            open_connections: self.open_connections(),
+            clients: connections.len(),
+            active_clients,
             total_requests_last_minute,
             total_requests_last_hour,
             max_connections: self.limits.max_connections,
@@ -199,11 +218,23 @@ impl Drop for ResourceManager {
     }
 }
 
+/// A place among the `max_connections` that may be open at once, from
+/// [`ResourceManager::open_connection`]. Held for the connection's life;
+/// dropping it frees the place.
+#[derive(Debug)]
+pub struct ConnectionSlot {
+    _permit: OwnedSemaphorePermit,
+}
+
 /// Resource usage statistics
 #[derive(Debug, Clone)]
 pub struct ResourceStats {
-    pub total_connections: usize,
-    pub active_connections: usize,
+    /// Connections open right now.
+    pub open_connections: usize,
+    /// Clients with a rate-limit window, idle or not.
+    pub clients: usize,
+    /// Clients that made a request within `connection_timeout_seconds`.
+    pub active_clients: usize,
     pub total_requests_last_minute: u32,
     pub total_requests_last_hour: u32,
     pub max_connections: usize,
@@ -216,48 +247,57 @@ mod tests {
     use super::*;
     use tokio::time::{Duration as TokioDuration, sleep};
 
+    /// The cap is on connections open at once: a slot is held while its
+    /// connection is open and freed when it closes.
     #[tokio::test]
-    async fn test_connection_limiting() {
-        let limits = ResourceLimits {
+    async fn the_cap_counts_open_connections() {
+        let manager = ResourceManager::with_limits(ResourceLimits {
             max_connections: 2,
             ..Default::default()
-        };
-        let manager = ResourceManager::with_limits(limits);
+        });
 
-        // Register first connection - should succeed
+        let first = manager.open_connection().expect("first slot");
+        let _second = manager.open_connection().expect("second slot");
+        assert_eq!(manager.open_connections(), 2);
         assert!(
-            manager
-                .register_connection("client1".to_string(), None)
-                .await
-                .is_ok()
+            matches!(
+                manager.open_connection(),
+                Err(ResourceError::ConnectionLimitExceeded { current: 2, max: 2 })
+            ),
+            "a third connection while two are open is refused"
         );
 
-        // Register second connection - should succeed
-        assert!(
-            manager
-                .register_connection("client2".to_string(), None)
-                .await
-                .is_ok()
-        );
+        drop(first);
 
-        // Register third connection - should fail
+        assert_eq!(manager.open_connections(), 1);
         assert!(
-            manager
-                .register_connection("client3".to_string(), None)
-                .await
-                .is_err()
+            manager.open_connection().is_ok(),
+            "a closed connection frees its slot"
         );
+    }
 
-        // Unregister one connection
-        manager.unregister_connection("client1").await;
+    /// The bug the slots fix: the cap counted clients, and a client stayed
+    /// counted until it had been idle for `connection_timeout_seconds`. So a
+    /// burst of one-shot commands, each its own process and each long gone,
+    /// filled the table and every new client was refused for minutes.
+    #[tokio::test]
+    async fn clients_that_have_closed_their_connections_hold_no_slot() {
+        let manager = ResourceManager::with_limits(ResourceLimits {
+            max_connections: 2,
+            ..Default::default()
+        });
 
-        // Now third connection should succeed
-        assert!(
+        for pid in 0..10 {
+            let slot = manager.open_connection().expect("a slot for each command");
             manager
-                .register_connection("client3".to_string(), None)
-                .await
-                .is_ok()
-        );
+                .register_connection(format!("1000:{pid}"), None)
+                .await;
+            drop(slot);
+        }
+
+        assert_eq!(manager.client_count().await, 10);
+        assert_eq!(manager.open_connections(), 0);
+        assert!(manager.open_connection().is_ok());
     }
 
     #[tokio::test]
@@ -272,8 +312,7 @@ mod tests {
         // Register a connection
         manager
             .register_connection("client1".to_string(), None)
-            .await
-            .unwrap();
+            .await;
 
         // First 3 requests should succeed
         for _ in 0..3 {
@@ -301,8 +340,7 @@ mod tests {
 
         manager
             .register_connection("client1".to_string(), None)
-            .await
-            .unwrap();
+            .await;
 
         // Consume the whole per-minute budget on the first connection.
         for _ in 0..3 {
@@ -313,47 +351,13 @@ mod tests {
         // be a no-op that keeps the existing window — not a fresh start.
         manager
             .register_connection("client1".to_string(), None)
-            .await
-            .unwrap();
+            .await;
 
         // So the next request is still over quota. Before the fix this
         // reset the count and erroneously returned Ok.
         assert!(
             manager.record_request("client1").await.is_err(),
             "re-registration must not hand the client a fresh rate-limit budget"
-        );
-    }
-
-    /// Re-registration is also exempt from the connection cap: an existing
-    /// client that reconnects while the table is full is still allowed,
-    /// since it's already counted. (A genuinely new client at the cap is
-    /// rejected — covered by `test_connection_limiting`.)
-    #[tokio::test]
-    async fn reregistering_at_capacity_is_allowed() {
-        let limits = ResourceLimits {
-            max_connections: 1,
-            ..Default::default()
-        };
-        let manager = ResourceManager::with_limits(limits);
-
-        manager
-            .register_connection("client1".to_string(), None)
-            .await
-            .unwrap();
-        // Table is full, but re-registering the SAME client must succeed.
-        assert!(
-            manager
-                .register_connection("client1".to_string(), None)
-                .await
-                .is_ok(),
-            "an already-registered client must not be rejected by the cap"
-        );
-        // A different client at capacity is still rejected.
-        assert!(
-            manager
-                .register_connection("client2".to_string(), None)
-                .await
-                .is_err()
         );
     }
 
@@ -368,9 +372,8 @@ mod tests {
         // Register a connection
         manager
             .register_connection("client1".to_string(), None)
-            .await
-            .unwrap();
-        assert_eq!(manager.connection_count().await, 1);
+            .await;
+        assert_eq!(manager.client_count().await, 1);
 
         // Wait for timeout + cleanup interval
         sleep(TokioDuration::from_secs(2)).await;
@@ -391,19 +394,18 @@ mod tests {
         // Register some connections and make requests
         manager
             .register_connection("client1".to_string(), None)
-            .await
-            .unwrap();
+            .await;
         manager
             .register_connection("client2".to_string(), None)
-            .await
-            .unwrap();
+            .await;
 
         manager.record_request("client1").await.unwrap();
         manager.record_request("client2").await.unwrap();
 
         let stats = manager.get_stats().await;
-        assert_eq!(stats.total_connections, 2);
-        assert_eq!(stats.active_connections, 2);
+        assert_eq!(stats.clients, 2);
+        assert_eq!(stats.active_clients, 2);
+        assert_eq!(stats.open_connections, 0);
         assert_eq!(stats.total_requests_last_minute, 2);
     }
 }

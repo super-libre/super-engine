@@ -10,9 +10,7 @@ use crate::auth::consent::ConsentKey;
 use crate::auth::identity::resolve_peer_identity;
 use crate::auth::tokens::{TokenMeta, TokenStore};
 use crate::http::PeerInfo;
-use crate::http::responses::{
-    auth_err, error_response, invalid_session, rate_limited, reason, scope_denied,
-};
+use crate::http::responses::{auth_err, invalid_session, rate_limited, reason, scope_denied};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -228,23 +226,9 @@ pub async fn require_allowed_origin(
     // Registering here, where the identity is first known, is what makes the
     // two agree. It is idempotent per id, so this is a lookup on all but the
     // first request of each origin.
-    let client_id = peer.client_id();
-    if let Err(e) = auth
-        .resource_manager()
-        .register_connection(client_id.clone(), None)
-        .await
-    {
-        log::warn!("connection rejected for {client_id}: {e}");
-        return refuse(
-            request,
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "connection_rejected",
-                "too_many_clients",
-            ),
-        )
+    auth.resource_manager()
+        .register_connection(peer.client_id(), None)
         .await;
-    }
     request.extensions_mut().insert(peer);
 
     cors_headers(&origin, next.run(request).await)
