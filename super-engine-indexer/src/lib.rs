@@ -118,7 +118,7 @@ async fn run_build<P: Product>(indexer: &Indexer, args: BuildArgs) -> anyhow::Re
     let prior = match args.prior_index.as_ref() {
         Some(p) if p.exists() => {
             let text = std::fs::read_to_string(p)?;
-            Some(serde_json::from_str::<Index<P::IndexModel, P::IndexBackend>>(&text)?)
+            Some(serde_json::from_str::<Index<P::IndexModel>>(&text)?)
         }
         _ => None,
     };
@@ -129,7 +129,7 @@ async fn run_build<P: Product>(indexer: &Indexer, args: BuildArgs) -> anyhow::Re
     let http = super_engine_forge::http::download_client(indexer.user_agent);
     let now_iso = chrono_now_iso();
 
-    let mut out_backends: Vec<IndexBackend<P::IndexModel, P::IndexBackend>> = Vec::new();
+    let mut out_backends: Vec<IndexBackend<P::IndexModel>> = Vec::new();
 
     for (id, entry) in &registry.0 {
         if entry.removed {
@@ -200,7 +200,7 @@ async fn build_entry<P: Product>(
     id: &str,
     entry: &registry_toml::Entry,
     repo: &RepoRef,
-) -> Result<IndexBackend<P::IndexModel, P::IndexBackend>, BuildFailure> {
+) -> Result<IndexBackend<P::IndexModel>, BuildFailure> {
     let resolved = resolve::resolve(client, repo, entry)
         .await
         .map_err(|e| BuildFailure {
@@ -356,7 +356,7 @@ pub(crate) fn into_index_backend<P: Product>(
     tag: String,
     assets: IndexAssets,
     manifest: Option<IndexAsset>,
-) -> IndexBackend<P::IndexModel, P::IndexBackend> {
+) -> IndexBackend<P::IndexModel> {
     IndexBackend::from_manifest(id.to_string(), m, version, tag, assets, manifest)
 }
 
@@ -365,7 +365,7 @@ pub(crate) fn into_index_backend<P: Product>(
 /// the two install directories is picked as the winner and the other is
 /// removed from disk — so a collision must never be published: fail the build
 /// instead.
-fn ensure_unique_sources<M, B>(backends: &[IndexBackend<M, B>]) -> anyhow::Result<()> {
+fn ensure_unique_sources<M>(backends: &[IndexBackend<M>]) -> anyhow::Result<()> {
     let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for b in backends {
         if let Some(prev_id) = seen.insert(b.source.as_str(), b.id.as_str()) {
@@ -393,7 +393,7 @@ fn ensure_unique_sources<M, B>(backends: &[IndexBackend<M, B>]) -> anyhow::Resul
 /// `id` and [`manifest::validate`] pins the release to it, so a fresh entry
 /// always has one; only an entry carried forward from an index built before
 /// the requirement could lack it, and a daemon would refuse to install it.
-fn ensure_unique_backend_ids<M, B>(backends: &[IndexBackend<M, B>]) -> anyhow::Result<()> {
+fn ensure_unique_backend_ids<M>(backends: &[IndexBackend<M>]) -> anyhow::Result<()> {
     let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for b in backends {
         let Some(backend_id) = b.backend_id.as_deref() else {
@@ -422,7 +422,7 @@ fn chrono_now_iso() -> String {
 mod tests {
     use super::*;
 
-    fn backend(id: &str, source: &str) -> IndexBackend<(), ()> {
+    fn backend(id: &str, source: &str) -> IndexBackend<()> {
         IndexBackend {
             id: id.into(),
             backend_id: None,
@@ -440,7 +440,7 @@ mod tests {
             online: false,
             supports_gpu: false,
             supports_cpu: true,
-            product: (),
+            supports: Vec::new(),
             models: Vec::new(),
             secrets: Vec::new(),
             options: Vec::new(),

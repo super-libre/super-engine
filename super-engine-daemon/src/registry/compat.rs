@@ -125,7 +125,7 @@ const MAX_ECHOED_CONTRACT: usize = 16;
 /// version would otherwise produce advice the user has already followed.
 fn contract_block<P: Product>(
     daemon: &Daemon,
-    entry: &IndexBackend<P::IndexModel, P::IndexBackend>,
+    entry: &IndexBackend<P::IndexModel>,
 ) -> Option<String> {
     if entry.contract.parse::<P::Contract>().is_ok() {
         return None;
@@ -155,7 +155,7 @@ fn contract_block<P: Product>(
 pub fn select<P: Product>(
     daemon: &Daemon,
     host: &Host,
-    entry: &IndexBackend<P::IndexModel, P::IndexBackend>,
+    entry: &IndexBackend<P::IndexModel>,
 ) -> Selection {
     // Before any asset question: a backend this daemon cannot drive has no
     // compatible asset, whatever the host looks like. Listing, install and
@@ -228,7 +228,7 @@ pub fn select<P: Product>(
 pub fn select_accel<P: Product>(
     daemon: &Daemon,
     host: &Host,
-    entry: &IndexBackend<P::IndexModel, P::IndexBackend>,
+    entry: &IndexBackend<P::IndexModel>,
     accel: Accel,
 ) -> Selection {
     let selection = select::<P>(daemon, &host.restricted_to(accel), entry);
@@ -739,10 +739,7 @@ fn file_requirement(file: &FileSpec) -> String {
 }
 
 #[must_use]
-pub fn to_selected_asset<M, B>(
-    entry: &IndexBackend<M, B>,
-    sel: &Selection,
-) -> Option<SelectedAsset> {
+pub fn to_selected_asset<M>(entry: &IndexBackend<M>, sel: &Selection) -> Option<SelectedAsset> {
     match sel {
         Selection::Wasm => entry.assets.wasm.as_ref().map(|_| SelectedAsset {
             target: String::new(),
@@ -772,10 +769,7 @@ mod tests {
     use super_engine_spec::product::Generation;
     use super_engine_spec::test_product::{self, Contract, TestProduct};
 
-    type IndexBackend = super_engine_spec::index::IndexBackend<
-        test_product::IndexModel,
-        test_product::IndexBackend,
-    >;
+    type IndexBackend = super_engine_spec::index::IndexBackend<test_product::IndexModel>;
 
     /// A daemon of the test product at 0.2.0.
     const DAEMON: Daemon = Daemon {
@@ -807,7 +801,7 @@ mod tests {
             online: false,
             supports_gpu: true,
             supports_cpu: true,
-            product: test_product::IndexBackend::default(),
+            supports: Vec::new(),
             models: vec![],
             secrets: vec![],
             options: vec![],

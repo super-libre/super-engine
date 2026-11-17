@@ -33,10 +33,6 @@ pub trait Product: Clone + fmt::Debug + Send + Sync + 'static {
     /// The per-model fields this product's registry index carries beside
     /// `name` and `supported_devices`.
     type IndexModel: Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync;
-    /// The backend-level fields this product's registry index carries beside
-    /// `online`, `supports_gpu` and `supports_cpu`: what the backend's models
-    /// can do, summed up per backend. See [`index_backend`](Self::index_backend).
-    type IndexBackend: Serialize + DeserializeOwned + Clone + fmt::Debug + Send + Sync;
 
     /// The product's slug, e.g. `super-stt`: the value a manifest's
     /// `[backend].product` names, beside its [`FORMER_SLUGS`](Self::FORMER_SLUGS).
@@ -79,15 +75,16 @@ pub trait Product: Clone + fmt::Debug + Send + Sync + 'static {
         model: &ModelEntry<Self::Model>,
     ) -> Self::IndexModel;
 
-    /// The backend-level index fields for one backend, summed up from what
-    /// [`index_model`](Self::index_model) gave each of its models.
+    /// What a backend's models can do beyond what the engine reads off their
+    /// devices, as entries of its index entry's `supports` list, summed up
+    /// from what [`index_model`](Self::index_model) gave each model.
     ///
-    /// The same idea as `online`, `supports_gpu` and `supports_cpu`, which the
-    /// index sums up from the models' devices: a client reads what a backend
-    /// can do off the entry, without walking its models. Built from the
-    /// models' index fields rather than declared, so an entry cannot claim
-    /// what none of its models says.
-    fn index_backend(models: &[crate::index::IndexModel<Self::IndexModel>]) -> Self::IndexBackend;
+    /// Built from the models rather than declared, so an entry cannot claim
+    /// what none of its models says. None by default.
+    fn index_supports(models: &[crate::index::IndexModel<Self::IndexModel>]) -> Vec<String> {
+        let _ = models;
+        Vec::new()
+    }
 }
 
 /// A backend-protocol contract generation: the one thing a manifest declares

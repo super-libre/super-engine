@@ -63,7 +63,7 @@ pub struct Daemon {
 /// `.staging` is a perfectly good path component but names the shared staging
 /// root every install writes through.
 #[must_use]
-pub fn install_dir_name<M, B>(entry: &IndexBackend<M, B>) -> &str {
+pub fn install_dir_name<M>(entry: &IndexBackend<M>) -> &str {
     match entry.backend_id.as_deref() {
         Some(id) if super_engine_spec::backend_id::is_valid(id) => id,
         _ => &entry.id,

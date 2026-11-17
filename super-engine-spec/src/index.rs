@@ -12,13 +12,23 @@
 //! same extension pattern `validate_runtime` uses for `Manifest`.
 //!
 //! The per-model fields a product adds are the `M` every type here carries —
-//! [`Product::IndexModel`] — flattened into each model entry. Its backend-level
-//! fields are the `B` — [`Product::IndexBackend`] — flattened into each backend
-//! entry.
+//! [`Product::IndexModel`] — flattened into each model entry.
 
 use crate::manifest::{Device, Manifest, ModelEntry};
 use crate::product::{Generation, Product};
 use serde::{Deserialize, Serialize};
+
+/// The entries of [`IndexBackend::supports`] the engine fills itself, from the
+/// models' devices. A product adds its own through
+/// [`Product::index_supports`].
+pub mod supports {
+    /// A model can run on a GPU: [`IndexBackend::supports_gpu`].
+    pub const GPU: &str = "gpu";
+    /// A model can run on the CPU: [`IndexBackend::supports_cpu`].
+    pub const CPU: &str = "cpu";
+    /// A model runs remotely: [`IndexBackend::online`].
+    pub const ONLINE: &str = "online";
+}
 
 /// `index.json` schema version the indexer emits.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -29,15 +39,15 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MIN_CLIENT: &str = "0.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Index<M, B> {
+pub struct Index<M> {
     pub schema_version: u32,
     pub generated_at: String,
     pub min_client: String,
-    pub backends: Vec<IndexBackend<M, B>>,
+    pub backends: Vec<IndexBackend<M>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexBackend<M, B> {
+pub struct IndexBackend<M> {
     pub id: String,
     /// The backend's reverse-DNS identifier from its release manifest. Names
     /// the install directory.
@@ -79,10 +89,18 @@ pub struct IndexBackend<M, B> {
     pub online: bool,
     pub supports_gpu: bool,
     pub supports_cpu: bool,
-    /// The backend-level fields the product adds ([`Product::IndexBackend`]),
-    /// summed up from the models like the three flags above.
-    #[serde(flatten)]
-    pub product: B,
+    /// What the backend can do, as one list a client reads instead of the
+    /// flags above: [`supports::GPU`], [`supports::CPU`] and
+    /// [`supports::ONLINE`] mirror `supports_gpu`, `supports_cpu` and
+    /// `online`, and the product adds its own entries
+    /// ([`Product::index_supports`]). Worked out from the models, never
+    /// declared. The flags stay for daemons that predate the list.
+    ///
+    /// Strings, not a closed set: a client meets entries added after it was
+    /// built, and must skip those rather than fail to read the index. Empty on
+    /// an index published before the field existed.
+    #[serde(default)]
+    pub supports: Vec<String>,
     pub models: Vec<IndexModel<M>>,
     pub secrets: Vec<IndexSecret>,
     pub options: Vec<IndexOption>,
@@ -174,7 +192,7 @@ fn model_support<M>(models: &[ModelEntry<M>]) -> ModelSupport {
     }
 }
 
-impl<M, B> IndexBackend<M, B> {
+impl<M> IndexBackend<M> {
     /// Assemble the manifest-derived fields of an index entry from a validated
     /// [`Manifest`]. The caller supplies the source-specific pins — the resolved
     /// `id`, `version`, `tag`, hashed `assets`, and optional pinned `manifest`
@@ -182,15 +200,15 @@ impl<M, B> IndexBackend<M, B> {
     /// maintainer-declared id + release version; custom-repo/local-dir use
     /// [`id_from_source`] + the manifest version).
     ///
-    /// Everything else — `online`/`supports_gpu`/`supports_cpu`, the product's
-    /// own fields of each model and of the backend, and the
+    /// Everything else — `online`/`supports_gpu`/`supports_cpu`, the
+    /// `supports` list, the product's fields of each model, and the
     /// secret/option label (falls back to the item `name`) and option `type`
     /// (defaults to `"string"`) — is derived here so every install path renders
     /// a backend identically. This is the single mapping that the indexer, the
     /// custom-repo resolver, and the local-dir resolver all share; previously
     /// the local-dir path silently dropped secrets and options entirely.
     #[must_use]
-    pub fn from_manifest<P: Product<IndexModel = M, IndexBackend = B>>(
+    pub fn from_manifest<P: Product<IndexModel = M>>(
         id: String,
         m: Manifest<P>,
         version: String,
@@ -217,7 +235,16 @@ impl<M, B> IndexBackend<M, B> {
                     .collect(),
             })
             .collect();
-        let product = P::index_backend(&models);
+        let mut listed: Vec<String> = [
+            (supports::GPU, supports_gpu),
+            (supports::CPU, supports_cpu),
+            (supports::ONLINE, online),
+        ]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(entry, _)| entry.to_string())
+        .collect();
+        listed.extend(P::index_supports(&models));
         Self {
             id,
             backend_id: m.backend.id,
@@ -235,7 +262,7 @@ impl<M, B> IndexBackend<M, B> {
             online,
             supports_gpu,
             supports_cpu,
-            product,
+            supports: listed,
             models,
             secrets: m
                 .secrets
@@ -397,8 +424,8 @@ mod tests {
     use super::*;
     use crate::test_product::{self, Model, Role as ModelRole, TestProduct};
 
-    type Index = super::Index<test_product::IndexModel, test_product::IndexBackend>;
-    type IndexBackend = super::IndexBackend<test_product::IndexModel, test_product::IndexBackend>;
+    type Index = super::Index<test_product::IndexModel>;
+    type IndexBackend = super::IndexBackend<test_product::IndexModel>;
     type IndexModel = super::IndexModel<test_product::IndexModel>;
     type Manifest = crate::manifest::Manifest<TestProduct>;
     type ModelEntry = crate::manifest::ModelEntry<Model>;
@@ -545,9 +572,7 @@ mod tests {
                 online: true,
                 supports_gpu: false,
                 supports_cpu: false,
-                product: test_product::IndexBackend {
-                    post_processes: true,
-                },
+                supports: Vec::new(),
                 models: vec![],
                 secrets: vec![],
                 options: vec![],
@@ -567,22 +592,21 @@ mod tests {
         let back: Index = serde_json::from_str(&s).unwrap();
         assert_eq!(back.backends.len(), 1);
         assert_eq!(back.backends[0].id, "openai");
-        assert!(back.backends[0].product.post_processes);
     }
 
-    /// A v2 manifest of the test product with one model per role in `roles`.
-    fn manifest_with_roles(roles: &[&str]) -> Manifest {
-        let models: String = roles
+    /// A v2 manifest of the test product with one model per `(role, device)`.
+    fn manifest_with_models(models: &[(&str, &str)]) -> Manifest {
+        let models: String = models
             .iter()
             .enumerate()
-            .map(|(i, role)| {
+            .map(|(i, (role, device))| {
                 format!(
                     r#"
                     [[models]]
                     name = "m{i}"
                     primary_language = "en"
                     supported_languages = ["en"]
-                    supported_devices = ["cpu"]
+                    supported_devices = ["{device}"]
                     role = "{role}"
                     "#
                 )
@@ -609,59 +633,64 @@ mod tests {
         .unwrap()
     }
 
-    /// The product's backend-level fields are summed up from its models' index
-    /// fields, the way the engine sums up `online` and the device flags: the
-    /// test product says a backend post-processes when one of its models does.
+    /// `supports` lists what the flags beside it say, then what the product
+    /// adds, all worked out from the models: the test product adds that a
+    /// backend post-processes when one of its models does.
     #[test]
-    fn from_manifest_sums_up_the_products_backend_fields_from_its_models() {
-        for (roles, post_processes) in [
-            (&["transcription"][..], false),
-            (&["transcription", "post_processor"][..], true),
-            (&[][..], false),
+    fn from_manifest_lists_what_the_backend_supports() {
+        for (models, listed) in [
+            (&[("transcription", "cpu")][..], &["cpu"][..]),
+            (
+                &[("transcription", "gpu"), ("transcription", "cpu")][..],
+                &["gpu", "cpu"][..],
+            ),
+            (&[("transcription", "none")][..], &["online"][..]),
+            (
+                &[("transcription", "gpu"), ("post_processor", "none")][..],
+                &["gpu", "online", test_product::POST_PROCESSES][..],
+            ),
         ] {
             let b = IndexBackend::from_manifest(
                 "y".into(),
-                manifest_with_roles(roles),
+                manifest_with_models(models),
                 "1.0.0".into(),
                 "v1.0.0".into(),
                 IndexAssets::default(),
                 None,
             );
-            assert_eq!(b.product.post_processes, post_processes, "{roles:?}");
+            assert_eq!(b.supports, listed, "{models:?}");
+            assert_eq!(b.supports_gpu, listed.contains(&supports::GPU));
+            assert_eq!(b.supports_cpu, listed.contains(&supports::CPU));
+            assert_eq!(b.online, listed.contains(&supports::ONLINE));
         }
     }
 
-    /// The product's backend-level fields sit on the entry itself, beside
-    /// `supports_cpu`, not under a key of their own: a client reads them
-    /// exactly as it reads the engine's flags.
+    /// An index published before `supports` existed still parses, with an
+    /// empty list, and one carrying an entry this build does not know parses
+    /// too: a client skips what it does not know rather than fail the index.
     #[test]
-    fn the_products_backend_fields_are_flattened_into_the_entry() {
-        let b = IndexBackend::from_manifest(
-            "y".into(),
-            manifest_with_roles(&["post_processor"]),
-            "1.0.0".into(),
-            "v1.0.0".into(),
-            IndexAssets::default(),
-            None,
+    fn an_index_entry_parses_with_any_supports_or_none() {
+        let entry = |extra: serde_json::Value| {
+            let mut json = serde_json::json!({
+                "id": "y", "source": "github.com/x/y", "version": "1.0.0", "tag": "v1.0.0",
+                "name": "Y", "kind": "wasm", "contract": "v1", "entrypoint": "y.wasm",
+                "online": false, "supports_gpu": false, "supports_cpu": true,
+                "models": [], "secrets": [], "options": [], "assets": {}
+            });
+            if let serde_json::Value::Object(extra) = extra {
+                json.as_object_mut().unwrap().extend(extra);
+            }
+            serde_json::from_value::<IndexBackend>(json)
+        };
+        assert!(
+            entry(serde_json::json!({}))
+                .expect("parses")
+                .supports
+                .is_empty()
         );
-        let v = serde_json::to_value(&b).expect("serializes");
-        assert_eq!(v["post_processes"], serde_json::json!(true), "{v}");
-        assert!(v.get("product").is_none(), "{v}");
-    }
-
-    /// An index published before a product field existed still parses, each
-    /// field reading as the product's default rather than failing the whole
-    /// catalog.
-    #[test]
-    fn an_index_entry_without_the_products_backend_fields_still_parses() {
-        let json = serde_json::json!({
-            "id": "y", "source": "github.com/x/y", "version": "1.0.0", "tag": "v1.0.0",
-            "name": "Y", "kind": "wasm", "contract": "v1", "entrypoint": "y.wasm",
-            "online": false, "supports_gpu": false, "supports_cpu": true,
-            "models": [], "secrets": [], "options": [], "assets": {}
-        });
-        let b: IndexBackend = serde_json::from_value(json).expect("older entry parses");
-        assert!(!b.product.post_processes);
+        let later = entry(serde_json::json!({ "supports": ["cpu", "teleports"] }))
+            .expect("an entry this build does not know parses");
+        assert_eq!(later.supports, ["cpu", "teleports"]);
     }
 
     /// The unified synthesis maps secrets and options (the local-dir path used

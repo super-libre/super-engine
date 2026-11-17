@@ -9,15 +9,15 @@ use super_engine_spec::index::{IndexBackend, IndexStale};
 /// release can pin an old (possibly vulnerable) version.
 pub const MAX_STALENESS_DAYS: i64 = 30;
 
-pub fn maybe_carry_forward<M: Clone, B: Clone>(
+pub fn maybe_carry_forward<M: Clone>(
     id: &str,
-    prior: Option<&IndexBackend<M, B>>,
+    prior: Option<&IndexBackend<M>>,
     error: &str,
     attempted_version: &str,
     attempted_tag: &str,
     now_iso: &str,
     max_staleness_days: i64,
-) -> Option<IndexBackend<M, B>> {
+) -> Option<IndexBackend<M>> {
     let prior = prior?;
     if prior.id != id {
         return None;
@@ -56,7 +56,7 @@ mod tests {
     use super::*;
     use super_engine_spec::index::*;
 
-    fn dummy(id: &str) -> IndexBackend<(), ()> {
+    fn dummy(id: &str) -> IndexBackend<()> {
         IndexBackend {
             id: id.into(),
             backend_id: None,
@@ -74,7 +74,7 @@ mod tests {
             online: false,
             supports_gpu: false,
             supports_cpu: false,
-            product: (),
+            supports: Vec::new(),
             models: vec![],
             secrets: vec![],
             options: vec![],
@@ -145,8 +145,7 @@ mod tests {
     #[test]
     fn returns_none_when_no_prior() {
         assert!(
-            maybe_carry_forward::<(), ()>("openai", None, "x", "1.0.0", "v1.0.0", "now", 30)
-                .is_none()
+            maybe_carry_forward::<()>("openai", None, "x", "1.0.0", "v1.0.0", "now", 30).is_none()
         );
     }
 }
