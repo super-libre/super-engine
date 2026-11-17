@@ -3,11 +3,10 @@
 //! this host sees them, and the install, update and refresh requests and
 //! replies. All fields `snake_case`.
 //!
-//! The model entries carry the product's own fields, and so does each backend
-//! entry, so the types that hold them are generic. Each is generic over the
-//! whole type it holds — a [`RegistryBackend`] over its model entry, a
-//! [`RegistryListResponse`] over its backend — rather than over the product's
-//! model fields: utoipa names a
+//! The model entries carry the product's own fields, so the types that hold
+//! them are generic. Each is generic over the whole type it holds — a
+//! [`RegistryBackend`] over its model entry, a [`RegistryListResponse`] over
+//! its backend — rather than over the product's fields: utoipa names a
 //! schema after the type arguments written inside another schema, which
 //! would publish `RegistryBackend` as `RegistryBackend_SttIndexModel`. A
 //! product binds them once, with its [`RegistryModel`], and lists
@@ -34,7 +33,7 @@ pub struct RegistryListResponse<Backend> {
 #[allow(clippy::struct_excessive_bools)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegistryBackend<Model, Fields> {
+pub struct RegistryBackend<Model> {
     pub id: String,
     /// The backend's reverse-DNS identifier, or `None` when the registry entry
     /// predates it. Names the install directory.
@@ -61,15 +60,11 @@ pub struct RegistryBackend<Model, Fields> {
     pub online: bool,
     pub supports_gpu: bool,
     pub supports_cpu: bool,
-    /// The backend-level fields the product adds, as the index carries them
-    /// ([`Product::IndexBackend`](crate::product::Product::IndexBackend)).
-    //
-    // Inlined in the OpenAPI schema, like a model's product fields: a
-    // flattened field is otherwise emitted as a reference to the product's
-    // type, which nothing registers in a daemon's document.
-    #[serde(flatten)]
-    #[cfg_attr(feature = "openapi", schema(inline))]
-    pub product: Fields,
+    /// What the backend can do, as the index lists it
+    /// ([`IndexBackend::supports`](crate::index::IndexBackend::supports)).
+    /// Empty from a daemon or an index from before the list.
+    #[serde(default)]
+    pub supports: Vec<String>,
     // The product's `RegistryModel`s.
     pub models: Vec<Model>,
     pub secrets: Vec<RegistrySecret>,
@@ -242,9 +237,9 @@ pub struct RefreshResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_product::{IndexBackend, IndexModel};
+    use crate::test_product::IndexModel;
 
-    type RegistryBackend = super::RegistryBackend<super::RegistryModel<IndexModel>, IndexBackend>;
+    type RegistryBackend = super::RegistryBackend<super::RegistryModel<IndexModel>>;
 
     /// The minimal registry listing entry every test below starts from,
     /// extending it with `serde_json::Value` indexing for the field each test

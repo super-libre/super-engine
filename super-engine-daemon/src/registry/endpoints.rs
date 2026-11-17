@@ -75,16 +75,15 @@ pub trait RegistryHost: Send + Sync + 'static {
 }
 
 type IndexModelOf<H> = <<H as RegistryHost>::Product as Product>::IndexModel;
-type IndexBackendOf<H> = <<H as RegistryHost>::Product as Product>::IndexBackend;
-type Entry<H> = IndexBackend<IndexModelOf<H>, IndexBackendOf<H>>;
-type Backend<H> = RegistryBackend<RegistryModel<IndexModelOf<H>>, IndexBackendOf<H>>;
+type Entry<H> = IndexBackend<IndexModelOf<H>>;
+type Backend<H> = RegistryBackend<RegistryModel<IndexModelOf<H>>>;
 
 /// What the registry endpoints share: the daemon, its index client, and the
 /// installs in flight. A daemon keeps one in its router state; clones share
 /// all three.
 pub struct Registry<H: RegistryHost> {
     host: Arc<H>,
-    client: Arc<Client<IndexModelOf<H>, IndexBackendOf<H>>>,
+    client: Arc<Client<IndexModelOf<H>>>,
     /// The `source` of every install or update in flight, so a second one
     /// for the same backend is refused rather than racing the first.
     in_flight: Arc<Mutex<HashSet<String>>>,
@@ -102,7 +101,7 @@ impl<H: RegistryHost> Clone for Registry<H> {
 
 impl<H: RegistryHost> Registry<H> {
     #[must_use]
-    pub fn new(host: Arc<H>, client: Client<IndexModelOf<H>, IndexBackendOf<H>>) -> Self {
+    pub fn new(host: Arc<H>, client: Client<IndexModelOf<H>>) -> Self {
         Self {
             host,
             client: Arc::new(client),
@@ -112,7 +111,7 @@ impl<H: RegistryHost> Registry<H> {
 
     /// The index client.
     #[must_use]
-    pub fn client(&self) -> &Client<IndexModelOf<H>, IndexBackendOf<H>> {
+    pub fn client(&self) -> &Client<IndexModelOf<H>> {
         &self.client
     }
 }
@@ -288,7 +287,7 @@ pub async fn list<H: RegistryHost>(registry: &Registry<H>, query: &ListQuery) ->
 }
 
 /// Whether `entry` survives the listing's filters.
-fn passes_filters<M, B>(entry: &IndexBackend<M, B>, query: &ListQuery) -> bool {
+fn passes_filters<M>(entry: &IndexBackend<M>, query: &ListQuery) -> bool {
     if let Some(ref kind) = query.kind
         && &entry.kind != kind
     {
@@ -321,7 +320,7 @@ fn passes_filters<M, B>(entry: &IndexBackend<M, B>, query: &ListQuery) -> bool {
 async fn builds<P: Product>(
     daemon: &Daemon,
     host: &Host,
-    entry: &IndexBackend<P::IndexModel, P::IndexBackend>,
+    entry: &IndexBackend<P::IndexModel>,
     backends_dir: &Path,
 ) -> Vec<Build> {
     let dir_name = install_dir_name(entry);
@@ -355,7 +354,7 @@ fn asset_size(asset: &IndexSubprocessAsset) -> u64 {
 }
 
 /// How `sel`, the build this host would get of `entry`, reads on the wire.
-fn compatibility<M, B>(entry: &IndexBackend<M, B>, sel: &Selection) -> Compatibility {
+fn compatibility<M>(entry: &IndexBackend<M>, sel: &Selection) -> Compatibility {
     Compatibility {
         compatible: sel.reason().is_none(),
         selected_asset: compat::to_selected_asset(entry, sel),
@@ -429,11 +428,11 @@ fn update_available(installed: Option<&str>, index_version: &str, compatible: bo
 }
 
 /// `entry` as the listing shows it.
-fn map_entry<M: Clone, B: Clone>(
-    entry: &IndexBackend<M, B>,
+fn map_entry<M: Clone>(
+    entry: &IndexBackend<M>,
     compatibility: Compatibility,
     installed_version: Option<String>,
-) -> RegistryBackend<RegistryModel<M>, B> {
+) -> RegistryBackend<RegistryModel<M>> {
     RegistryBackend {
         id: entry.id.clone(),
         backend_id: entry.backend_id.clone(),
@@ -449,7 +448,7 @@ fn map_entry<M: Clone, B: Clone>(
         online: entry.online,
         supports_gpu: entry.supports_gpu,
         supports_cpu: entry.supports_cpu,
-        product: entry.product.clone(),
+        supports: entry.supports.clone(),
         models: entry
             .models
             .iter()

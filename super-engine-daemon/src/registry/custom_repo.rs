@@ -60,7 +60,7 @@ pub enum ResolveError {
 pub async fn resolve<P: Product>(
     client: &dyn ForgeClient,
     repo_url: &str,
-) -> Result<IndexBackend<P::IndexModel, P::IndexBackend>, ResolveError> {
+) -> Result<IndexBackend<P::IndexModel>, ResolveError> {
     let repo = RepoRef::parse(repo_url).map_err(|_| ResolveError::BadRepoUrl(repo_url.into()))?;
     // A 404 here is the ordinary case, not a forge outage: the repo has no
     // published release yet, or is private, or does not exist. Left as a

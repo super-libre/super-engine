@@ -153,22 +153,11 @@ fn default_role() -> String {
     Role::default().to_string()
 }
 
-/// The test product's backend-level index fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct IndexBackend {
-    /// Whether any of the backend's models post-processes, read as `false`
-    /// when an index omits it.
-    #[serde(default)]
-    pub post_processes: bool,
-}
-
 impl Product for TestProduct {
     type Contract = Contract;
     type Capabilities = Capabilities;
     type Model = Model;
     type IndexModel = IndexModel;
-    type IndexBackend = IndexBackend;
 
     const SLUG: &'static str = "super-test";
     const FORMER_SLUGS: &'static [&'static str] = &["super-test-before"];
@@ -213,11 +202,16 @@ impl Product for TestProduct {
         }
     }
 
-    fn index_backend(models: &[crate::index::IndexModel<IndexModel>]) -> IndexBackend {
-        IndexBackend {
-            post_processes: models
-                .iter()
-                .any(|m| m.product.role == Role::PostProcessor.to_string()),
-        }
+    fn index_supports(models: &[crate::index::IndexModel<IndexModel>]) -> Vec<String> {
+        models
+            .iter()
+            .any(|m| m.product.role == Role::PostProcessor.to_string())
+            .then(|| POST_PROCESSES.to_string())
+            .into_iter()
+            .collect()
     }
 }
+
+/// The entry the test product adds to an index entry's `supports` when one of
+/// its models post-processes.
+pub const POST_PROCESSES: &str = "post_processes";
