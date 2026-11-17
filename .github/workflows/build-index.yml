@@ -35,7 +35,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # A build from a cold cache, after a lockfile change, took 5m 3s and was
+    # cancelled at the old limit of 5. Being cancelled, it saved no cache, so
+    # the next run was cold again.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,6 +61,9 @@ jobs:
             ~/.cargo/git
             src/target
           key: build-index-${{ hashFiles('src/Cargo.lock') }}
+          # A changed lockfile (every super-engine pin bump) misses the key;
+          # start from the last cache rather than from nothing.
+          restore-keys: build-index-
 
       - name: Build indexer
         working-directory: src
