@@ -8,7 +8,7 @@
 //! version compared against is the daemon's own, which the daemon passes in:
 //! this crate's version is not the product's.
 
-use super_engine_forge::{ForgeClient, Release, ReleaseAsset, ReleaseKind, RepoRef};
+use super_engine_forge::{ForgeClient, ForgeError, Release, ReleaseAsset, ReleaseKind, RepoRef};
 use super_engine_protocol::ProductSpec;
 use super_engine_protocol::models::self_update::{InstallerAsset, SelfUpdateStatus};
 use super_engine_protocol::models::update_beta_optin::UpdateBetaOptIn;
@@ -351,6 +351,11 @@ impl SelfUpdateChecker {
         let include_pre = self.effective_beta_optin(optin);
         let repo = RepoRef::parse(self.product.repo).expect("static repo ref");
         let result = client.list_releases(&repo).await;
+        if let Err(e) = &result {
+            // The whole error, URL and all, for whoever reads the log; the
+            // status carries `check_failure`'s sentence.
+            log::warn!("update check failed: {e}");
+        }
         let checked_at = Some(chrono::Utc::now().to_rfc3339());
 
         let new_checker_state = match result {
@@ -407,7 +412,7 @@ impl SelfUpdateChecker {
                         latest_version,
                         update_available,
                         checked_at,
-                        last_check_error: Some(e.to_string()),
+                        last_check_error: Some(check_failure(&e)),
                         beta_optin_effective: include_pre,
                         installer_asset,
                     },
@@ -439,6 +444,31 @@ impl SelfUpdateChecker {
     /// check in this same run doesn't repeat it.
     pub async fn record_notified(&self, tag: &str) {
         *self.notified.lock().await = Some(tag.to_string());
+    }
+}
+
+/// What a failed check says in `last_check_error`, which the settings app
+/// shows under the time of the check.
+///
+/// The transport's own text names the client library and the request URL —
+/// `HTTP: error sending request for url (https://…/releases?per_page=100)` —
+/// and tells the person reading it nothing they can act on. This says what
+/// happened; the log keeps the whole error.
+fn check_failure(e: &ForgeError) -> String {
+    match e {
+        ForgeError::Http(e) if e.is_timeout() => "The update server didn't answer in time.".into(),
+        ForgeError::Http(e) if e.is_connect() => "Couldn't reach the update server.".into(),
+        ForgeError::Http(e) => match e.status() {
+            Some(status)
+                if status == reqwest::StatusCode::FORBIDDEN
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                "The update server is turning requests away for now. Try again later.".into()
+            }
+            Some(status) => format!("The update server answered {status}."),
+            None => "The update server's answer couldn't be read.".into(),
+        },
+        ForgeError::TooLarge { .. } => "The update server's answer was too large.".into(),
     }
 }
 
@@ -794,7 +824,43 @@ mod tests {
         assert!(did_check2, "uncontended call must perform its own check");
         assert_eq!(st2.latest_version.as_deref(), Some("v99.0.0"));
         assert!(st2.update_available);
-        assert!(st2.last_check_error.is_some());
+        assert_eq!(
+            st2.last_check_error.as_deref(),
+            Some("Couldn't reach the update server."),
+            "a person reads this on the Updates page, so it says what happened, not the URL"
+        );
+    }
+
+    /// A forge that answers with an error status says which.
+    #[tokio::test]
+    async fn a_refused_check_names_the_answer() {
+        let mut s = mockito::Server::new_async().await;
+        let _m = s
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .create_async()
+            .await;
+        let (st, _) = checker()
+            .run_check(&github(s.url()), UpdateBetaOptIn::Disabled)
+            .await;
+        assert_eq!(
+            st.last_check_error.as_deref(),
+            Some("The update server answered 500 Internal Server Error.")
+        );
+
+        let mut s = mockito::Server::new_async().await;
+        let _m = s
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(403)
+            .create_async()
+            .await;
+        let (st, _) = checker()
+            .run_check(&github(s.url()), UpdateBetaOptIn::Disabled)
+            .await;
+        assert_eq!(
+            st.last_check_error.as_deref(),
+            Some("The update server is turning requests away for now. Try again later.")
+        );
     }
 
     /// End-to-end wiring: a release carrying BOTH the installer binary asset
