@@ -7,7 +7,7 @@ mod connection;
 mod manager;
 
 pub use connection::ConnectionInfo;
-pub use manager::{ResourceManager, ResourceStats};
+pub use manager::{ConnectionSlot, ResourceManager, ResourceStats};
 
 /// Configuration for resource management limits
 #[derive(Debug, Clone)]
