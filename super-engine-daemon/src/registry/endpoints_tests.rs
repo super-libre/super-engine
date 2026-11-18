@@ -637,3 +637,16 @@ async fn an_install_with_no_predecessor_repoints_nothing() {
 
     assert!(host.replaced.lock().is_empty());
 }
+
+/// A source the registry does not list is a `404 not_found` that says so, not
+/// a bare code.
+#[tokio::test]
+async fn an_unlisted_source_is_named_in_the_message() {
+    let (status, v) = body_of(super::not_in_registry("github.com/no/such")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["error_code"], "not_found");
+    assert_eq!(
+        v["message"],
+        "The registry lists no backend with the source `github.com/no/such`."
+    );
+}

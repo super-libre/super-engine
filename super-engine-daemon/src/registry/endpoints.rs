@@ -161,6 +161,23 @@ pub fn error_with_message(status: StatusCode, code: &str, message: &str) -> Resp
     error_envelope(status, code, Some(message))
 }
 
+/// What `registry_unavailable` says when the index is needed and neither the
+/// registry nor a saved copy can supply it.
+const REGISTRY_UNAVAILABLE: &str =
+    "Couldn't reach the registry, and no copy of it is saved on this computer.";
+
+/// What `missing_body` says.
+const MISSING_BODY: &str = "The request has no JSON body.";
+
+/// `404 not_found` for a `source` the registry does not list.
+fn not_in_registry(source: &str) -> Response {
+    error_with_message(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        &format!("The registry lists no backend with the source `{source}`."),
+    )
+}
+
 fn error_envelope(status: StatusCode, code: &str, message: Option<&str>) -> Response {
     json(
         status,
@@ -239,7 +256,11 @@ pub struct UpdateBody {
 /// nothing is cached.
 pub async fn list<H: RegistryHost>(registry: &Registry<H>, query: &ListQuery) -> Response {
     let Ok(index) = registry.client.get().await else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable");
+        return error_with_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry_unavailable",
+            REGISTRY_UNAVAILABLE,
+        );
     };
 
     let daemon = registry.host.daemon();
@@ -505,7 +526,11 @@ pub async fn refresh<H: RegistryHost>(registry: &Registry<H>) -> Response {
                 error: "registry_unavailable".to_owned(),
             },
         );
-        error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+        error_with_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry_unavailable",
+            "Couldn't reach the registry to refresh it.",
+        )
     }
 }
 
@@ -521,7 +546,11 @@ fn publish<E: CoreEvents + ?Sized>(events: &E, event: &RegistryEvent) {
 /// `local_path`. Returns the body and whichever of the three was sent.
 fn parse_install_body(raw: Option<Json<InstallBody>>) -> Result<(InstallBody, String), ErrResp> {
     let Some(Json(body)) = raw else {
-        return Err(Box::new(error(StatusCode::BAD_REQUEST, "missing_body")));
+        return Err(Box::new(error_with_message(
+            StatusCode::BAD_REQUEST,
+            "missing_body",
+            MISSING_BODY,
+        )));
     };
 
     let key = match (&body.source, &body.repo_url, &body.local_path) {
@@ -545,16 +574,17 @@ async fn resolve_install_entry<H: RegistryHost>(
 ) -> Result<Entry<H>, ErrResp> {
     if let Some(ref source) = body.source {
         let Ok(index) = registry.client.get().await else {
-            return Err(Box::new(error(
+            return Err(Box::new(error_with_message(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "registry_unavailable",
+                REGISTRY_UNAVAILABLE,
             )));
         };
         return index
             .backends
             .into_iter()
             .find(|b| &b.source == source)
-            .ok_or_else(|| Box::new(error(StatusCode::NOT_FOUND, "not_found")));
+            .ok_or_else(|| Box::new(not_in_registry(source)));
     }
     if let Some(ref repo_url) = body.repo_url {
         let forge = install_forge(body.forge, repo_url).map_err(|(status, code, message)| {
@@ -866,7 +896,11 @@ pub async fn install<H: RegistryHost>(
         Err(r) => return *r,
     };
     let Some(marker) = InFlightMarker::acquire(&registry.in_flight, &key) else {
-        return error(StatusCode::CONFLICT, "install_in_progress");
+        return error_with_message(
+            StatusCode::CONFLICT,
+            "install_in_progress",
+            &format!("`{key}` is already being installed."),
+        );
     };
     let entry = match resolve_install_entry(registry, &body).await {
         Ok(e) => e,
@@ -910,17 +944,25 @@ pub async fn update<H: RegistryHost>(
     body: Option<Json<UpdateBody>>,
 ) -> Response {
     let Some(Json(body)) = body else {
-        return error(StatusCode::BAD_REQUEST, "missing_body");
+        return error_with_message(StatusCode::BAD_REQUEST, "missing_body", MISSING_BODY);
     };
     let Some(marker) = InFlightMarker::acquire(&registry.in_flight, &body.source) else {
-        return error(StatusCode::CONFLICT, "update_in_progress");
+        return error_with_message(
+            StatusCode::CONFLICT,
+            "update_in_progress",
+            &format!("`{}` is already being updated.", body.source),
+        );
     };
 
     let Ok(index) = registry.client.get().await else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable");
+        return error_with_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry_unavailable",
+            REGISTRY_UNAVAILABLE,
+        );
     };
     let Some(entry) = index.backends.into_iter().find(|b| b.source == body.source) else {
-        return error(StatusCode::NOT_FOUND, "not_found");
+        return not_in_registry(&body.source);
     };
     // Matched by `source`, the same key the listing uses to decide
     // `update_available`, and the same helper, so the two never drift.
@@ -932,7 +974,11 @@ pub async fn update<H: RegistryHost>(
         )
     };
     let Some(from_version) = installed else {
-        return error(StatusCode::NOT_FOUND, "not_installed");
+        return error_with_message(
+            StatusCode::NOT_FOUND,
+            "not_installed",
+            &format!("No installed backend has the source `{}`.", entry.source),
+        );
     };
 
     // String equality would treat any different string as an update, so an

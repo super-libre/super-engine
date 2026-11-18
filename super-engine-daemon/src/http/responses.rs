@@ -4,16 +4,21 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 /// Canonical error response builder for the `{ "status": "error",
-/// "message": <message>, "data": { "reason": <reason> } }` shape.
+/// "error_code": <code>, "message": <code>, "data": { "reason": <reason> } }`
+/// shape.
 ///
 /// All error responses that carry a `data.reason` field route through
 /// this function so the JSON shape is defined in exactly one place.
+///
+/// `code` is both the `error_code` every error carries, which clients switch
+/// on, and the `message`, where clients older than `error_code` look for it.
 #[must_use]
-pub fn error_response(status: StatusCode, message: &str, reason: &str) -> Response {
+pub fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
     let body = serde_json::json!({
-        "status":  "error",
-        "message": message,
-        "data":    { "reason": reason }
+        "status":     "error",
+        "error_code": code,
+        "message":    code,
+        "data":       { "reason": reason }
     });
     (
         status,
@@ -64,9 +69,11 @@ pub fn invalid_session(reason: &'static str) -> Response {
 
 #[must_use]
 pub fn scope_denied() -> Response {
+    // The identifier twice, as in `error_response`.
     let body = serde_json::json!({
-        "status":  "error",
-        "message": "scope_denied",
+        "status":     "error",
+        "error_code": "scope_denied",
+        "message":    "scope_denied",
     });
     (
         StatusCode::FORBIDDEN,
@@ -79,8 +86,9 @@ pub fn scope_denied() -> Response {
 #[must_use]
 pub fn rate_limited() -> Response {
     let body = serde_json::json!({
-        "status":  "error",
-        "message": "rate_limited",
+        "status":     "error",
+        "error_code": "rate_limited",
+        "message":    "rate_limited",
     });
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -91,6 +99,40 @@ pub fn rate_limited() -> Response {
 }
 
 #[must_use]
-pub fn auth_err(status: StatusCode, message: &str, reason: &str) -> Response {
-    error_response(status, message, reason)
+pub fn auth_err(status: StatusCode, code: &str, reason: &str) -> Response {
+    error_response(status, code, reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StatusCode, auth_err, invalid_session, rate_limited, reason, scope_denied};
+    use axum::response::Response;
+
+    async fn body_of(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        serde_json::from_slice(&bytes).expect("a JSON body")
+    }
+
+    /// Every auth error carries its identifier as `error_code`, the field the
+    /// contract says every error has, and still as `message`, where clients
+    /// older than `error_code` look for it.
+    #[tokio::test]
+    async fn auth_errors_carry_their_code_in_both_fields() {
+        for (resp, code) in [
+            (invalid_session(reason::UNKNOWN), "invalid_session"),
+            (scope_denied(), "scope_denied"),
+            (rate_limited(), "rate_limited"),
+            (
+                auth_err(StatusCode::FORBIDDEN, "auth_denied", reason::USER_DENIED),
+                "auth_denied",
+            ),
+        ] {
+            let body = body_of(resp).await;
+            assert_eq!(body["status"], "error", "{body}");
+            assert_eq!(body["error_code"], code, "{body}");
+            assert_eq!(body["message"], code, "{body}");
+        }
+    }
 }
