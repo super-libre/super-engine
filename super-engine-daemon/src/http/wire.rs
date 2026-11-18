@@ -7,18 +7,21 @@
 
 use serde::Serialize;
 
-/// The auth-failure envelope: `message` names the failure and `data.reason`
-/// says which of its cases occurred.
+/// The auth-failure envelope: `error_code` names the failure and
+/// `data.reason` says which of its cases occurred.
 ///
-/// Distinct from `ErrorEnvelope` because the auth surface predates
-/// `error_code` and clients read `data.reason` there. Both are documented
-/// rather than reconciled, since changing either is a breaking wire change.
+/// Distinct from `ErrorEnvelope` because clients read `data.reason` here. The
+/// identifier is in `message` too, where clients older than `error_code`
+/// look for it.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ReasonEnvelope {
     /// Always `error`.
     #[schema(example = "error")]
     pub status: &'static str,
     /// The failure identifier, e.g. `invalid_session` or `auth_denied`.
+    pub error_code: String,
+    /// The same identifier, for clients that switched on it before
+    /// `error_code` existed.
     pub message: String,
     pub data: Reason,
 }
