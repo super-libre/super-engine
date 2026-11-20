@@ -10,6 +10,7 @@ static INSTALLER: Installer = Installer {
     user_agent: "super-test/0.0.0",
     wrapper_usage: "Used by the tests.",
     after_install: None,
+    extra_binaries: &[],
     apps: &["super-test-app"],
     retired: Retired::NONE,
 };

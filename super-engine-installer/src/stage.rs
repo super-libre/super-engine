@@ -358,6 +358,24 @@ fn stage_wrapper(
     })
 }
 
+/// The entries for the [`Installer::extra_binaries`] the release in `staging`
+/// carries. None is required: a release from before one shipped does not
+/// carry it, and still installs.
+fn extra_binary_entries<'a>(
+    staging: &'a Path,
+    bin: &'a Path,
+    installer: &'a Installer,
+) -> impl Iterator<Item = ManifestEntry> + 'a {
+    installer.extra_binaries.iter().filter_map(move |name| {
+        let source = staging.join(name);
+        source.exists().then(|| ManifestEntry {
+            source,
+            dest: bin.join(name),
+            mode: 0o755,
+        })
+    })
+}
+
 /// Build the manifest for `components`, resolving every source against
 /// `staging` and every destination against `prefix` (`unit_dir` for the
 /// systemd unit).
@@ -408,6 +426,7 @@ pub fn build_manifest(
         ] {
             entries.push(required_entry(staging, &name, bin.join(&name), 0o755)?);
         }
+        entries.extend(extra_binary_entries(staging, &bin, installer));
         entries.push(stage_wrapper(staging, prefix, installer)?);
 
         let unit = format!("{slug}.service");
@@ -537,6 +556,7 @@ mod tests {
             "super-test-daemon",
             "super-test-cli",
             "super-test-consent",
+            "super-test-mcp",
             "super-test-app",
             "super-test-cosmic-applet",
             "systemd/super-test.service",
@@ -873,6 +893,76 @@ mod tests {
         let content = std::fs::read_to_string(&wrapper.source).unwrap();
         assert!(content.starts_with("#!/bin/bash\n"));
         assert!(content.contains("exec \"/usr/local/bin/super-test-cli\" \"$@\""));
+    }
+
+    fn daemon_only() -> Components {
+        Components {
+            daemon: true,
+            app: false,
+            applet: false,
+        }
+    }
+
+    #[test]
+    fn an_extra_binary_installs_with_the_daemon() {
+        let staging = fake_staging();
+        let prefix = std::path::Path::new("/usr/local");
+        let units = std::path::Path::new("/usr/lib/systemd/user");
+        let me = std::path::Path::new("/proc/self/exe");
+        let m = build_manifest(
+            &staging,
+            None,
+            prefix,
+            units,
+            &daemon_only(),
+            me,
+            &INSTALLER,
+        )
+        .unwrap();
+        let mcp = m
+            .entries
+            .iter()
+            .find(|e| e.dest.ends_with("bin/super-test-mcp"))
+            .expect("the extra binary is installed");
+        assert_eq!(mcp.source, staging.join("super-test-mcp"));
+        assert_eq!(mcp.mode, 0o755);
+
+        let app_only = Components {
+            daemon: false,
+            app: true,
+            applet: false,
+        };
+        let m = build_manifest(&staging, None, prefix, units, &app_only, me, &INSTALLER).unwrap();
+        assert!(
+            !m.entries
+                .iter()
+                .any(|e| e.dest.ends_with("bin/super-test-mcp"))
+        );
+    }
+
+    #[test]
+    fn a_release_without_an_extra_binary_still_installs() {
+        let staging = fake_staging_without(&["super-test-mcp"]);
+        let m = build_manifest(
+            &staging,
+            None,
+            std::path::Path::new("/usr/local"),
+            std::path::Path::new("/usr/lib/systemd/user"),
+            &daemon_only(),
+            std::path::Path::new("/proc/self/exe"),
+            &INSTALLER,
+        )
+        .unwrap();
+        assert!(
+            !m.entries
+                .iter()
+                .any(|e| e.dest.ends_with("bin/super-test-mcp"))
+        );
+        assert!(
+            m.entries
+                .iter()
+                .any(|e| e.dest.ends_with("bin/super-test-daemon"))
+        );
     }
 
     /// The tarball of a product that replaced two others: its daemon, and an
