@@ -141,7 +141,7 @@ pub async fn require_allowed_origin(
     let is_tcp = request
         .extensions()
         .get::<PeerInfo>()
-        .is_some_and(|p| p.pid.is_none() && p.uid.is_none());
+        .is_some_and(PeerInfo::is_tcp);
     if !is_tcp {
         return next.run(request).await;
     }
@@ -915,6 +915,21 @@ mod guard_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, "reached");
+    }
+
+    /// The gate reads the listener from the connection, not from which
+    /// credentials are missing: a Unix peer whose credentials could not be read
+    /// is still a Unix peer, and the guards after this one fail it closed.
+    #[tokio::test]
+    async fn a_unix_peer_without_credentials_is_not_origin_gated() {
+        let auth = Auth::for_tests(&[]);
+        let (status, body) = call(
+            origin_gated(&auth),
+            PeerInfo::unix(None, None),
+            get_from(None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     fn scope_gated(auth: &Auth) -> Router {

@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! What the daemon knows about the caller on a connection.
 
+/// Which listener a connection arrived on.
+///
+/// Set once, by the accept loop that took the connection, and never inferred
+/// from anything else on [`PeerInfo`]. A Unix peer can lack credentials on a
+/// platform without `peer_cred()`, so "no pid and no uid" does not mean TCP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// The daemon's Unix socket, where the kernel names the caller.
+    Unix,
+    /// The loopback TCP listener, where nothing does.
+    Tcp,
+}
+
 /// Per-connection extension carrying whatever the daemon knows about the
 /// caller.
 ///
@@ -9,12 +22,14 @@
 /// `peer_cred()`. On the TCP listener there are no credentials to read, and
 /// [`Self::web_origin`] carries the caller's identity instead.
 ///
-/// The two are mutually exclusive by construction: the Unix accept loop never
-/// sets an origin, and the TCP one never has credentials to set. Which listener
-/// a request arrived on is therefore readable from this struct alone, with no
-/// separate transport flag that could disagree with it.
+/// [`Self::transport`] says which listener the connection arrived on. It is
+/// set by the accept loop, through [`Self::unix`] or [`Self::tcp`], so the
+/// guards read the listener from it rather than guessing it from which other
+/// fields happen to be empty.
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
+    /// The listener the connection arrived on.
+    pub transport: Transport,
     pub pid: Option<u32>,
     pub uid: Option<u32>,
     /// The allowlisted `Origin` of a TCP caller, `None` for a Unix one.
@@ -33,6 +48,7 @@ impl PeerInfo {
     #[must_use]
     pub fn unix(pid: Option<u32>, uid: Option<u32>) -> Self {
         Self {
+            transport: Transport::Unix,
             pid,
             uid,
             web_origin: None,
@@ -47,10 +63,17 @@ impl PeerInfo {
     #[must_use]
     pub fn tcp() -> Self {
         Self {
+            transport: Transport::Tcp,
             pid: None,
             uid: None,
             web_origin: None,
         }
+    }
+
+    /// Whether the connection arrived on the TCP listener.
+    #[must_use]
+    pub fn is_tcp(&self) -> bool {
+        self.transport == Transport::Tcp
     }
 
     /// Stable client identifier built from peer credentials, used as the key
@@ -80,7 +103,7 @@ impl PeerInfo {
 
 #[cfg(test)]
 mod client_id_tests {
-    use super::PeerInfo;
+    use super::{PeerInfo, Transport};
 
     /// The rate limiter refuses any client id the resource manager has not seen,
     /// so the id a connection is registered under and the id looked up per
@@ -124,5 +147,17 @@ mod client_id_tests {
         assert_eq!(PeerInfo::unix(Some(42), Some(1000)).client_id(), "1000:42");
         assert_eq!(PeerInfo::unix(None, Some(1000)).client_id(), "1000:?");
         assert_eq!(PeerInfo::unix(Some(42), None).client_id(), "?:42");
+    }
+
+    /// The listener is what the constructor says, whatever else is known. A
+    /// Unix peer whose credentials could not be read looks like a TCP one on
+    /// every other field, and must still be a Unix peer.
+    #[test]
+    fn the_transport_comes_from_the_constructor() {
+        assert_eq!(PeerInfo::tcp().transport, Transport::Tcp);
+        assert!(PeerInfo::tcp().is_tcp());
+        let no_credentials = PeerInfo::unix(None, None);
+        assert_eq!(no_credentials.transport, Transport::Unix);
+        assert!(!no_credentials.is_tcp());
     }
 }

@@ -9,4 +9,4 @@ pub mod responses;
 pub mod server;
 pub mod wire;
 
-pub use peer::PeerInfo;
+pub use peer::{PeerInfo, Transport};
