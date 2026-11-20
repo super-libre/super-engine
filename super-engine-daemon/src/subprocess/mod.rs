@@ -663,7 +663,8 @@ impl SubprocessBackend {
 
     /// One HTTP request over the backend's Unix socket, carrying `headers`
     /// plus the secret/option context every `/v1` request gets, with the
-    /// response body read in full.
+    /// response body read in full. A context header `headers` names itself
+    /// is sent with the request's value instead, for this request alone.
     ///
     /// # Errors
     /// Returns an error if the socket dial, the request, or reading the body
@@ -715,7 +716,7 @@ impl SubprocessBackend {
             .uri(path)
             .header("host", "backend.local");
         let context = self.context_headers();
-        for (k, v) in headers.iter().chain(&context) {
+        for (k, v) in request_headers(headers, &context) {
             builder = builder.header(k.as_str(), v.as_str());
         }
         let req = builder.body(Full::new(Bytes::from(body)))?;
@@ -1076,6 +1077,21 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+/// The headers one request is sent with: its own, then each of the
+/// instance's context headers it does not name itself. A request that brings
+/// its own value for one, like the context of a single dictation, replaces
+/// the instance's for that request alone. Names match as HTTP's do, without
+/// regard to case.
+fn request_headers<'a>(
+    own: &'a [(String, String)],
+    context: &'a [(String, String)],
+) -> impl Iterator<Item = &'a (String, String)> {
+    own.iter().chain(context.iter().filter(|(name, _)| {
+        !own.iter()
+            .any(|(own_name, _)| own_name.eq_ignore_ascii_case(name))
+    }))
 }
 
 #[cfg(test)]
