@@ -2,7 +2,9 @@
 //! The guards every route sits behind: the origin gate on the TCP listener,
 //! the token and scope check, and the per-client rate limit. An assistant
 //! route has a gate of its own in place of the origin gate
-//! ([`require_assistant_caller`]).
+//! ([`require_assistant_caller`]), and a route for the product's own clients
+//! only has one more guard after the scope check
+//! ([`require_official_client`]).
 //!
 //! Each takes the daemon's [`Auth`] as its state, so a daemon layers them
 //! with `axum::middleware::from_fn_with_state(auth.clone(), guard)`.
@@ -595,6 +597,79 @@ pub async fn require_any_authenticated(
     }
 }
 
+/// Let a request through only when its caller is one of the product's own
+/// clients, installed beside the daemon.
+///
+/// For routes no other caller should reach whatever scopes it holds, such as
+/// the ones that mint and revoke assistant keys: an assistant must not be able
+/// to mint itself another key, and neither should any other program the user
+/// once allowed. Layered inside a scope guard, which attaches the
+/// [`AuthContext`] this reads; with none attached, the request is refused.
+///
+/// The caller has already been checked against its session's grantee by then,
+/// so this judges the grantee with the same test that lets the product's own
+/// clients skip the consent dialog
+/// ([`is_official_client`](crate::auth::consent::is_official_client)). A web
+/// page and an assistant never pass it.
+///
+/// In a debug build, `<PREFIX>_TREAT_AS_OFFICIAL=1`
+/// ([`TREAT_AS_OFFICIAL`](crate::auth::TREAT_AS_OFFICIAL)) lets every caller
+/// but an assistant through, for integration tests whose client is not
+/// installed beside the daemon. A release build ignores it.
+pub async fn require_official_client(
+    State(auth): State<Auth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(grantee) = request
+        .extensions()
+        .get::<AuthContext>()
+        .map(|ctx| ctx.meta.grantee.clone())
+    else {
+        log::error!("require_official_client found no session: layer it inside a scope guard");
+        return refuse(request, not_official_client()).await;
+    };
+    if auth.is_official(&grantee) || treated_as_official(&auth, &grantee) {
+        return next.run(request).await;
+    }
+    log::warn!(
+        "{} is not one of {}'s own clients; refused",
+        grantee.describe(),
+        auth.product().display_name,
+    );
+    refuse(request, not_official_client()).await
+}
+
+fn not_official_client() -> Response {
+    auth_err(
+        StatusCode::FORBIDDEN,
+        "auth_denied",
+        reason::NOT_OFFICIAL_CLIENT,
+    )
+}
+
+/// Whether `<PREFIX>_TREAT_AS_OFFICIAL=1` lets `grantee` through
+/// [`require_official_client`]. Never for an assistant, and never in a release
+/// build: compiled out there, as `<PREFIX>_AUTO_APPROVE` is, so a stray
+/// variable cannot open these routes in a shipped binary.
+fn treated_as_official(auth: &Auth, grantee: &PeerIdentity) -> bool {
+    if let PeerIdentity::Assistant { .. } = grantee {
+        return false;
+    }
+    let var = auth.product().env(crate::auth::TREAT_AS_OFFICIAL);
+    #[cfg(debug_assertions)]
+    let treat = std::env::var(&var).is_ok_and(|v| v == "1");
+    #[cfg(not(debug_assertions))]
+    let treat = false;
+    if treat {
+        log::info!(
+            "{var}=1 set; treating {} as an official client",
+            grantee.describe()
+        );
+    }
+    treat
+}
+
 /// Per-request rate-limit gate. Layered on every authenticated
 /// route group — `/auth/request` is excluded because its abuse
 /// model is the consent popup, not per-request quota.
@@ -1002,8 +1077,8 @@ mod web_binding_tests {
 #[cfg(test)]
 mod guard_tests {
     use super::{
-        require_allowed_origin, require_any_authenticated, require_assistant_caller,
-        require_rate_limit, require_scope, require_status_scope,
+        AuthContext, require_allowed_origin, require_any_authenticated, require_assistant_caller,
+        require_official_client, require_rate_limit, require_scope, require_status_scope,
     };
     use crate::auth::Auth;
     use crate::auth::identity::{PeerIdentity, resolve_peer_identity};
@@ -1396,6 +1471,107 @@ mod guard_tests {
         let (status, body) =
             call(assistant_route(&auth), self_peer(), get_with_token(&token)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A route for the product's own clients, with the session a scope guard
+    /// would have attached for `grantee`, or none.
+    fn official_route(auth: &Auth, grantee: Option<PeerIdentity>) -> Router {
+        let router = Router::new()
+            .route("/", get(|| async { "reached" }))
+            .layer(from_fn_with_state(auth.clone(), require_official_client));
+        match grantee {
+            Some(grantee) => {
+                let now = chrono::Utc::now();
+                router.layer(axum::Extension(AuthContext {
+                    meta: crate::auth::tokens::TokenMeta {
+                        app_name: "Test".to_string(),
+                        scopes: vec!["settings".to_string()],
+                        grantee,
+                        issued_at: now,
+                        expires_at: now + chrono::Duration::days(30),
+                    },
+                    token: "token".to_string(),
+                }))
+            }
+            None => router,
+        }
+    }
+
+    /// The product's own client, installed beside the daemon, gets through.
+    #[tokio::test]
+    async fn an_official_client_reaches_an_official_route() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("super-test-app");
+        std::fs::write(&app, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let auth = Auth::for_tests_with_official_dir(dir.path());
+
+        let (status, body) = call(
+            official_route(&auth, Some(PeerIdentity::native(&app))),
+            self_peer(),
+            Request::get("/").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Every other caller is refused, whatever its scopes: a program that is
+    /// not one of the product's clients, a sandbox that put one at the same
+    /// path, a page, an assistant, and a request no scope guard checked.
+    #[tokio::test]
+    async fn any_other_caller_is_refused_an_official_route() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("super-test-app");
+        std::fs::write(&app, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let auth = Auth::for_tests_with_official_dir(dir.path());
+
+        for grantee in [
+            Some(PeerIdentity::native("/usr/bin/curl")),
+            Some(PeerIdentity::Native {
+                exe_path: app.clone(),
+                flatpak_app_id: Some("org.example.Stranger".to_string()),
+            }),
+            Some(PeerIdentity::web("http://127.0.0.1:8910")),
+            Some(PeerIdentity::Assistant {
+                key_id: "0a1b2c3d".to_string(),
+            }),
+            None,
+        ] {
+            let shown = format!("{grantee:?}");
+            let (status, body) = call(
+                official_route(&auth, grantee),
+                self_peer(),
+                Request::get("/").body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{shown}: {body}");
+            assert!(body.contains("not_official_client"), "{shown}: {body}");
+        }
+    }
+
+    /// End to end: an assistant through its own gate and the token check holds
+    /// a good key, and is still refused a route for the product's own clients,
+    /// such as the one that mints keys.
+    #[tokio::test]
+    async fn an_assistant_cannot_reach_an_official_route() {
+        let auth = Auth::for_tests(&[]);
+        let (secret, _) = assistant_key(&auth).await;
+        let router = Router::new()
+            .route("/", get(|| async { "reached" }))
+            .layer(from_fn_with_state(auth.clone(), require_official_client))
+            .layer(from_fn_with_state(auth.clone(), require_any_authenticated))
+            .layer(from_fn_with_state(auth.clone(), require_assistant_caller));
+        let (status, body) = call(
+            router,
+            PeerInfo::tcp(),
+            assistant_request(Some(&secret), "127.0.0.1:7300", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("not_official_client"), "{body}");
     }
 }
 

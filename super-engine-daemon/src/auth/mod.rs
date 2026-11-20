@@ -40,6 +40,15 @@ pub use middleware::AuthContext;
 /// the consent gate in a shipped binary.
 pub const AUTO_APPROVE: &str = "AUTO_APPROVE";
 
+/// The product's variable (`<PREFIX>_TREAT_AS_OFFICIAL`) that, set to `1`, lets
+/// every caller with a session through
+/// [`require_official_client`](middleware::require_official_client) as if it
+/// were one of the product's own clients. Honored only in debug builds, for
+/// integration tests whose client is not installed beside the daemon, and
+/// never for an assistant key, so a test can still show that an assistant is
+/// refused.
+pub const TREAT_AS_OFFICIAL: &str = "TREAT_AS_OFFICIAL";
+
 /// What a daemon passes to [`Auth::load`].
 pub struct AuthConfig {
     /// The consent dialog: the product it names, and what its scopes grant.
@@ -68,6 +77,11 @@ struct Inner {
     deny_cache: DenyCache,
     resource_manager: Arc<ResourceManager>,
     allowed_origins: Vec<String>,
+    /// Where the product's own clients are installed, in place of the
+    /// daemon's own directory, for a test that cannot put one beside the test
+    /// binary.
+    #[cfg(test)]
+    official_dir: Option<std::path::PathBuf>,
 }
 
 impl Auth {
@@ -88,6 +102,8 @@ impl Auth {
                 deny_cache: DenyCache::default(),
                 resource_manager: config.resource_manager,
                 allowed_origins: config.allowed_origins,
+                #[cfg(test)]
+                official_dir: None,
             }),
         }
     }
@@ -155,6 +171,16 @@ impl Auth {
         crate::http::origins::is_origin_allowed(&self.inner.allowed_origins, origin)
     }
 
+    /// Whether `grantee` is one of the product's own clients, installed beside
+    /// the daemon. See [`consent::is_official_client`].
+    fn is_official(&self, grantee: &PeerIdentity) -> bool {
+        #[cfg(test)]
+        if let Some(dir) = &self.inner.official_dir {
+            return consent::is_official_identity_in(self.product(), dir, grantee);
+        }
+        consent::is_official_client(self.product(), grantee)
+    }
+
     fn dialog(&self) -> &ConsentDialog {
         &self.inner.dialog
     }
@@ -170,6 +196,16 @@ impl Auth {
 
 #[cfg(test)]
 impl Auth {
+    /// [`Self::for_tests`], with the product's own clients installed in
+    /// `official_dir` rather than beside the test binary.
+    pub(crate) fn for_tests_with_official_dir(official_dir: &std::path::Path) -> Self {
+        let mut auth = Self::for_tests(&[]);
+        Arc::get_mut(&mut auth.inner)
+            .expect("a fresh Auth is not shared")
+            .official_dir = Some(official_dir.to_path_buf());
+        auth
+    }
+
     /// The test product's auth state with no sessions, admitting
     /// `allowed_origins` over TCP.
     pub(crate) fn for_tests(allowed_origins: &[&str]) -> Self {

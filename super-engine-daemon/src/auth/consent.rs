@@ -478,6 +478,22 @@ fn official_client_names(product: &ProductSpec) -> impl Iterator<Item = &'static
 /// not logged here — the caller logs the rare success.
 #[must_use]
 pub fn is_official_client(product: &ProductSpec, identity: &PeerIdentity) -> bool {
+    let Ok(daemon_exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(daemon_dir) = daemon_exe.parent() else {
+        return false;
+    };
+    is_official_identity_in(product, daemon_dir, identity)
+}
+
+/// [`is_official_client`] with the daemon's own directory given: whether
+/// `identity` is one of `product`'s own client binaries, in `daemon_dir`.
+pub(crate) fn is_official_identity_in(
+    product: &ProductSpec,
+    daemon_dir: &Path,
+    identity: &PeerIdentity,
+) -> bool {
     let PeerIdentity::Native {
         exe_path,
         flatpak_app_id,
@@ -499,12 +515,6 @@ pub fn is_official_client(product: &ProductSpec, identity: &PeerIdentity) -> boo
     if flatpak_app_id.is_some() {
         return false;
     }
-    let Ok(daemon_exe) = std::env::current_exe() else {
-        return false;
-    };
-    let Some(daemon_dir) = daemon_exe.parent() else {
-        return false;
-    };
     is_official_client_in(product, daemon_dir, exe_path)
 }
 

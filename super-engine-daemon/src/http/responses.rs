@@ -75,6 +75,10 @@ pub mod reason {
     /// loopback interface, so any other host is a name pointed at it from
     /// outside, as DNS rebinding does.
     pub const HOST_NOT_ALLOWED: &str = "host_not_allowed";
+    /// The caller has a session, with the scope the route needs, but the route
+    /// is for the product's own clients only, installed beside the daemon, and
+    /// the caller is not one of them. A web page or an assistant never is.
+    pub const NOT_OFFICIAL_CLIENT: &str = "not_official_client";
 }
 
 #[must_use]
