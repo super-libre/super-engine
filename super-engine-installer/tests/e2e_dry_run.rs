@@ -20,10 +20,10 @@ const COMPONENTS_ARG: &str = "--components=all";
 /// The release tag this test's fake GitHub API always returns.
 const FAKE_TAG: &str = "v9.9.9-beta.1";
 
-/// The applet release's tag: newer than any applet a host running this test
+/// The add-on releases' tag: newer than any add-on a host running this test
 /// may have installed, which the installer would otherwise keep, skipping
 /// the download this test checks.
-const FAKE_APPLET_TAG: &str = "v99.0.0-beta.1";
+const FAKE_ADD_ON_TAG: &str = "v99.0.0-beta.1";
 
 /// This host's Rust target triple, computed the same way
 /// `resolve::target_triple` does — duplicated here because that module is
@@ -97,15 +97,32 @@ fn applet_tarball(dir: &std::path::Path, name: &str) -> Vec<u8> {
         dir,
         name,
         &[
-            ("super-cosmic-applet", b"#!/bin/sh\necho fake\n"),
+            ("super-test-shared-applet", b"#!/bin/sh\necho fake\n"),
             (
-                "resources/super-cosmic-applet-full.desktop",
+                "resources/super-test-shared-applet-full.desktop",
                 b"[Desktop Entry]\nName=Super Applet\n",
             ),
             (
-                "resources/icons/hicolor/scalable/apps/super-cosmic-applet.svg",
+                "resources/icons/hicolor/scalable/apps/super-test-shared-applet.svg",
                 b"<svg/>",
             ),
+        ],
+    )
+}
+
+/// The extension release's tarball: the extension's directory, its
+/// `metadata.json` naming the test product's extension.
+fn extension_tarball(dir: &std::path::Path, name: &str) -> Vec<u8> {
+    tarball(
+        dir,
+        name,
+        &[
+            (
+                "metadata.json",
+                br#"{"uuid": "super-test@example.com", "version-name": "99.0.0-beta.1"}"#,
+            ),
+            ("extension.js", b"export default class {}\n"),
+            ("schemas/gschemas.compiled", b"GVariant"),
         ],
     )
 }
@@ -139,94 +156,88 @@ fn releases_json(
     .to_string()
 }
 
-#[tokio::test]
-async fn dry_run_resolves_downloads_verifies_and_stages_against_a_mocked_release() {
-    let triple = target_triple();
-    let tarball_name = format!("super-test-{triple}-beta.tar.gz");
+/// One release served by the fake GitHub API: its repo, the path its assets
+/// are served under, its tag, and its tarball's name and bytes.
+struct FakeRelease<'a> {
+    repo: &'a str,
+    path: &'a str,
+    tag: &'a str,
+    tarball_name: String,
+    tarball: Vec<u8>,
+}
 
-    // Removed when the test ends, failed or not.
-    let tmp = tempfile::Builder::new()
-        .prefix("super-engine-installer-e2e-")
-        .tempdir()
-        .unwrap();
-    let dir = tmp.path();
-    let tarball_bytes = product_tarball(&dir, &tarball_name);
-    let sums_text = format!("{}  {tarball_name}\n", sha256_hex(&tarball_bytes));
-    let applet_tarball_name = format!("super-cosmic-applet-{triple}-beta.tar.gz");
-    let applet_bytes = applet_tarball(&dir, &applet_tarball_name);
-    let applet_sums = format!("{}  {applet_tarball_name}\n", sha256_hex(&applet_bytes));
-
-    let mut server = mockito::Server::new_async().await;
+/// Serve `release`'s listing, tarball and `SHA256SUMS` from `server`, each
+/// expected to be asked for once.
+async fn serve(server: &mut mockito::Server, release: &FakeRelease<'_>) -> Vec<mockito::Mock> {
     let base = server.url();
+    let sums = format!(
+        "{}  {}\n",
+        sha256_hex(&release.tarball),
+        release.tarball_name
+    );
+    let listing = releases_json(
+        &base,
+        release.path,
+        release.tag,
+        (&release.tarball_name, release.tarball.len()),
+        sums.len(),
+    );
+    vec![
+        server
+            .mock(
+                "GET",
+                format!("/repos/{}/releases?per_page=100", release.repo).as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(listing)
+            .expect(1)
+            .create_async()
+            .await,
+        server
+            .mock("GET", format!("/{}/tarball", release.path).as_str())
+            .with_status(200)
+            .with_body(&release.tarball)
+            .expect(1)
+            .create_async()
+            .await,
+        server
+            .mock("GET", format!("/{}/sums", release.path).as_str())
+            .with_status(200)
+            .with_body(sums)
+            .expect(1)
+            .create_async()
+            .await,
+    ]
+}
 
-    let mut mocks = Vec::new();
-    for (repo, path, tag, name, bytes, sums) in [
-        (
-            "example/super-test",
-            "product",
-            FAKE_TAG,
-            &tarball_name,
-            &tarball_bytes,
-            &sums_text,
-        ),
-        (
-            "super-libre/super-cosmic-applet",
-            "applet",
-            FAKE_APPLET_TAG,
-            &applet_tarball_name,
-            &applet_bytes,
-            &applet_sums,
-        ),
-    ] {
-        let listing = releases_json(&base, path, tag, (name, bytes.len()), sums.len());
-        mocks.push(
-            server
-                .mock(
-                    "GET",
-                    format!("/repos/{repo}/releases?per_page=100").as_str(),
-                )
-                .with_status(200)
-                .with_header("content-type", "application/json")
-                .with_body(listing)
-                .expect(1)
-                .create_async()
-                .await,
-        );
-        mocks.push(
-            server
-                .mock("GET", format!("/{path}/tarball").as_str())
-                .with_status(200)
-                .with_body(bytes)
-                .expect(1)
-                .create_async()
-                .await,
-        );
-        mocks.push(
-            server
-                .mock("GET", format!("/{path}/sums").as_str())
-                .with_status(200)
-                .with_body(sums)
-                .expect(1)
-                .create_async()
-                .await,
-        );
+/// The product's release, as the fake GitHub API serves it.
+fn product_release(dir: &std::path::Path) -> FakeRelease<'static> {
+    let tarball_name = format!("super-test-{}-beta.tar.gz", target_triple());
+    FakeRelease {
+        repo: "example/super-test",
+        path: "product",
+        tag: FAKE_TAG,
+        tarball: product_tarball(dir, &tarball_name),
+        tarball_name,
     }
+}
 
-    let out = tokio::task::spawn_blocking({
-        let base = base.clone();
-        move || {
-            std::process::Command::new(env!("CARGO_BIN_EXE_super-test-install"))
-                .env("GITHUB_API_BASE", base)
-                .args([
-                    "--non-interactive",
-                    "--json-progress",
-                    "--beta",
-                    "--dry-run",
-                    COMPONENTS_ARG,
-                ])
-                .output()
-                .unwrap()
-        }
+/// Run `super-test-install --dry-run` against the fake GitHub API at `base`
+/// with `components`, and return its JSON events, checking it succeeded.
+async fn dry_run(base: String, components: &'static str) -> Vec<serde_json::Value> {
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_super-test-install"))
+            .env("GITHUB_API_BASE", base)
+            .args([
+                "--non-interactive",
+                "--json-progress",
+                "--beta",
+                "--dry-run",
+                components,
+            ])
+            .output()
+            .unwrap()
     })
     .await
     .unwrap();
@@ -246,6 +257,44 @@ async fn dry_run_resolves_downloads_verifies_and_stages_against_a_mocked_release
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad JSON line {l:?}: {e}")))
         .collect();
     assert!(!events.is_empty(), "expected at least one JSON event");
+    events
+}
+
+/// The components the `complete` event, the last, says were installed.
+fn completed_components(events: &[serde_json::Value]) -> Vec<String> {
+    let complete = events.last().unwrap();
+    assert_eq!(complete["event"], "complete");
+    assert_eq!(complete["installed_version"], FAKE_TAG);
+    complete["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn dry_run_resolves_downloads_verifies_and_stages_against_a_mocked_release() {
+    // Removed when the test ends, failed or not.
+    let tmp = tempfile::Builder::new()
+        .prefix("super-engine-installer-e2e-")
+        .tempdir()
+        .unwrap();
+    let dir = tmp.path();
+    let applet_tarball_name = format!("super-test-shared-applet-{}-beta.tar.gz", target_triple());
+    let applet = FakeRelease {
+        repo: "example/super-test-cosmic-applet",
+        path: "applet",
+        tag: FAKE_ADD_ON_TAG,
+        tarball: applet_tarball(dir, &applet_tarball_name),
+        tarball_name: applet_tarball_name,
+    };
+
+    let mut server = mockito::Server::new_async().await;
+    let mut mocks = serve(&mut server, &product_release(dir)).await;
+    mocks.extend(serve(&mut server, &applet).await);
+
+    let events = dry_run(server.url(), COMPONENTS_ARG).await;
     assert!(
         events
             .iter()
@@ -256,20 +305,39 @@ async fn dry_run_resolves_downloads_verifies_and_stages_against_a_mocked_release
         events.iter().any(|e| e["event"] == "progress"),
         "expected at least one progress event: {events:?}"
     );
-
-    let complete = events.last().unwrap();
-    assert_eq!(complete["event"], "complete");
-    assert_eq!(complete["installed_version"], FAKE_TAG);
-    let components: Vec<String> = complete["components"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(components, vec!["daemon", "app", "applet"]);
+    assert_eq!(completed_components(&events), ["daemon", "app", "applet"]);
 
     // Both releases were resolved, and both tarballs downloaded and checked:
     // the applet's from its own repo, since the product's carries none.
+    for mock in &mocks {
+        mock.assert_async().await;
+    }
+}
+
+/// The extension comes from its own repo, as `<name>-noarch[-beta].tar.gz`,
+/// and stages without the product's other components.
+#[tokio::test]
+async fn dry_run_stages_the_extension_from_its_own_release() {
+    let tmp = tempfile::Builder::new()
+        .prefix("super-engine-installer-e2e-extension-")
+        .tempdir()
+        .unwrap();
+    let dir = tmp.path();
+    let extension_tarball_name = "super-test-gnome-shell-extension-noarch-beta.tar.gz".to_string();
+    let extension = FakeRelease {
+        repo: "example/super-test-gnome-shell-extension",
+        path: "extension",
+        tag: FAKE_ADD_ON_TAG,
+        tarball: extension_tarball(dir, &extension_tarball_name),
+        tarball_name: extension_tarball_name,
+    };
+
+    let mut server = mockito::Server::new_async().await;
+    let mut mocks = serve(&mut server, &product_release(dir)).await;
+    mocks.extend(serve(&mut server, &extension).await);
+
+    let events = dry_run(server.url(), "--components=extension").await;
+    assert_eq!(completed_components(&events), ["extension"]);
     for mock in &mocks {
         mock.assert_async().await;
     }

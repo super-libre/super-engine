@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Post-install steps run back in the unprivileged user process after the
 //! root phase has placed files: systemd service (re)start, app restart,
-//! applet panel restart, launcher-cache nudge and legacy `~/.local` cleanup, then any
+//! applet panel restart, turning on a new GNOME Shell extension,
+//! launcher-cache nudge and legacy `~/.local` cleanup, then any
 //! steps of the product's own ([`Installer::after_install`]). Every step is
 //! best-effort (`log::warn!` on failure) except the daemon restart, the one
 //! failure the app must hear about. The systemd unit is named after the
@@ -22,7 +23,7 @@ use super_engine_protocol::ProductSpec;
 
 use crate::errors::InstallError;
 use crate::stage::Components;
-use crate::{AfterInstall, Installer, Retired};
+use crate::{AfterInstall, GnomeExtension, Installer, Retired};
 
 /// Run `bin` with `args`, discarding output, returning whether it exited 0.
 /// A spawn failure (binary missing, etc.) also counts as "not ok".
@@ -69,6 +70,11 @@ pub enum Step {
     RestartApp,
     /// Restart `cosmic-panel` so it picks up the just-updated applet binary.
     RestartPanel,
+    /// Turn on the GNOME Shell extension this run installed where there was
+    /// none: add it to `org.gnome.shell`'s `enabled-extensions`, and take it
+    /// off `disabled-extensions`. One that was already there keeps what its
+    /// user chose.
+    EnableExtension,
     /// Nudge COSMIC's launcher caches (app grid + search backend) to rescan
     /// desktop entries.
     NudgeLaunchers,
@@ -78,10 +84,22 @@ pub enum Step {
     // `Installer::after_install`.
 }
 
+/// What this run did to the product's GNOME Shell extension, when it
+/// installed a release of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionChange {
+    /// Installed where there was none.
+    Installed,
+    /// A newer release replaced the one there.
+    Updated,
+}
+
 /// Decide which [`Step`]s to run, and in what order, from facts already known
 /// before any post-install I/O: `components` (what was just installed or
 /// updated), `applet_changes` (captured *before* the root phase ran: whether
-/// an applet binary the panel may be running is replaced or removed), and three
+/// an applet binary the panel may be running is replaced or removed),
+/// `extension_change` (also captured before: whether the extension's release
+/// went where there was none, or over an older one), and three
 /// environment probes the caller
 /// (`run`) is expected to have already made: `systemctl_available` (a `$PATH`
 /// lookup), `panel_running` (a `pgrep` check) and `app_running` (whether an
@@ -93,7 +111,8 @@ pub enum Step {
 ///
 /// Order: systemd install/enable/restart, then the app restart (after the
 /// daemon's, so the new app meets the new daemon), then the applet's panel
-/// restart, then the launcher-cache nudge, then legacy cleanup. Every file is already
+/// restart, then turning on a new extension, then the launcher-cache nudge,
+/// then legacy cleanup. Every file is already
 /// placed by the time this runs — that all happens earlier, in the root phase
 /// — so [`Step::CleanupLegacy`] is a single unconditional sweep rather than
 /// one pass per component; removing files that were never there is a no-op, so
@@ -106,6 +125,7 @@ pub fn plan(
     systemctl_available: bool,
     panel_running: bool,
     app_running: bool,
+    extension_change: Option<ExtensionChange>,
 ) -> Vec<Step> {
     let mut steps = Vec::new();
 
@@ -124,7 +144,12 @@ pub fn plan(
         steps.push(Step::RestartPanel);
     }
 
-    // The launcher nudge is skipped only for a daemon-only install: an app
+    if components.extension && extension_change == Some(ExtensionChange::Installed) {
+        steps.push(Step::EnableExtension);
+    }
+
+    // The launcher nudge is skipped for an install of the daemon without
+    // the app or the applet (the extension adds no launcher entry): an app
     // or applet install both add launcher-visible entries that benefit from
     // the rescan.
     let daemon_only = components.daemon && !components.app && !components.applet;
@@ -291,6 +316,61 @@ async fn step_restart_panel() {
     }
 }
 
+/// The `org.gnome.shell` keys that list extensions by UUID.
+const ENABLED_EXTENSIONS: &str = "enabled-extensions";
+const DISABLED_EXTENSIONS: &str = "disabled-extensions";
+
+/// `gsettings get org.gnome.shell <key>`'s output, when it succeeds.
+async fn shell_setting(key: &str) -> Option<String> {
+    let output = tokio::process::Command::new("gsettings")
+        .args(["get", "org.gnome.shell", key])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Turn on the extension `extension` names for the user running the
+/// installer. GNOME Shell reads `enabled-extensions` as it changes, but finds
+/// an extension's files only at login, so the extension loads at the next
+/// one.
+async fn step_enable_extension(extension: &GnomeExtension) {
+    let uuid = extension.uuid;
+    let Some(enabled) = shell_setting(ENABLED_EXTENSIONS).await else {
+        log::warn!(
+            "could not read GNOME Shell's enabled extensions; turn it on with: gnome-extensions enable {uuid}"
+        );
+        return;
+    };
+    if let Some(value) = crate::extension::enabled_with(&enabled, uuid)
+        && !cmd_ok(
+            "gsettings",
+            &["set", "org.gnome.shell", ENABLED_EXTENSIONS, &value],
+        )
+        .await
+    {
+        log::warn!(
+            "could not turn on the GNOME Shell extension; turn it on with: gnome-extensions enable {uuid}"
+        );
+        return;
+    }
+    if let Some(disabled) = shell_setting(DISABLED_EXTENSIONS).await
+        && let Some(value) = crate::extension::disabled_without(&disabled, uuid)
+        && !cmd_ok(
+            "gsettings",
+            &["set", "org.gnome.shell", DISABLED_EXTENSIONS, &value],
+        )
+        .await
+    {
+        log::warn!("could not take the GNOME Shell extension off the disabled list");
+    }
+}
+
 /// Nudge COSMIC's launcher caches (app grid + search backend): both scan
 /// desktop entries at session start and miss entries added to a directory
 /// they weren't watching. They respawn on demand and rescan.
@@ -382,9 +462,10 @@ fn legacy_paths(product: &ProductSpec) -> Vec<String> {
 ///
 /// `applet_changes` must be captured *before* the root phase ran — it decides
 /// whether the panel needs restarting to pick up a *changed* applet binary:
-/// the shared applet replaced by a newer release, or the product's own
-/// removed in its favor. An applet installed fresh, or kept because it is
-/// already current, needs no restart.
+/// the applet replaced by a newer release, or the one the product once
+/// bundled removed in its favor. An applet installed fresh, or kept because
+/// it is already current, needs no restart. `extension_change` is captured
+/// before it too: see [`ExtensionChange`].
 ///
 /// The product's own steps ([`Installer::after_install`]) run last, and only
 /// once the shared ones have succeeded.
@@ -397,6 +478,7 @@ pub async fn run(
     installer: &Installer,
     components: &Components,
     applet_changes: bool,
+    extension_change: Option<ExtensionChange>,
     interactive: bool,
     prefix: &Path,
 ) -> Result<(), InstallError> {
@@ -434,6 +516,7 @@ pub async fn run(
         systemctl_available,
         panel_running,
         !running_apps.is_empty(),
+        extension_change,
     ) {
         match step {
             Step::DaemonReload => step_daemon_reload().await,
@@ -455,9 +538,20 @@ pub async fn run(
                 }
             }
             Step::RestartPanel => step_restart_panel().await,
+            Step::EnableExtension => {
+                if let Some(extension) = &installer.gnome_extension {
+                    step_enable_extension(extension).await;
+                }
+            }
             Step::NudgeLaunchers => step_nudge_launchers().await,
             Step::CleanupLegacy => cleanup_legacy(product),
         }
+    }
+
+    // GNOME Shell finds an extension's files only at login, and can't be
+    // restarted under Wayland without ending the session.
+    if components.extension && extension_change.is_some() {
+        log::info!("log out and back in to load the GNOME Shell extension");
     }
 
     if let Some(after_install) = installer.after_install {
@@ -465,6 +559,7 @@ pub async fn run(
             components: *components,
             interactive,
             cosmic_available: on_path("cosmic-panel"),
+            gnome_available: on_path("gnome-shell"),
             prefix,
         });
     }
@@ -519,6 +614,7 @@ mod tests {
             daemon: true,
             app: true,
             applet: true,
+            extension: false,
         }
     }
 
@@ -527,6 +623,7 @@ mod tests {
             daemon: true,
             app: false,
             applet: false,
+            extension: false,
         }
     }
 
@@ -590,7 +687,7 @@ mod tests {
         // available, applet "already installed", panel and app "running") —
         // none of that matters when the applet and app aren't part of THIS
         // run's components.
-        let steps = plan(daemon_only(), true, true, true, true);
+        let steps = plan(daemon_only(), true, true, true, true, None);
         assert!(!steps.contains(&Step::NudgeLaunchers));
         assert!(!steps.contains(&Step::RestartPanel));
         assert!(!steps.contains(&Step::RestartApp));
@@ -604,10 +701,11 @@ mod tests {
             daemon: false,
             app: true,
             applet: false,
+            extension: false,
         };
-        assert!(plan(app_only, false, true, false, true).contains(&Step::RestartApp));
-        assert!(!plan(app_only, false, true, false, false).contains(&Step::RestartApp));
-        assert!(!plan(daemon_only(), false, true, false, true).contains(&Step::RestartApp));
+        assert!(plan(app_only, false, true, false, true, None).contains(&Step::RestartApp));
+        assert!(!plan(app_only, false, true, false, false, None).contains(&Step::RestartApp));
+        assert!(!plan(daemon_only(), false, true, false, true, None).contains(&Step::RestartApp));
     }
 
     #[test]
@@ -616,22 +714,23 @@ mod tests {
             daemon: false,
             app: false,
             applet: true,
+            extension: false,
         };
-        assert!(plan(applet_only, true, false, true, false).contains(&Step::RestartPanel));
+        assert!(plan(applet_only, true, false, true, false, None).contains(&Step::RestartPanel));
         // No running applet's binary changes (a fresh install, or an applet
         // already current): no restart even if the panel is running.
-        assert!(!plan(applet_only, false, false, true, false).contains(&Step::RestartPanel));
+        assert!(!plan(applet_only, false, false, true, false, None).contains(&Step::RestartPanel));
         // An applet's binary changes, but the panel isn't currently running:
         // nothing to restart.
-        assert!(!plan(applet_only, true, false, false, false).contains(&Step::RestartPanel));
+        assert!(!plan(applet_only, true, false, false, false, None).contains(&Step::RestartPanel));
         // Applet not selected THIS run (e.g. a daemon-only update), even
         // though it was installed before and the panel is running.
-        assert!(!plan(daemon_only(), true, false, true, false).contains(&Step::RestartPanel));
+        assert!(!plan(daemon_only(), true, false, true, false, None).contains(&Step::RestartPanel));
     }
 
     #[test]
     fn plan_no_systemctl_means_no_systemd_steps() {
-        let steps = plan(all_three(), true, false, true, false);
+        let steps = plan(all_three(), true, false, true, false, None);
         assert!(!steps.contains(&Step::DaemonReload));
         assert!(!steps.contains(&Step::RemoveLegacyUnit));
         assert!(!steps.contains(&Step::Enable));
@@ -644,8 +743,9 @@ mod tests {
             daemon: false,
             app: true,
             applet: false,
+            extension: false,
         };
-        let steps = plan(app_only, false, true, false, false);
+        let steps = plan(app_only, false, true, false, false, None);
         assert!(!steps.iter().any(|s| matches!(
             s,
             Step::DaemonReload | Step::RemoveLegacyUnit | Step::Enable | Step::RestartOrStart
@@ -655,9 +755,10 @@ mod tests {
     #[test]
     fn plan_cleanup_legacy_always_runs_regardless_of_every_other_gate() {
         assert!(
-            plan(Components::default(), false, false, false, false).contains(&Step::CleanupLegacy)
+            plan(Components::default(), false, false, false, false, None)
+                .contains(&Step::CleanupLegacy)
         );
-        assert!(plan(all_three(), true, true, true, true).contains(&Step::CleanupLegacy));
+        assert!(plan(all_three(), true, true, true, true, None).contains(&Step::CleanupLegacy));
     }
 
     #[test]
@@ -666,8 +767,9 @@ mod tests {
             daemon: false,
             app: true,
             applet: false,
+            extension: false,
         };
-        let steps = plan(app_only, false, true, false, false);
+        let steps = plan(app_only, false, true, false, false, None);
         assert!(steps.contains(&Step::NudgeLaunchers));
         assert!(
             !steps
@@ -684,7 +786,7 @@ mod tests {
         // available, interactive session. The documented order for the
         // "all" case: systemd install/enable/(re)start, app restart, applet
         // panel restart, launcher nudge, legacy cleanup.
-        let steps = plan(all_three(), true, true, true, true);
+        let steps = plan(all_three(), true, true, true, true, None);
         assert_eq!(
             steps,
             vec![
@@ -766,6 +868,34 @@ mod tests {
                 .iter()
                 .all(|p| p.contains("super-test") || p == ".local/bin/test"),
             "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn plan_turns_on_only_an_extension_installed_where_there_was_none() {
+        let extension_only = Components {
+            extension: true,
+            ..Components::default()
+        };
+        let installed = Some(ExtensionChange::Installed);
+        assert!(
+            plan(extension_only, false, false, false, false, installed)
+                .contains(&Step::EnableExtension)
+        );
+        // An update keeps what its user chose, on or off, and so does one
+        // kept because it is already current.
+        let updated = Some(ExtensionChange::Updated);
+        assert!(
+            !plan(extension_only, false, false, false, false, updated)
+                .contains(&Step::EnableExtension)
+        );
+        assert!(
+            !plan(extension_only, false, false, false, false, None)
+                .contains(&Step::EnableExtension)
+        );
+        assert!(
+            !plan(daemon_only(), false, true, false, false, installed)
+                .contains(&Step::EnableExtension)
         );
     }
 }
