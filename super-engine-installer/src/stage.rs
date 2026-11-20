@@ -334,6 +334,30 @@ fn required_entry(
     Ok(ManifestEntry { source, dest, mode })
 }
 
+/// The `<short_name>` wrapper's entry. The wrapper has no source in the
+/// tarball — generate it now and stage it as a real file, so the root phase
+/// only ever copies files.
+fn stage_wrapper(
+    staging: &Path,
+    prefix: &Path,
+    installer: &Installer,
+) -> Result<ManifestEntry, InstallError> {
+    let short_name = installer.product.short_name;
+    let generated_dir = staging.join("generated");
+    std::fs::create_dir_all(&generated_dir).map_err(|e| {
+        InstallError::InstallFailed(format!("create {}: {e}", generated_dir.display()))
+    })?;
+    let wrapper_path = generated_dir.join(short_name);
+    std::fs::write(&wrapper_path, wrapper_script(prefix, installer)).map_err(|e| {
+        InstallError::InstallFailed(format!("write {}: {e}", wrapper_path.display()))
+    })?;
+    Ok(ManifestEntry {
+        source: wrapper_path,
+        dest: prefix.join("bin").join(short_name),
+        mode: 0o755,
+    })
+}
+
 /// Build the manifest for `components`, resolving every source against
 /// `staging` and every destination against `prefix` (`unit_dir` for the
 /// systemd unit).
@@ -384,22 +408,7 @@ pub fn build_manifest(
         ] {
             entries.push(required_entry(staging, &name, bin.join(&name), 0o755)?);
         }
-
-        // The wrapper has no source in the tarball — generate it now and
-        // stage it as a real file, so the root phase only ever copies files.
-        let generated_dir = staging.join("generated");
-        std::fs::create_dir_all(&generated_dir).map_err(|e| {
-            InstallError::InstallFailed(format!("create {}: {e}", generated_dir.display()))
-        })?;
-        let wrapper_path = generated_dir.join(product.short_name);
-        std::fs::write(&wrapper_path, wrapper_script(prefix, installer)).map_err(|e| {
-            InstallError::InstallFailed(format!("write {}: {e}", wrapper_path.display()))
-        })?;
-        entries.push(ManifestEntry {
-            source: wrapper_path,
-            dest: bin.join(product.short_name),
-            mode: 0o755,
-        });
+        entries.push(stage_wrapper(staging, prefix, installer)?);
 
         let unit = format!("{slug}.service");
         entries.push(required_entry(
