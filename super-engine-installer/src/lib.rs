@@ -50,6 +50,11 @@ pub struct Installer {
     /// The product's own post-install steps, run after the shared ones. They
     /// are best-effort: they log what fails, and the install still succeeds.
     pub after_install: Option<fn(&AfterInstall<'_>)>,
+    /// Binaries the `daemon` component installs beside the daemon, the CLI
+    /// and the consent helper, by name, e.g. an MCP server. Each is skipped
+    /// when the release does not carry it, so a release from before it
+    /// shipped still installs.
+    pub extra_binaries: &'static [&'static str],
     /// The apps the `app` component installs, by binary name: each with its
     /// `resources/<name>.desktop` and icon, and its metainfo when the release
     /// carries one. A product's apps need not carry its slug.
@@ -544,6 +549,7 @@ mod tests {
         user_agent: "super-engine-installer-tests",
         wrapper_usage: "Used by the tests.",
         after_install: None,
+        extra_binaries: &["super-test-mcp"],
         apps: &["super-test-app"],
         retired: Retired::NONE,
     };
@@ -554,6 +560,7 @@ mod tests {
         user_agent: "super-engine-installer-tests",
         wrapper_usage: "Used by the tests.",
         after_install: None,
+        extra_binaries: &[],
         apps: &["super-a-app", "super-b-app"],
         retired: Retired {
             binaries: &["super-a-daemon", "super-a-cli", "a"],
