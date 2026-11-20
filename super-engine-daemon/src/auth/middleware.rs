@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The guards every route sits behind: the origin gate on the TCP listener,
-//! the token and scope check, and the per-client rate limit.
+//! the token and scope check, and the per-client rate limit. An assistant
+//! route has a gate of its own in place of the origin gate
+//! ([`require_assistant_caller`]), and a route for the product's own clients
+//! only has one more guard after the scope check
+//! ([`require_official_client`]).
 //!
 //! Each takes the daemon's [`Auth`] as its state, so a daemon layers them
 //! with `axum::middleware::from_fn_with_state(auth.clone(), guard)`.
 
 use crate::auth::Auth;
+use crate::auth::assistant_keys;
 use crate::auth::consent::ConsentKey;
-use crate::auth::identity::resolve_peer_identity;
+use crate::auth::identity::{PeerIdentity, resolve_peer_identity};
 use crate::auth::tokens::{TokenMeta, TokenStore};
 use crate::http::PeerInfo;
 use crate::http::responses::{auth_err, invalid_session, rate_limited, reason, scope_denied};
@@ -110,8 +115,9 @@ async fn refuse(request: Request<Body>, response: Response) -> Response {
 /// Gate every TCP request on the user's origin allowlist, and answer browser
 /// preflights.
 ///
-/// This is the TCP half of the identity model, and the reason turning the TCP
-/// listener on (`[http.tcp].enabled`) exposes nothing by itself. The Unix socket has `SO_PEERCRED`: the kernel names the caller and
+/// This is the TCP half of the identity model for browser pages, and the reason
+/// turning the TCP listener on (`[http.tcp].enabled`) exposes nothing by
+/// itself. The Unix socket has `SO_PEERCRED`: the kernel names the caller and
 /// no client can talk its way out of that. TCP has no equivalent, so the only
 /// thing distinguishing one caller from another is the `Origin` header — and a
 /// header is a claim, not a proof.
@@ -128,6 +134,10 @@ async fn refuse(request: Request<Body>, response: Response) -> Response {
 /// only there so a browser reports the refusal as a CORS error the developer
 /// can read instead of an opaque network failure.
 ///
+/// An AI assistant sends no `Origin`, so it is refused here. A daemon serves
+/// assistants on routes this gate is not layered on, behind
+/// [`require_assistant_caller`] instead.
+///
 /// Unix requests pass through untouched: their identity is already settled, and
 /// a browser cannot reach that socket to need any of this.
 pub async fn require_allowed_origin(
@@ -141,7 +151,7 @@ pub async fn require_allowed_origin(
     let is_tcp = request
         .extensions()
         .get::<PeerInfo>()
-        .is_some_and(|p| p.pid.is_none() && p.uid.is_none());
+        .is_some_and(PeerInfo::is_tcp);
     if !is_tcp {
         return next.run(request).await;
     }
@@ -264,6 +274,154 @@ fn cors_headers(origin: &str, mut response: Response) -> Response {
     response
 }
 
+/// Gate an assistant route: admit an AI assistant on the TCP listener by its
+/// assistant key.
+///
+/// An assistant is a program, not a page, so it sends no `Origin` and cannot
+/// pass [`require_allowed_origin`]. A daemon layers this gate on its assistant
+/// routes instead, and keeps those routes out of the origin gate's reach. Its
+/// whole test is the key: the daemon minted it when the user connected the
+/// assistant, so a request bearing it is that assistant.
+///
+/// Three things are checked, in this order, before the key:
+///
+/// 1. **No `Origin` at all.** An assistant never sends one, and every browser
+///    does on a request like this, so any `Origin` is a page. A page is never
+///    an assistant, whatever key it holds, and it gets no CORS headers that
+///    would let it read the refusal.
+/// 2. **The `Host` names the loopback interface**: `127.0.0.1`, `localhost` or
+///    `[::1]`, on any port. A browser leaves `Origin` off some requests, a
+///    same-origin `GET` among them, and DNS rebinding can make a page's own
+///    origin resolve to this listener. Such a request still names the page's
+///    host, so it stops here.
+/// 3. **The bearer is an assistant key**, from the `Authorization` header only.
+///    A session token is not one, even a valid one: sessions belong to the
+///    Unix socket and to allowlisted pages.
+///
+/// The key's id then becomes the request's identity
+/// ([`PeerInfo::assistant_key_id`]), which the token guards after this one
+/// check the key against. Without this gate, the same key is presented by a
+/// different caller and refused.
+///
+/// Unix requests pass through untouched: their identity is already settled, and
+/// the token guards after this one check whatever they present.
+pub async fn require_assistant_caller(
+    State(auth): State<Auth>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(mut peer) = request
+        .extensions()
+        .get::<PeerInfo>()
+        .filter(|p| p.is_tcp())
+        .cloned()
+    else {
+        return next.run(request).await;
+    };
+
+    // `contains_key`, not `request_origin`: an `Origin` that is not valid
+    // UTF-8 is still an `Origin`, and still a browser.
+    if request.headers().contains_key("origin") {
+        log::warn!("assistant route refused a TCP request that sent an Origin");
+        return refuse(
+            request,
+            auth_err(
+                StatusCode::FORBIDDEN,
+                "auth_denied",
+                reason::BROWSER_NOT_ALLOWED,
+            ),
+        )
+        .await;
+    }
+
+    if !names_loopback(&request) {
+        let host = request
+            .headers()
+            .get("host")
+            .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned());
+        log::warn!("assistant route refused a TCP request for host {host:?}");
+        return refuse(
+            request,
+            auth_err(
+                StatusCode::FORBIDDEN,
+                "auth_denied",
+                reason::HOST_NOT_ALLOWED,
+            ),
+        )
+        .await;
+    }
+
+    let key_id = extract_bearer_token(request.headers())
+        .filter(|token| token.starts_with(assistant_keys::PREFIX))
+        .and_then(|token| auth.tokens().validate(&token).ok())
+        .and_then(|meta| match meta.grantee {
+            PeerIdentity::Assistant { key_id } => Some(key_id),
+            _ => None,
+        });
+    let Some(key_id) = key_id else {
+        return refuse(request, invalid_session(reason::UNKNOWN)).await;
+    };
+    peer.assistant_key_id = Some(key_id);
+
+    // Register the new identity before the rate limiter looks it up, for the
+    // reason `require_allowed_origin` gives: the accept loop registered this
+    // connection as the anonymous TCP caller it was then, which is not the id
+    // the rate limiter now asks about.
+    auth.resource_manager()
+        .register_connection(peer.client_id(), None)
+        .await;
+    request.extensions_mut().insert(peer);
+
+    next.run(request).await
+}
+
+/// Whether `request` is addressed to the loopback interface.
+///
+/// Its one `Host` header must name it. An absolute-form request target
+/// (`GET http://host/ HTTP/1.1`) carries an authority of its own, which
+/// HTTP/1.1 puts before `Host`, so when there is one it must name it too. A
+/// browser never sends that form to a server, but nothing else should get
+/// past this check by using it.
+fn names_loopback(request: &Request<Body>) -> bool {
+    let mut hosts = request.headers().get_all("host").iter();
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
+        return false;
+    };
+    let Ok(host) = host.to_str() else {
+        return false;
+    };
+    is_loopback_authority(host)
+        && request
+            .uri()
+            .authority()
+            .is_none_or(|authority| is_loopback_authority(authority.as_str()))
+}
+
+/// Whether `authority` (`host` or `host:port`) is `127.0.0.1`, `localhost` or
+/// `[::1]`, on any port.
+///
+/// An exact match, not a parse: any other spelling of the loopback address is
+/// refused, which costs an assistant nothing, since it is told which one to
+/// use.
+fn is_loopback_authority(authority: &str) -> bool {
+    let (host, port) = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(end) => authority.split_at(end + 1),
+            None => return false,
+        }
+    } else {
+        match authority.find(':') {
+            Some(colon) => authority.split_at(colon),
+            None => (authority, ""),
+        }
+    };
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (host == "127.0.0.1" || host == "[::1]" || host.eq_ignore_ascii_case("localhost"))
+}
+
 /// The token in an `Authorization: Bearer <token>` header, if there is one.
 #[must_use]
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -304,6 +462,12 @@ pub struct AuthContext {
 /// A resolved mismatch revokes, matching the `/events` watch rather than
 /// merely refusing this one call: the approval named a binary that is not
 /// the one calling, so the session is over, not paused.
+///
+/// An assistant key is the exception. Its grantee is the key itself, which
+/// only [`require_assistant_caller`] gives a request, so the key presented
+/// anywhere else is refused as `wrong_caller`. It is not revoked: the user
+/// connected an assistant with it, and a key pasted into the wrong place is
+/// no reason to disconnect that assistant. Revoking it is the user's call.
 fn verify_peer_binding(
     tokens: &TokenStore,
     peer: Option<&PeerInfo>,
@@ -319,6 +483,14 @@ fn verify_peer_binding(
     };
     if meta.matches(&identity) {
         return Ok(());
+    }
+    if let PeerIdentity::Assistant { .. } = meta.grantee {
+        log::warn!(
+            "assistant key presented by a different caller: key={} caller={}; refused, not revoked",
+            meta.describe_grantee(),
+            identity.describe(),
+        );
+        return Err(reason::WRONG_CALLER);
     }
     log::warn!(
         "session token presented by a different caller: approved={} caller={}; revoking",
@@ -423,6 +595,79 @@ pub async fn require_any_authenticated(
         }
         Err(reason) => refuse(request, invalid_session(reason)).await,
     }
+}
+
+/// Let a request through only when its caller is one of the product's own
+/// clients, installed beside the daemon.
+///
+/// For routes no other caller should reach whatever scopes it holds, such as
+/// the ones that mint and revoke assistant keys: an assistant must not be able
+/// to mint itself another key, and neither should any other program the user
+/// once allowed. Layered inside a scope guard, which attaches the
+/// [`AuthContext`] this reads; with none attached, the request is refused.
+///
+/// The caller has already been checked against its session's grantee by then,
+/// so this judges the grantee with the same test that lets the product's own
+/// clients skip the consent dialog
+/// ([`is_official_client`](crate::auth::consent::is_official_client)). A web
+/// page and an assistant never pass it.
+///
+/// In a debug build, `<PREFIX>_TREAT_AS_OFFICIAL=1`
+/// ([`TREAT_AS_OFFICIAL`](crate::auth::TREAT_AS_OFFICIAL)) lets every caller
+/// but an assistant through, for integration tests whose client is not
+/// installed beside the daemon. A release build ignores it.
+pub async fn require_official_client(
+    State(auth): State<Auth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(grantee) = request
+        .extensions()
+        .get::<AuthContext>()
+        .map(|ctx| ctx.meta.grantee.clone())
+    else {
+        log::error!("require_official_client found no session: layer it inside a scope guard");
+        return refuse(request, not_official_client()).await;
+    };
+    if auth.is_official(&grantee) || treated_as_official(&auth, &grantee) {
+        return next.run(request).await;
+    }
+    log::warn!(
+        "{} is not one of {}'s own clients; refused",
+        grantee.describe(),
+        auth.product().display_name,
+    );
+    refuse(request, not_official_client()).await
+}
+
+fn not_official_client() -> Response {
+    auth_err(
+        StatusCode::FORBIDDEN,
+        "auth_denied",
+        reason::NOT_OFFICIAL_CLIENT,
+    )
+}
+
+/// Whether `<PREFIX>_TREAT_AS_OFFICIAL=1` lets `grantee` through
+/// [`require_official_client`]. Never for an assistant, and never in a release
+/// build: compiled out there, as `<PREFIX>_AUTO_APPROVE` is, so a stray
+/// variable cannot open these routes in a shipped binary.
+fn treated_as_official(auth: &Auth, grantee: &PeerIdentity) -> bool {
+    if let PeerIdentity::Assistant { .. } = grantee {
+        return false;
+    }
+    let var = auth.product().env(crate::auth::TREAT_AS_OFFICIAL);
+    #[cfg(debug_assertions)]
+    let treat = std::env::var(&var).is_ok_and(|v| v == "1");
+    #[cfg(not(debug_assertions))]
+    let treat = false;
+    if treat {
+        log::info!(
+            "{var}=1 set; treating {} as an official client",
+            grantee.describe()
+        );
+    }
+    treat
 }
 
 /// Per-request rate-limit gate. Layered on every authenticated
@@ -831,9 +1076,12 @@ mod web_binding_tests {
 /// answers when it does not.
 #[cfg(test)]
 mod guard_tests {
-    use super::{require_allowed_origin, require_scope, require_status_scope};
+    use super::{
+        AuthContext, require_allowed_origin, require_any_authenticated, require_assistant_caller,
+        require_official_client, require_rate_limit, require_scope, require_status_scope,
+    };
     use crate::auth::Auth;
-    use crate::auth::identity::resolve_peer_identity;
+    use crate::auth::identity::{PeerIdentity, resolve_peer_identity};
     use crate::http::PeerInfo;
     use axum::Router;
     use axum::body::Body;
@@ -917,6 +1165,21 @@ mod guard_tests {
         assert_eq!(body, "reached");
     }
 
+    /// The gate reads the listener from the connection, not from which
+    /// credentials are missing: a Unix peer whose credentials could not be read
+    /// is still a Unix peer, and the guards after this one fail it closed.
+    #[tokio::test]
+    async fn a_unix_peer_without_credentials_is_not_origin_gated() {
+        let auth = Auth::for_tests(&[]);
+        let (status, body) = call(
+            origin_gated(&auth),
+            PeerInfo::unix(None, None),
+            get_from(None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     fn scope_gated(auth: &Auth) -> Router {
         Router::new()
             .route("/", get(|| async { "reached" }))
@@ -987,6 +1250,370 @@ mod guard_tests {
                 ));
         let (status, body) = call(router, self_peer(), get_with_token(&token)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// An assistant route as a daemon builds one: the assistant gate first,
+    /// then the rate limit, then the token check.
+    fn assistant_route(auth: &Auth) -> Router {
+        Router::new()
+            .route("/", get(|| async { "reached" }))
+            .layer(from_fn_with_state(auth.clone(), require_any_authenticated))
+            .layer(from_fn_with_state(auth.clone(), require_rate_limit))
+            .layer(from_fn_with_state(auth.clone(), require_assistant_caller))
+    }
+
+    /// A request as an assistant sends one: to `host`, with `token` as its
+    /// bearer when there is one, and no `Origin` unless `origin` is given.
+    fn assistant_request(token: Option<&str>, host: &str, origin: Option<&str>) -> Request<Body> {
+        let mut request = Request::get("/").header("host", host);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        request.body(Body::empty()).expect("request builds")
+    }
+
+    /// A key minted for an assistant, the way the product mints one.
+    async fn assistant_key(auth: &Auth) -> (String, String) {
+        let (secret, key) = auth
+            .mint_assistant_key("Claude Code", &["tts".to_string()])
+            .await
+            .expect("mint");
+        (secret, key.id)
+    }
+
+    /// The case the gate exists for: a program on TCP with no `Origin`, its
+    /// key, and a loopback `Host` reaches the route. The rate limiter is in
+    /// the way, so reaching the route also shows the gate registered the
+    /// key's bucket: an unregistered one is answered `429`.
+    #[tokio::test]
+    async fn an_assistant_key_over_tcp_reaches_the_route() {
+        let auth = Auth::for_tests(&[]);
+        let (secret, id) = assistant_key(&auth).await;
+        for host in [
+            "127.0.0.1:7300",
+            "localhost:7300",
+            "[::1]:7300",
+            "127.0.0.1",
+        ] {
+            let (status, body) = call(
+                assistant_route(&auth),
+                PeerInfo::tcp(),
+                assistant_request(Some(&secret), host, None),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{host}: {body}");
+            assert_eq!(body, "reached");
+        }
+        assert!(
+            auth.resource_manager()
+                .record_request(&format!("assistant:{id}"))
+                .await
+                .is_ok(),
+            "the gate registers the key's own bucket"
+        );
+    }
+
+    /// A page is never an assistant, whatever key it holds.
+    #[tokio::test]
+    async fn an_assistant_key_with_an_origin_is_refused() {
+        let auth = Auth::for_tests(&["http://127.0.0.1:8910"]);
+        let (secret, _) = assistant_key(&auth).await;
+        let response = assistant_route(&auth)
+            .layer(axum::Extension(PeerInfo::tcp()))
+            .oneshot(assistant_request(
+                Some(&secret),
+                "127.0.0.1:7300",
+                Some("http://127.0.0.1:8910"),
+            ))
+            .await
+            .expect("the router answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin"),
+            "a page must not be able to read the refusal"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body reads");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("browser_not_allowed"), "{body}");
+    }
+
+    /// A `Host` that is not the loopback interface is a name pointed at the
+    /// listener from outside, as DNS rebinding does.
+    #[tokio::test]
+    async fn a_foreign_host_is_refused() {
+        let auth = Auth::for_tests(&[]);
+        let (secret, _) = assistant_key(&auth).await;
+        for host in [
+            "evil.test:7300",
+            "127.0.0.1.evil.test:7300",
+            "localhost.evil.test",
+            "127.0.0.1:7300@evil.test",
+            "",
+        ] {
+            let (status, body) = call(
+                assistant_route(&auth),
+                PeerInfo::tcp(),
+                assistant_request(Some(&secret), host, None),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{host:?}: {body}");
+            assert!(body.contains("host_not_allowed"), "{host:?}: {body}");
+        }
+
+        let no_host = Request::get("/")
+            .header("authorization", format!("Bearer {secret}"))
+            .body(Body::empty())
+            .expect("request builds");
+        let (status, body) = call(assistant_route(&auth), PeerInfo::tcp(), no_host).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "no Host at all: {body}");
+
+        // An absolute-form target names its own host, ahead of `Host`.
+        let absolute = Request::get("http://evil.test:7300/")
+            .header("host", "127.0.0.1:7300")
+            .header("authorization", format!("Bearer {secret}"))
+            .body(Body::empty())
+            .expect("request builds");
+        let (status, body) = call(assistant_route(&auth), PeerInfo::tcp(), absolute).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "absolute form: {body}");
+    }
+
+    /// A session token is not an assistant key, even a valid one, and neither
+    /// is no token, a key never minted, or a key since revoked.
+    #[tokio::test]
+    async fn only_a_live_assistant_key_gets_through() {
+        let auth = Auth::for_tests(&[]);
+        let (session, _) = auth.tokens().mint(
+            "Docs",
+            &["tts".to_string()],
+            &PeerIdentity::web("http://127.0.0.1:8910"),
+        );
+        let (revoked, revoked_id) = assistant_key(&auth).await;
+        assert!(auth.revoke_assistant_key(&revoked_id).await.unwrap());
+        let never_minted = format!("sva_{}", "0".repeat(64));
+
+        for token in [
+            Some(session.as_str()),
+            None,
+            Some(never_minted.as_str()),
+            Some(revoked.as_str()),
+        ] {
+            let (status, body) = call(
+                assistant_route(&auth),
+                PeerInfo::tcp(),
+                assistant_request(token, "127.0.0.1:7300", None),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{token:?}: {body}");
+            assert!(body.contains("invalid_session"), "{token:?}: {body}");
+            assert!(body.contains("\"unknown\""), "{token:?}: {body}");
+        }
+    }
+
+    /// Over the Unix socket the gate steps aside, and the token check after it
+    /// finds the key in the wrong hands: refused, but not revoked, since the
+    /// assistant the user connected with it still holds it.
+    #[tokio::test]
+    async fn an_assistant_key_over_unix_is_refused_but_kept() {
+        let auth = Auth::for_tests(&[]);
+        let (secret, _) = assistant_key(&auth).await;
+        let router = Router::new()
+            .route("/", get(|| async { "reached" }))
+            .layer(from_fn_with_state(auth.clone(), require_any_authenticated))
+            .layer(from_fn_with_state(auth.clone(), require_assistant_caller));
+        let (status, body) = call(router, self_peer(), get_with_token(&secret)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(body.contains("wrong_caller"), "{body}");
+        assert!(
+            auth.tokens().validate(&secret).is_ok(),
+            "the key is still good for its assistant"
+        );
+    }
+
+    /// From an allowlisted page, through the origin gate, the key is in the
+    /// wrong hands too: refused, and kept.
+    #[tokio::test]
+    async fn an_assistant_key_from_an_allowed_page_is_refused_but_kept() {
+        let auth = Auth::for_tests(&["http://127.0.0.1:8910"]);
+        let (secret, _) = assistant_key(&auth).await;
+        let router = Router::new()
+            .route("/", get(|| async { "reached" }))
+            .layer(from_fn_with_state(auth.clone(), require_any_authenticated))
+            .layer(from_fn_with_state(auth.clone(), require_allowed_origin));
+        let request = Request::get("/")
+            .header("origin", "http://127.0.0.1:8910")
+            .header("authorization", format!("Bearer {secret}"))
+            .body(Body::empty())
+            .expect("request builds");
+        let (status, body) = call(router, PeerInfo::tcp(), request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(body.contains("wrong_caller"), "{body}");
+        assert!(auth.tokens().validate(&secret).is_ok());
+    }
+
+    /// A session token presented over the Unix socket on an assistant route is
+    /// checked as it is anywhere else: the gate only changes TCP requests.
+    #[tokio::test]
+    async fn a_session_over_unix_passes_the_assistant_gate() {
+        let auth = Auth::for_tests(&[]);
+        let me = resolve_peer_identity(Some(&self_peer()), "guard_tests").expect("identifiable");
+        let (token, _) = auth.tokens().mint("Test", &["tts".to_string()], &me);
+        // The accept loop registers a Unix caller; there is no accept loop here.
+        auth.resource_manager()
+            .register_connection(self_peer().client_id(), None)
+            .await;
+        let (status, body) =
+            call(assistant_route(&auth), self_peer(), get_with_token(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A route for the product's own clients, with the session a scope guard
+    /// would have attached for `grantee`, or none.
+    fn official_route(auth: &Auth, grantee: Option<PeerIdentity>) -> Router {
+        let router = Router::new()
+            .route("/", get(|| async { "reached" }))
+            .layer(from_fn_with_state(auth.clone(), require_official_client));
+        match grantee {
+            Some(grantee) => {
+                let now = chrono::Utc::now();
+                router.layer(axum::Extension(AuthContext {
+                    meta: crate::auth::tokens::TokenMeta {
+                        app_name: "Test".to_string(),
+                        scopes: vec!["settings".to_string()],
+                        grantee,
+                        issued_at: now,
+                        expires_at: now + chrono::Duration::days(30),
+                    },
+                    token: "token".to_string(),
+                }))
+            }
+            None => router,
+        }
+    }
+
+    /// The product's own client, installed beside the daemon, gets through.
+    #[tokio::test]
+    async fn an_official_client_reaches_an_official_route() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("super-test-app");
+        std::fs::write(&app, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let auth = Auth::for_tests_with_official_dir(dir.path());
+
+        let (status, body) = call(
+            official_route(&auth, Some(PeerIdentity::native(&app))),
+            self_peer(),
+            Request::get("/").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Every other caller is refused, whatever its scopes: a program that is
+    /// not one of the product's clients, a sandbox that put one at the same
+    /// path, a page, an assistant, and a request no scope guard checked.
+    #[tokio::test]
+    async fn any_other_caller_is_refused_an_official_route() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("super-test-app");
+        std::fs::write(&app, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let auth = Auth::for_tests_with_official_dir(dir.path());
+
+        for grantee in [
+            Some(PeerIdentity::native("/usr/bin/curl")),
+            Some(PeerIdentity::Native {
+                exe_path: app.clone(),
+                flatpak_app_id: Some("org.example.Stranger".to_string()),
+            }),
+            Some(PeerIdentity::web("http://127.0.0.1:8910")),
+            Some(PeerIdentity::Assistant {
+                key_id: "0a1b2c3d".to_string(),
+            }),
+            None,
+        ] {
+            let shown = format!("{grantee:?}");
+            let (status, body) = call(
+                official_route(&auth, grantee),
+                self_peer(),
+                Request::get("/").body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{shown}: {body}");
+            assert!(body.contains("not_official_client"), "{shown}: {body}");
+        }
+    }
+
+    /// End to end: an assistant through its own gate and the token check holds
+    /// a good key, and is still refused a route for the product's own clients,
+    /// such as the one that mints keys.
+    #[tokio::test]
+    async fn an_assistant_cannot_reach_an_official_route() {
+        let auth = Auth::for_tests(&[]);
+        let (secret, _) = assistant_key(&auth).await;
+        let router = Router::new()
+            .route("/", get(|| async { "reached" }))
+            .layer(from_fn_with_state(auth.clone(), require_official_client))
+            .layer(from_fn_with_state(auth.clone(), require_any_authenticated))
+            .layer(from_fn_with_state(auth.clone(), require_assistant_caller));
+        let (status, body) = call(
+            router,
+            PeerInfo::tcp(),
+            assistant_request(Some(&secret), "127.0.0.1:7300", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("not_official_client"), "{body}");
+    }
+}
+
+/// What the assistant gate takes for the loopback interface.
+#[cfg(test)]
+mod loopback_tests {
+    use super::is_loopback_authority;
+
+    #[test]
+    fn the_three_loopback_names_on_any_port() {
+        for authority in [
+            "127.0.0.1",
+            "127.0.0.1:7300",
+            "localhost",
+            "localhost:1",
+            "LocalHost:7300",
+            "[::1]",
+            "[::1]:7300",
+        ] {
+            assert!(is_loopback_authority(authority), "{authority}");
+        }
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        for authority in [
+            "",
+            "evil.test",
+            "evil.test:7300",
+            "127.0.0.1.evil.test",
+            "localhost.evil.test:7300",
+            "127.0.0.2:7300",
+            "[::1]evil",
+            "[::1",
+            "::1",
+            "127.0.0.1:",
+            "127.0.0.1:port",
+            "127.0.0.1:7300@evil.test",
+            "user@127.0.0.1:7300",
+        ] {
+            assert!(!is_loopback_authority(authority), "{authority}");
+        }
     }
 }
 

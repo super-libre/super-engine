@@ -710,12 +710,13 @@ fn spawn_events_keepalive_and_exe_watch(
                     }
                 }
                 _ = exe_watch.tick() => {
-                    // No pid means a web subscriber, which has no binary to
-                    // watch: its identity is an origin, and an origin cannot
-                    // be swapped on disk mid-stream. What *can* change is the
-                    // user's allowlist, and this watch does not see that — a
-                    // stream opened while an origin was allowed outlives its
-                    // removal, until the client disconnects.
+                    // No pid means a TCP subscriber, which has no binary to
+                    // watch: its identity is an origin or an assistant key,
+                    // and neither can be swapped on disk mid-stream. What
+                    // *can* change is the user's allowlist, or the key being
+                    // revoked, and this watch sees neither — a stream opened
+                    // while an origin was allowed, or a key live, outlives
+                    // the change until the client disconnects.
                     let Some(pid) = peer_pid else { continue; };
                     // Re-resolve the whole identity, not just the path: a
                     // sandboxed peer's path is one every sandbox can share, so

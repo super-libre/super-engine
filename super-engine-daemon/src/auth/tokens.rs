@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The session tokens a daemon has issued, and their copy in the secrets file.
+//!
+//! The store also answers for the daemon's assistant keys
+//! ([`assistant_keys`](crate::auth::assistant_keys)), so one lookup serves
+//! every bearer a guard is handed.
 
+use crate::auth::assistant_keys::{self, AssistantKey, AssistantKeyStore};
 use crate::auth::identity::PeerIdentity;
-use crate::secrets::Secrets;
+use crate::secrets::{Secrets, SecretsError};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use log::{info, warn};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -172,10 +177,15 @@ async fn persist_snapshot(snapshot: HashMap<String, TokenMeta>, secrets: Secrets
 /// is the hot lookup path; every mutation also writes the whole map
 /// back to the [secrets file](crate::secrets) so a daemon restart
 /// re-hydrates the same set of valid tokens.
+///
+/// It holds the daemon's assistant keys too, so [`Self::validate`] answers
+/// for every bearer: a session token, or an assistant key by its
+/// [prefix](assistant_keys::PREFIX).
 #[derive(Clone)]
 pub struct TokenStore {
     pub(crate) inner: Arc<Mutex<HashMap<String, TokenMeta>>>,
     persist: SessionPersister,
+    assistant_keys: AssistantKeyStore,
 }
 
 #[cfg(test)]
@@ -227,13 +237,14 @@ impl TokenStore {
     fn empty(secrets: Secrets) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            assistant_keys: AssistantKeyStore::load(secrets.clone()),
             persist: SessionPersister::spawn(secrets),
         }
     }
 
-    /// Load the sessions persisted in `secrets`, prune anything already past
-    /// its `expires_at`, and write the cleaned set back if pruning removed
-    /// entries.
+    /// Load the sessions and assistant keys persisted in `secrets`, prune any
+    /// session already past its `expires_at`, and write the cleaned set back
+    /// if pruning removed entries. Assistant keys never expire.
     ///
     /// # Panics
     /// If a thread panicked while holding the store's lock.
@@ -311,12 +322,25 @@ impl TokenStore {
     /// The session `token` names, or why there is none: `unknown` or
     /// `expired` (an expired token is evicted on the way).
     ///
+    /// A token with the assistant-key [prefix](assistant_keys::PREFIX) is
+    /// looked up among the assistant keys instead, and comes back as a session
+    /// whose grantee is that key's
+    /// [`PeerIdentity::Assistant`]. It never expires; a revoked or never-minted
+    /// one is `unknown`.
+    ///
     /// # Errors
     /// The `invalid_session` reason the caller answers with.
     ///
     /// # Panics
     /// If a thread panicked while holding the store's lock.
     pub fn validate(&self, token: &str) -> Result<TokenMeta, &'static str> {
+        if token.starts_with(assistant_keys::PREFIX) {
+            return self
+                .assistant_keys
+                .lookup(token)
+                .map(|key| key.token_meta())
+                .ok_or("unknown");
+        }
         // Submit the expired-eviction snapshot under the lock so the persist
         // channel's order matches lock order (audit 2 Tier 1 #4). `submit` is a
         // non-blocking channel send — the file write happens off-thread in the
@@ -332,6 +356,57 @@ impl TokenStore {
             return Err("expired");
         }
         Ok(meta)
+    }
+
+    /// Mint an assistant key for the assistant `name`, granting `scopes`, and
+    /// write it to the secrets file. The key's secret and the key.
+    ///
+    /// The key is written before it is returned, since the caller hands it
+    /// out: a key the next daemon has never heard of would leave the assistant
+    /// holding nothing. The write runs on a blocking thread.
+    ///
+    /// # Errors
+    /// When the secrets file cannot be written. No key is minted then.
+    ///
+    /// # Panics
+    /// If a thread panicked while holding the keys' lock.
+    pub async fn mint_assistant_key(
+        &self,
+        name: &str,
+        scopes: &[String],
+    ) -> Result<(String, AssistantKey), SecretsError> {
+        self.assistant_keys.mint(name, scopes).await
+    }
+
+    /// Every assistant key, oldest first, without its secret.
+    ///
+    /// # Panics
+    /// If a thread panicked while holding the keys' lock.
+    #[must_use]
+    pub fn assistant_keys(&self) -> Vec<AssistantKey> {
+        self.assistant_keys.list()
+    }
+
+    /// The secret of the assistant key `id`, or `None` when there is no such
+    /// key.
+    ///
+    /// # Panics
+    /// If a thread panicked while holding the keys' lock.
+    #[must_use]
+    pub fn assistant_key_secret(&self, id: &str) -> Option<String> {
+        self.assistant_keys.secret(id)
+    }
+
+    /// Revoke the assistant key `id` and write the change. It stops working at
+    /// once. `false` when there was no such key.
+    ///
+    /// # Errors
+    /// When the secrets file cannot be written. The key keeps working then.
+    ///
+    /// # Panics
+    /// If a thread panicked while holding the keys' lock.
+    pub async fn revoke_assistant_key(&self, id: &str) -> Result<bool, SecretsError> {
+        self.assistant_keys.revoke(id).await
     }
 
     /// Drop a session token immediately and persist the change. Used by

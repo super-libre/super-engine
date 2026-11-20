@@ -175,6 +175,11 @@ async fn spawn_consent_dialog(
         PeerIdentity::Web { origin } => {
             cmd.env(product.env(consent::WEB_ORIGIN), origin);
         }
+        // An assistant's key was minted by the product, on the user's word,
+        // so there is no question to ask. `ask_user_for_consent` refuses one
+        // before it gets here; this arm only keeps the helper from being
+        // started with no identity at all.
+        PeerIdentity::Assistant { .. } => return None,
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -344,6 +349,11 @@ fn consent_dialog_text(
                  {product} does for installed programs."
             );
         }
+        // Never shown: `ask_user_for_consent` refuses an assistant before it
+        // composes a dialog, since its key was minted on the user's word.
+        PeerIdentity::Assistant { key_id } => {
+            let _ = writeln!(text, "Assistant key {key_id} wants access to {product}.");
+        }
     }
 
     let _ = writeln!(text);
@@ -400,6 +410,13 @@ pub async fn ask_user_for_consent(
     scopes: &[String],
     identity: &PeerIdentity,
 ) -> ConsentDecision {
+    // An assistant is never asked about: the product mints its key when the
+    // user connects it, so a dialog would ask the user a question they have
+    // already answered, about a caller the dialog has no way to name.
+    if let PeerIdentity::Assistant { key_id } = identity {
+        log::warn!("refusing to show the consent dialog for assistant key {key_id}");
+        return ConsentDecision::PopupFailed;
+    }
     // Serialize popups globally: at most one consent dialog on screen at a time
     // (audit 2 Tier 3 #10). `/auth/request` is unauthenticated and outside the
     // rate limiter, and the 8 scopes yield 255 distinct `(exe, scopes)` consent
@@ -461,16 +478,33 @@ fn official_client_names(product: &ProductSpec) -> impl Iterator<Item = &'static
 /// not logged here — the caller logs the rare success.
 #[must_use]
 pub fn is_official_client(product: &ProductSpec, identity: &PeerIdentity) -> bool {
+    let Ok(daemon_exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(daemon_dir) = daemon_exe.parent() else {
+        return false;
+    };
+    is_official_identity_in(product, daemon_dir, identity)
+}
+
+/// [`is_official_client`] with the daemon's own directory given: whether
+/// `identity` is one of `product`'s own client binaries, in `daemon_dir`.
+pub(crate) fn is_official_identity_in(
+    product: &ProductSpec,
+    daemon_dir: &Path,
+    identity: &PeerIdentity,
+) -> bool {
     let PeerIdentity::Native {
         exe_path,
         flatpak_app_id,
     } = identity
     else {
-        // A web peer is never first-party. The whole check below is about a
-        // binary on this filesystem, and a page has none — there is nothing
-        // to canonicalize and no ownership to verify, so the only safe answer
-        // is the consent popup. A site calling itself `<slug>-app` must not
-        // get within reach of the short-circuit.
+        // A web peer or an assistant is never first-party. The whole check
+        // below is about a binary on this filesystem, and neither has one —
+        // there is nothing to canonicalize and no ownership to verify, so the
+        // only safe answer is no. A site calling itself `<slug>-app` must not
+        // get within reach of the short-circuit, and neither must an
+        // assistant whose key the user named that.
         return false;
     };
     // A sandboxed peer is never first-party, whatever its path says. The
@@ -481,12 +515,6 @@ pub fn is_official_client(product: &ProductSpec, identity: &PeerIdentity) -> boo
     if flatpak_app_id.is_some() {
         return false;
     }
-    let Ok(daemon_exe) = std::env::current_exe() else {
-        return false;
-    };
-    let Some(daemon_dir) = daemon_exe.parent() else {
-        return false;
-    };
     is_official_client_in(product, daemon_dir, exe_path)
 }
 
