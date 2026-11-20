@@ -444,3 +444,30 @@ fn a_backend_that_reports_no_progress_never_stalls() {
     assert!(!watch.reports_progress());
     assert!(!watch.stalled(start + Duration::from_secs(3600)));
 }
+
+/// A request that names a context header itself is sent with its own value,
+/// for that request alone, and the instance's other headers still go with it.
+#[test]
+fn a_request_can_replace_a_context_header_for_itself() {
+    let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+    let context = vec![
+        pair("x-voice-prompt", "\"the user's\""),
+        pair("x-voice-option-beam", "5"),
+    ];
+    let own = vec![
+        pair("content-type", "application/json"),
+        pair("X-Voice-Prompt", "\"the user's, and this take's\""),
+    ];
+    let sent: Vec<_> = request_headers(&own, &context).cloned().collect();
+    assert_eq!(
+        sent,
+        vec![
+            pair("content-type", "application/json"),
+            pair("X-Voice-Prompt", "\"the user's, and this take's\""),
+            pair("x-voice-option-beam", "5"),
+        ]
+    );
+    // A request naming none of them gets the instance's, as before.
+    let plain = vec![pair("content-type", "application/json")];
+    assert_eq!(request_headers(&plain, &context).count(), 3);
+}
