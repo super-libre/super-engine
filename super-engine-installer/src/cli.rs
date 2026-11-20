@@ -26,7 +26,7 @@ pub struct Cli {
 pub fn parse_cli(product: &ProductSpec) -> Cli {
     let m = Command::new(product.installer_binary())
         .about(format!(
-            "Install or update {} (daemon, CLI, app, COSMIC applet)",
+            "Install or update {} (daemon, CLI, app, and its COSMIC applet or GNOME Shell extension)",
             product.display_name
         ))
         .disable_version_flag(true)
@@ -58,9 +58,17 @@ pub fn parse_cli(product: &ProductSpec) -> Cli {
             Arg::new("components")
                 .long("components")
                 .value_parser(PossibleValuesParser::new([
-                    "all", "daemon", "app", "applet",
+                    "all",
+                    "daemon",
+                    "app",
+                    "applet",
+                    "extension",
                 ]))
-                .help("Explicit component selection (default: detect)"),
+                .help(
+                    "Explicit component selection (default: detect). `all` is the daemon, \
+                     the app and the COSMIC applet; the GNOME Shell extension is detected, \
+                     or asked for by name",
+                ),
         )
         .arg(
             Arg::new("dry-run")

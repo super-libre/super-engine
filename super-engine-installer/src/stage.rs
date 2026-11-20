@@ -5,23 +5,55 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use super_engine_protocol::SHARED_APPLET;
 use super_engine_spec::verify::{tar_budget_step, tar_entry_unsafe_reason, unpack_cap};
 
 use crate::errors::InstallError;
-use crate::{Installer, Retired};
+use crate::{GnomeExtension, Installer, Retired};
 
-/// Which of the three installable components are selected.
+/// Which of the installable components are selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // one flag per component, as the `complete` event lists them
 pub struct Components {
     pub daemon: bool,
     pub app: bool,
+    /// The product's COSMIC applet
+    /// ([`Installer::cosmic_applet`](crate::Installer::cosmic_applet)).
     pub applet: bool,
+    /// The product's GNOME Shell extension
+    /// ([`Installer::gnome_extension`](crate::Installer::gnome_extension)).
+    pub extension: bool,
+}
+
+/// Which desktops are here to host what a product adds to them: COSMIC's
+/// panel its applet, GNOME Shell its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Desktops {
+    /// A COSMIC panel is on `$PATH`.
+    pub cosmic: bool,
+    /// GNOME Shell is on `$PATH`.
+    pub gnome: bool,
+}
+
+#[cfg(test)]
+impl Desktops {
+    pub const NONE: Self = Self {
+        cosmic: false,
+        gnome: false,
+    };
+    pub const COSMIC: Self = Self {
+        cosmic: true,
+        gnome: false,
+    };
+    pub const GNOME: Self = Self {
+        cosmic: false,
+        gnome: true,
+    };
 }
 
 impl Components {
     /// The wire strings for the `complete` event's `components` field, in
-    /// `["daemon", "app", "applet"]` order (only the selected subset).
+    /// `["daemon", "app", "applet", "extension"]` order (only the selected
+    /// subset).
     #[must_use]
     #[allow(clippy::trivially_copy_pass_by_ref)] // interface fixed by the design doc: `&self`
     pub fn names(&self) -> Vec<String> {
@@ -35,23 +67,30 @@ impl Components {
         if self.applet {
             names.push("applet".to_string());
         }
+        if self.extension {
+            names.push("extension".to_string());
+        }
         names
     }
 }
 
-/// An explicit component selection: either the four `--components` CLI
-/// values (`all|daemon|app|applet`, see `From<&str>` below), or
-/// `AllButApplet` — reachable only from the interactive menu's "All" option
-/// when no COSMIC panel is present, never from `--components` (the CLI's
-/// `all` keeps meaning literally-all, so the hermetic e2e test stays
-/// deterministic regardless of the CI host's COSMIC availability).
+/// An explicit component selection: either the `--components` CLI values
+/// (`all|daemon|app|applet|extension`, see `From<&str>` below), or
+/// `AllDetected` — reachable only from the interactive menu's "All" option,
+/// never from `--components`: the daemon and the app, with the applet where a
+/// COSMIC panel is and the extension where GNOME Shell is. The CLI's `all`
+/// keeps meaning the daemon, the app and the applet whatever the host has,
+/// so the hermetic e2e test stays deterministic regardless of the CI host's
+/// desktop; the extension is detected, picked from the menu, or asked for by
+/// name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentSelection {
     All,
-    AllButApplet,
+    AllDetected,
     Daemon,
     App,
     Applet,
+    Extension,
 }
 
 impl From<&str> for ComponentSelection {
@@ -63,6 +102,7 @@ impl From<&str> for ComponentSelection {
             "daemon" => ComponentSelection::Daemon,
             "app" => ComponentSelection::App,
             "applet" => ComponentSelection::Applet,
+            "extension" => ComponentSelection::Extension,
             _ => ComponentSelection::All,
         }
     }
@@ -75,27 +115,33 @@ impl From<&str> for ComponentSelection {
 /// an update —
 /// only the components already present are refreshed (the daemon always,
 /// since it is the core piece every install has). Otherwise this is a fresh
-/// install: daemon and app always, and the applet only when `cosmic_available`
-/// (installing a COSMIC applet with no COSMIC panel to host it is useless).
+/// install: daemon and app always, the applet only where `desktops` has a
+/// COSMIC panel, and the extension only where it has GNOME Shell (installing
+/// either with nothing to host it is useless). A product without an applet
+/// or an extension never gets one.
 #[must_use]
 pub fn plan_components(
     explicit: Option<ComponentSelection>,
     prefix: &Path,
-    cosmic_available: bool,
+    desktops: Desktops,
     installer: &Installer,
 ) -> Components {
     let product = installer.product;
+    let has_applet = installer.cosmic_applet.is_some();
+    let has_extension = installer.gnome_extension.is_some();
     if let Some(selection) = explicit {
         return match selection {
             ComponentSelection::All => Components {
                 daemon: true,
                 app: true,
-                applet: true,
+                applet: has_applet,
+                extension: false,
             },
-            ComponentSelection::AllButApplet => Components {
+            ComponentSelection::AllDetected => Components {
                 daemon: true,
                 app: true,
-                applet: false,
+                applet: desktops.cosmic && has_applet,
+                extension: desktops.gnome && has_extension,
             },
             ComponentSelection::Daemon => Components {
                 daemon: true,
@@ -106,7 +152,11 @@ pub fn plan_components(
                 ..Components::default()
             },
             ComponentSelection::Applet => Components {
-                applet: true,
+                applet: has_applet,
+                ..Components::default()
+            },
+            ComponentSelection::Extension => Components {
+                extension: has_extension,
                 ..Components::default()
             },
         };
@@ -129,15 +179,21 @@ pub fn plan_components(
             app: in_bin
                 .iter()
                 .any(|name| installer.apps.contains(&name.as_str())),
-            applet: in_bin
-                .iter()
-                .any(|name| *name == format!("{slug}-cosmic-applet") || name == SHARED_APPLET),
+            applet: installer.cosmic_applet.is_some_and(|applet| {
+                in_bin
+                    .iter()
+                    .any(|name| *name == format!("{slug}-cosmic-applet") || name == applet.name)
+            }),
+            extension: installer
+                .gnome_extension
+                .is_some_and(|extension| crate::extension::is_installed(prefix, &extension)),
         }
     } else {
         Components {
             daemon: true,
             app: true,
-            applet: cosmic_available,
+            applet: desktops.cosmic && has_applet,
+            extension: desktops.gnome && has_extension,
         }
     }
 }
@@ -303,7 +359,8 @@ fn retired_files(prefix: &Path, unit_dir: &Path, retired: &Retired) -> Vec<PathB
 }
 
 /// What a product's own COSMIC applet installed under `prefix`: its binary,
-/// its three launcher entries and its icon. The shared applet replaces them.
+/// its three launcher entries and its icon. The applet with releases of its
+/// own replaces them.
 fn product_applet_files(prefix: &Path, product_applet: &str) -> Vec<PathBuf> {
     let mut files = vec![prefix.join("bin").join(product_applet)];
     for side in ["full", "left", "right"] {
@@ -383,9 +440,16 @@ fn extra_binary_entries<'a>(
 /// The applet's sources are in `applet`, the extracted tarball of the
 /// applet's own release (see [`crate::applet`]), never in the product's
 /// tarball: a product's release may still carry an applet, and it is
-/// ignored. With the applet component selected, the product's own
-/// `<slug>-cosmic-applet` goes, and `applet` is `None` when the installed
-/// shared applet is already as new as the release, which then stays.
+/// ignored. With the applet component selected, the `<slug>-cosmic-applet`
+/// the product once bundled goes, and `applet` is `None` when the installed
+/// applet is already as new as the release, which then stays.
+///
+/// The extension's sources are in `extension`, the extracted tarball of the
+/// product's extension's own release (see [`crate::extension`]). Each of its
+/// files goes under `<prefix>/share/gnome-shell/extensions/<uuid>`, and the
+/// files of the installed one that the release no longer has go. `extension`
+/// is `None` when the installed extension is already as new as the release,
+/// which then stays.
 ///
 /// `self_exe` is the running installer's own binary — every
 /// install/update re-stages a copy of itself at `<prefix>/bin/<slug>-install`
@@ -399,6 +463,7 @@ fn extra_binary_entries<'a>(
 /// component is missing from `staging` — caught here, before escalation, so a
 /// broken tarball never prompts for a root password.
 #[allow(clippy::trivially_copy_pass_by_ref)] // interface fixed by the design doc: `&Components`
+#[allow(clippy::too_many_arguments)] // one source per component that has releases of its own
 pub fn build_manifest(
     staging: &Path,
     applet: Option<&Path>,
@@ -407,6 +472,7 @@ pub fn build_manifest(
     components: &Components,
     self_exe: &Path,
     installer: &Installer,
+    extension: Option<&Path>,
 ) -> Result<Manifest, InstallError> {
     let product = installer.product;
     let slug = product.slug;
@@ -467,9 +533,11 @@ pub fn build_manifest(
         }
     }
 
-    if components.applet {
-        // The shared applet replaces the product's own, and those of the
-        // products it replaces, whether this run installs it or finds it
+    if components.applet
+        && let Some(cosmic_applet) = &installer.cosmic_applet
+    {
+        // The applet replaces the one the product once bundled, and those of
+        // the products it replaces, whether this run installs it or finds it
         // already current.
         removals.extend(product_applet_files(
             prefix,
@@ -479,42 +547,66 @@ pub fn build_manifest(
             removals.extend(product_applet_files(prefix, applet));
         }
         if let Some(applet) = applet {
-            entries.push(required_entry(
-                applet,
-                SHARED_APPLET,
-                bin.join(SHARED_APPLET),
-                0o755,
-            )?);
-            for path in applet_desktop_files(applet, SHARED_APPLET)? {
-                let name = path
+            let name = cosmic_applet.name;
+            entries.push(required_entry(applet, name, bin.join(name), 0o755)?);
+            for path in applet_desktop_files(applet, name)? {
+                let entry = path
                     .file_name()
                     .expect("filtered on file_name above")
                     .to_owned();
                 entries.push(ManifestEntry {
                     source: path,
-                    dest: prefix.join("share/applications").join(name),
+                    dest: prefix.join("share/applications").join(entry),
                     mode: 0o644,
                 });
             }
             entries.push(required_entry(
                 applet,
-                &format!("resources/icons/hicolor/scalable/apps/{SHARED_APPLET}.svg"),
-                prefix.join(format!(
-                    "share/icons/hicolor/scalable/apps/{SHARED_APPLET}.svg"
-                )),
+                &format!("resources/icons/hicolor/scalable/apps/{name}.svg"),
+                prefix.join(format!("share/icons/hicolor/scalable/apps/{name}.svg")),
                 0o644,
             )?);
         }
     }
 
+    if components.extension
+        && let (Some(staged), Some(gnome_extension)) = (extension, &installer.gnome_extension)
+    {
+        let (placed, stale) = extension_manifest(staged, prefix, gnome_extension)?;
+        entries.extend(placed);
+        removals.extend(stale);
+    }
+
     Ok(Manifest { entries, removals })
+}
+
+/// The extension's part of the manifest: each file of its release in
+/// `staged` placed under its directory, and the files of the one installed
+/// that the release no longer has, to remove.
+fn extension_manifest(
+    staged: &Path,
+    prefix: &Path,
+    gnome_extension: &GnomeExtension,
+) -> Result<(Vec<ManifestEntry>, Vec<PathBuf>), InstallError> {
+    let files = crate::extension::release_files(staged, gnome_extension)?;
+    let dir = crate::extension::dir(prefix, gnome_extension);
+    let stale = crate::extension::stale_files(prefix, gnome_extension, &files);
+    let placed = files
+        .into_iter()
+        .map(|rel| ManifestEntry {
+            source: staged.join(&rel),
+            dest: dir.join(rel),
+            mode: 0o644,
+        })
+        .collect();
+    Ok((placed, stale))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_dir::TestDir;
-    use crate::tests::INSTALLER;
+    use crate::tests::{INSTALLER, TEST_APPLET, TEST_EXTENSION};
     use std::path::PathBuf;
     use super_engine_protocol::test_product::TEST;
 
@@ -586,12 +678,13 @@ mod tests {
     /// entries and its icon, less any whose basename is in `missing`.
     fn fake_applet_release_without(missing: &[&str]) -> TestDir {
         let dir = test_dir();
+        let name = TEST_APPLET.name;
         for f in [
-            SHARED_APPLET.to_string(),
-            format!("resources/{SHARED_APPLET}-full.desktop"),
-            format!("resources/{SHARED_APPLET}-left.desktop"),
-            format!("resources/{SHARED_APPLET}-right.desktop"),
-            format!("resources/icons/hicolor/scalable/apps/{SHARED_APPLET}.svg"),
+            name.to_string(),
+            format!("resources/{name}-full.desktop"),
+            format!("resources/{name}-left.desktop"),
+            format!("resources/{name}-right.desktop"),
+            format!("resources/icons/hicolor/scalable/apps/{name}.svg"),
         ] {
             if missing
                 .iter()
@@ -620,9 +713,11 @@ mod tests {
                 daemon: false,
                 app: false,
                 applet: true,
+                extension: false,
             },
             Path::new("/proc/self/exe"),
             &INSTALLER,
+            None,
         )
         .expect("an applet-only manifest")
     }
@@ -643,11 +738,11 @@ mod tests {
         let m = applet_only_manifest(&fake_staging(), Some(&*applet));
 
         for expected in [
-            "/usr/local/bin/super-cosmic-applet",
-            "/usr/local/share/applications/super-cosmic-applet-full.desktop",
-            "/usr/local/share/applications/super-cosmic-applet-left.desktop",
-            "/usr/local/share/applications/super-cosmic-applet-right.desktop",
-            "/usr/local/share/icons/hicolor/scalable/apps/super-cosmic-applet.svg",
+            "/usr/local/bin/super-test-shared-applet",
+            "/usr/local/share/applications/super-test-shared-applet-full.desktop",
+            "/usr/local/share/applications/super-test-shared-applet-left.desktop",
+            "/usr/local/share/applications/super-test-shared-applet-right.desktop",
+            "/usr/local/share/icons/hicolor/scalable/apps/super-test-shared-applet.svg",
         ] {
             let entry = m
                 .entries
@@ -723,9 +818,11 @@ mod tests {
                 daemon: true,
                 app: true,
                 applet: false,
+                extension: false,
             },
             Path::new("/proc/self/exe"),
             &INSTALLER,
+            None,
         )
         .unwrap();
         assert!(m.removals.is_empty(), "{:?}", m.removals);
@@ -736,28 +833,28 @@ mod tests {
         );
     }
 
-    /// On an update, an installed shared applet keeps the applet component,
+    /// On an update, the product's installed applet keeps the applet component,
     /// just as the product's own applet does.
     #[test]
-    fn detection_update_mode_counts_the_shared_applet() {
-        let prefix = mktree(&["bin/super-test-daemon", "bin/super-cosmic-applet"]);
-        let c = plan_components(None, &prefix, false, &INSTALLER);
+    fn detection_update_mode_counts_the_products_applet() {
+        let prefix = mktree(&["bin/super-test-daemon", "bin/super-test-shared-applet"]);
+        let c = plan_components(None, &prefix, Desktops::NONE, &INSTALLER);
         assert!(c.daemon && c.applet);
     }
 
     #[test]
     fn detection_update_mode_only_updates_whats_present() {
         let prefix = mktree(&["bin/super-test-daemon", "bin/super-test-app"]); // helper: temp dir + touch files
-        let c = plan_components(None, &prefix, true, &INSTALLER);
+        let c = plan_components(None, &prefix, Desktops::COSMIC, &INSTALLER);
         assert!(c.daemon && c.app && !c.applet);
     }
 
     #[test]
     fn detection_fresh_install_takes_all_gated_on_cosmic() {
         let prefix = mktree(&[]); // empty bin/ (F6: `mktree` always creates it)
-        let c = plan_components(None, &prefix, false, &INSTALLER);
+        let c = plan_components(None, &prefix, Desktops::NONE, &INSTALLER);
         assert!(c.daemon && c.app && !c.applet);
-        let c = plan_components(None, &prefix, true, &INSTALLER);
+        let c = plan_components(None, &prefix, Desktops::COSMIC, &INSTALLER);
         assert!(c.applet);
     }
 
@@ -770,9 +867,9 @@ mod tests {
         // so this is still a fresh install.
         let prefix = test_dir(); // no `bin/` subdirectory created
         assert!(!prefix.join("bin").exists());
-        let c = plan_components(None, &prefix, false, &INSTALLER);
+        let c = plan_components(None, &prefix, Desktops::NONE, &INSTALLER);
         assert!(c.daemon && c.app && !c.applet);
-        let c = plan_components(None, &prefix, true, &INSTALLER);
+        let c = plan_components(None, &prefix, Desktops::COSMIC, &INSTALLER);
         assert!(c.daemon && c.app && c.applet);
     }
 
@@ -781,7 +878,7 @@ mod tests {
         // The daemon is always refreshed on an update (the core piece every
         // install has) even when only the applet binary is present.
         let prefix = mktree(&["bin/super-test-cosmic-applet"]);
-        let c = plan_components(None, &prefix, true, &INSTALLER);
+        let c = plan_components(None, &prefix, Desktops::COSMIC, &INSTALLER);
         assert!(c.daemon && !c.app && c.applet);
     }
 
@@ -792,21 +889,31 @@ mod tests {
             "bin/super-test-app",
             "bin/super-test-cosmic-applet",
         ]);
-        let c = plan_components(None, &prefix, false, &INSTALLER); // cosmic gone, but applet was already installed
+        let c = plan_components(None, &prefix, Desktops::NONE, &INSTALLER); // cosmic gone, but applet was already installed
         assert!(c.daemon && c.app && c.applet);
     }
 
     #[test]
     fn explicit_daemon_selects_only_daemon() {
         let prefix = mktree(&["bin/super-test-app"]);
-        let c = plan_components(Some(ComponentSelection::Daemon), &prefix, true, &INSTALLER);
+        let c = plan_components(
+            Some(ComponentSelection::Daemon),
+            &prefix,
+            Desktops::COSMIC,
+            &INSTALLER,
+        );
         assert!(c.daemon && !c.app && !c.applet);
     }
 
     #[test]
     fn explicit_app_selects_only_app() {
         let prefix = mktree(&[]);
-        let c = plan_components(Some(ComponentSelection::App), &prefix, true, &INSTALLER);
+        let c = plan_components(
+            Some(ComponentSelection::App),
+            &prefix,
+            Desktops::COSMIC,
+            &INSTALLER,
+        );
         assert!(!c.daemon && c.app && !c.applet);
     }
 
@@ -816,35 +923,175 @@ mod tests {
         // Explicit `--components=applet` bypasses the `cosmic_available`
         // gate entirely — unlike the interactive menu's option 4, the CLI
         // flag is trusted outright.
-        let c = plan_components(Some(ComponentSelection::Applet), &prefix, false, &INSTALLER);
+        let c = plan_components(
+            Some(ComponentSelection::Applet),
+            &prefix,
+            Desktops::NONE,
+            &INSTALLER,
+        );
         assert!(!c.daemon && !c.app && c.applet);
     }
 
     #[test]
     fn explicit_all_selects_everything_regardless_of_existing_state() {
         let prefix = mktree(&["bin/super-test-daemon"]);
-        let c = plan_components(Some(ComponentSelection::All), &prefix, true, &INSTALLER);
+        let c = plan_components(
+            Some(ComponentSelection::All),
+            &prefix,
+            Desktops::COSMIC,
+            &INSTALLER,
+        );
         assert!(c.daemon && c.app && c.applet);
     }
 
     #[test]
-    fn all_but_applet_always_skips_applet_while_all_stays_all_inclusive() {
+    fn all_detected_takes_the_add_ons_whose_desktop_is_here() {
         let prefix = mktree(&[]);
-        // `AllButApplet` (the interactive menu's "All (skip COSMIC applet)"
-        // path) skips the applet even when a COSMIC panel is present.
+        let all = Some(ComponentSelection::AllDetected);
+        let c = plan_components(all, &prefix, Desktops::COSMIC, &INSTALLER);
+        assert!(c.daemon && c.app && c.applet && !c.extension);
+        let c = plan_components(all, &prefix, Desktops::GNOME, &INSTALLER);
+        assert!(c.daemon && c.app && !c.applet && c.extension);
+        let c = plan_components(all, &prefix, Desktops::NONE, &INSTALLER);
+        assert!(c.daemon && c.app && !c.applet && !c.extension);
+    }
+
+    #[test]
+    fn all_stays_the_daemon_the_app_and_the_applet_whatever_the_desktop() {
+        // Explicit `All` (the `--components=all` CLI path) never depends on
+        // the host's desktop — this must never change, since the hermetic
+        // e2e test relies on it being deterministic on a CI host with no
+        // cosmic-panel or GNOME Shell.
+        let prefix = mktree(&[]);
+        for desktops in [Desktops::NONE, Desktops::GNOME] {
+            let c = plan_components(Some(ComponentSelection::All), &prefix, desktops, &INSTALLER);
+            assert!(c.daemon && c.app && c.applet && !c.extension);
+        }
+    }
+
+    #[test]
+    fn a_product_without_add_ons_never_gets_one() {
+        let installer = Installer {
+            cosmic_applet: None,
+            gnome_extension: None,
+            ..INSTALLER
+        };
+        let prefix = mktree(&[]);
+        let both = Desktops {
+            cosmic: true,
+            gnome: true,
+        };
+        for explicit in [
+            None,
+            Some(ComponentSelection::All),
+            Some(ComponentSelection::AllDetected),
+            Some(ComponentSelection::Applet),
+            Some(ComponentSelection::Extension),
+        ] {
+            let c = plan_components(explicit, &prefix, both, &installer);
+            assert!(!c.applet && !c.extension, "{explicit:?}");
+        }
+        // Nor does an update that finds the applet it once bundled.
+        let prefix = mktree(&["bin/super-test-daemon", "bin/super-test-cosmic-applet"]);
+        assert!(!plan_components(None, &prefix, both, &installer).applet);
+    }
+
+    #[test]
+    fn a_fresh_install_on_gnome_takes_the_extension() {
+        let prefix = mktree(&[]);
+        let c = plan_components(None, &prefix, Desktops::GNOME, &INSTALLER);
+        assert!(c.daemon && c.app && !c.applet && c.extension);
         let c = plan_components(
-            Some(ComponentSelection::AllButApplet),
+            None,
             &prefix,
-            true,
+            Desktops::GNOME,
+            &crate::tests::MERGED_INSTALLER,
+        );
+        assert!(!c.extension);
+    }
+
+    #[test]
+    fn an_update_keeps_an_installed_extension_whatever_the_desktop() {
+        let prefix = mktree(&["bin/super-test-daemon"]);
+        assert!(!plan_components(None, &prefix, Desktops::GNOME, &INSTALLER).extension);
+        crate::extension::fake_release(
+            &crate::extension::dir(&prefix, &TEST_EXTENSION),
+            TEST_EXTENSION.uuid,
+        );
+        assert!(plan_components(None, &prefix, Desktops::NONE, &INSTALLER).extension);
+    }
+
+    #[test]
+    fn explicit_extension_selects_only_the_extension() {
+        let prefix = mktree(&[]);
+        let c = plan_components(
+            Some(ComponentSelection::Extension),
+            &prefix,
+            Desktops::NONE,
             &INSTALLER,
         );
-        assert!(c.daemon && c.app && !c.applet);
-        // Explicit `All` (the `--components=all` CLI path) stays literally
-        // all-inclusive regardless of `cosmic_available` — this must never
-        // change, since the hermetic e2e test relies on it being
-        // deterministic on a CI host with no cosmic-panel.
-        let c = plan_components(Some(ComponentSelection::All), &prefix, false, &INSTALLER);
-        assert!(c.daemon && c.app && c.applet);
+        assert_eq!(
+            c,
+            Components {
+                extension: true,
+                ..Components::default()
+            }
+        );
+    }
+
+    fn extension_only_manifest(prefix: &Path, staged: &Path) -> Result<Manifest, InstallError> {
+        build_manifest(
+            &fake_staging(),
+            None,
+            prefix,
+            Path::new("/usr/lib/systemd/user"),
+            &Components {
+                extension: true,
+                ..Components::default()
+            },
+            Path::new("/proc/self/exe"),
+            &INSTALLER,
+            Some(staged),
+        )
+    }
+
+    #[test]
+    fn the_extension_goes_where_gnome_shell_looks_and_what_it_dropped_goes() {
+        let prefix = test_dir();
+        let dir = crate::extension::dir(&prefix, &TEST_EXTENSION);
+        crate::extension::fake_release(&dir, TEST_EXTENSION.uuid);
+        std::fs::write(dir.join("old.js"), "").unwrap();
+        let staged = test_dir();
+        crate::extension::fake_release(&staged, TEST_EXTENSION.uuid);
+
+        let m = extension_only_manifest(&prefix, &staged).unwrap();
+        let mut placed: Vec<(PathBuf, PathBuf, u32)> = m
+            .entries
+            .iter()
+            .filter(|e| e.dest.starts_with(&dir))
+            .map(|e| (e.source.clone(), e.dest.clone(), e.mode))
+            .collect();
+        placed.sort();
+        let expected: Vec<(PathBuf, PathBuf, u32)> = [
+            "core/model.js",
+            "extension.js",
+            "metadata.json",
+            "schemas/gschemas.compiled",
+        ]
+        .iter()
+        .map(|rel| (staged.join(rel), dir.join(rel), 0o644))
+        .collect();
+        assert_eq!(placed, expected);
+        // Only the installer itself besides.
+        assert_eq!(m.entries.len(), expected.len() + 1);
+        assert_eq!(m.removals, [dir.join("old.js")]);
+    }
+
+    #[test]
+    fn another_extension_never_reaches_the_root_phase() {
+        let staged = test_dir();
+        crate::extension::fake_release(&staged, "someone-else@example.com");
+        assert!(extension_only_manifest(&test_dir(), &staged).is_err());
     }
 
     #[test]
@@ -859,9 +1106,11 @@ mod tests {
                 daemon: true,
                 app: true,
                 applet: false,
+                extension: false,
             },
             std::path::Path::new("/proc/self/exe"),
             &INSTALLER,
+            None,
         )
         .unwrap();
         let dests: Vec<String> = m
@@ -900,6 +1149,7 @@ mod tests {
             daemon: true,
             app: false,
             applet: false,
+            extension: false,
         }
     }
 
@@ -917,6 +1167,7 @@ mod tests {
             &daemon_only(),
             me,
             &INSTALLER,
+            None,
         )
         .unwrap();
         let mcp = m
@@ -931,8 +1182,12 @@ mod tests {
             daemon: false,
             app: true,
             applet: false,
+            extension: false,
         };
-        let m = build_manifest(&staging, None, prefix, units, &app_only, me, &INSTALLER).unwrap();
+        let m = build_manifest(
+            &staging, None, prefix, units, &app_only, me, &INSTALLER, None,
+        )
+        .unwrap();
         assert!(
             !m.entries
                 .iter()
@@ -951,6 +1206,7 @@ mod tests {
             &daemon_only(),
             std::path::Path::new("/proc/self/exe"),
             &INSTALLER,
+            None,
         )
         .unwrap();
         assert!(
@@ -997,6 +1253,7 @@ mod tests {
             &components,
             std::path::Path::new("/proc/self/exe"),
             &crate::tests::MERGED_INSTALLER,
+            None,
         )
     }
 
@@ -1008,6 +1265,7 @@ mod tests {
             daemon: false,
             app: true,
             applet: false,
+            extension: false,
         })
         .unwrap();
         let dests: Vec<String> = m
@@ -1042,6 +1300,7 @@ mod tests {
             daemon: true,
             app: false,
             applet: false,
+            extension: false,
         })
         .unwrap();
         for gone in [
@@ -1069,18 +1328,20 @@ mod tests {
             daemon: false,
             app: true,
             applet: false,
+            extension: false,
         })
         .unwrap();
         assert!(m.removals.is_empty(), "{:?}", m.removals);
     }
 
-    /// The shared applet replaces the replaced products' applets too.
+    /// The product's applet replaces the replaced products' applets too.
     #[test]
     fn the_shared_applet_replaces_the_replaced_products_applets() {
         let m = merged_manifest(Components {
             daemon: false,
             app: false,
             applet: true,
+            extension: false,
         })
         .unwrap();
         for gone in [
@@ -1096,10 +1357,20 @@ mod tests {
     #[test]
     fn detection_update_mode_finds_any_named_app() {
         let prefix = mktree(&["bin/super-test-daemon", "bin/super-b-app"]);
-        let c = plan_components(None, &prefix, false, &crate::tests::MERGED_INSTALLER);
+        let c = plan_components(
+            None,
+            &prefix,
+            Desktops::NONE,
+            &crate::tests::MERGED_INSTALLER,
+        );
         assert!(c.daemon && c.app);
         let prefix = mktree(&["bin/super-test-daemon"]);
-        let c = plan_components(None, &prefix, false, &crate::tests::MERGED_INSTALLER);
+        let c = plan_components(
+            None,
+            &prefix,
+            Desktops::NONE,
+            &crate::tests::MERGED_INSTALLER,
+        );
         assert!(!c.app);
     }
 
@@ -1115,9 +1386,11 @@ mod tests {
                 daemon: false,
                 app: true,
                 applet: false,
+                extension: false,
             },
             std::path::Path::new("/proc/self/exe"),
             &INSTALLER,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, crate::errors::InstallError::InstallFailed(_)));
@@ -1126,16 +1399,16 @@ mod tests {
     #[test]
     fn manifest_errors_when_applet_desktop_glob_is_empty() {
         // F5: if the applet release's `resources/` is missing or renamed so
-        // the `super-cosmic-applet-*.desktop` glob yields zero entries, the
+        // the `super-test-shared-applet-*.desktop` glob yields zero entries, the
         // applet binary would otherwise get installed with no launcher
         // entry at all — silently, since a `for` loop over an empty `Vec`
         // just does nothing. That must be a hard error for a selected
         // applet component, exactly like the sibling `required_entry` icon
         // check just below it.
         let applet = fake_applet_release_without(&[
-            "super-cosmic-applet-full.desktop",
-            "super-cosmic-applet-left.desktop",
-            "super-cosmic-applet-right.desktop",
+            "super-test-shared-applet-full.desktop",
+            "super-test-shared-applet-left.desktop",
+            "super-test-shared-applet-right.desktop",
         ]);
         let err = build_manifest(
             &fake_staging(),
@@ -1146,9 +1419,11 @@ mod tests {
                 daemon: false,
                 app: false,
                 applet: true,
+                extension: false,
             },
             std::path::Path::new("/proc/self/exe"),
             &INSTALLER,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, crate::errors::InstallError::InstallFailed(_)));
@@ -1166,9 +1441,11 @@ mod tests {
                 daemon: false,
                 app: true,
                 applet: false,
+                extension: false,
             },
             std::path::Path::new("/proc/self/exe"),
             &INSTALLER,
+            None,
         )
         .unwrap();
         assert!(
@@ -1189,6 +1466,7 @@ mod tests {
             &Components::default(),
             std::path::Path::new("/some/self/exe"),
             &INSTALLER,
+            None,
         )
         .unwrap();
         let self_entry = m

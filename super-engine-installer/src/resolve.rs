@@ -3,7 +3,7 @@
 //! locate its tarball + `SHA256SUMS` assets for this host's target triple.
 
 use super_engine_forge::{ForgeClient, Release, ReleaseKind, RepoRef};
-use super_engine_spec::version::parse_version;
+use super_engine_spec::version::{parse_version, update_available};
 
 use crate::errors::InstallError;
 
@@ -141,6 +141,20 @@ pub async fn resolve_target(
         tarball_name: name,
         sums_url,
     })
+}
+
+/// Whether to install the release tagged `candidate` over an add-on whose
+/// `installed` version was read from what is there: when none is installed,
+/// or its version can't be read, or the release is newer. An equal version
+/// is left alone, which also spares a restart. Products may share an
+/// add-on, so a newer one than the release is never replaced: a stable
+/// install after a beta one would otherwise take the beta's back.
+#[must_use]
+pub fn should_install(installed: Option<&str>, candidate: &str) -> bool {
+    match installed {
+        Some(have) if parse_version(have).is_some() => update_available(have, candidate),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -486,5 +500,29 @@ mod tests {
             target_triple_for("mips"),
             Err(crate::errors::InstallError::UnsupportedArch(a)) if a == "mips"
         ));
+    }
+
+    #[test]
+    fn an_add_on_that_is_missing_or_unreadable_is_installed() {
+        assert!(should_install(None, "v0.1.0"));
+        assert!(should_install(Some("garbage"), "v0.1.0"));
+    }
+
+    #[test]
+    fn a_newer_release_replaces_the_installed_add_on() {
+        assert!(should_install(Some("0.1.0"), "v0.1.1"));
+        assert!(should_install(Some("0.2.0-beta.1"), "v0.2.0"));
+    }
+
+    #[test]
+    fn an_add_on_as_new_as_the_release_is_left_alone() {
+        assert!(!should_install(Some("0.1.0"), "v0.1.0"));
+    }
+
+    /// A stable install after a beta one keeps the beta's newer add-on.
+    #[test]
+    fn a_newer_installed_add_on_is_never_replaced_by_an_older_release() {
+        assert!(!should_install(Some("0.2.0-beta.1"), "v0.1.0"));
+        assert!(!should_install(Some("0.3.0"), "v0.2.0"));
     }
 }

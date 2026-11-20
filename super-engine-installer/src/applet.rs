@@ -1,34 +1,41 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The COSMIC applet the products share: where its releases come from, and
-//! whether this install takes one.
+//! A product's COSMIC applet: where its releases come from, and whether this
+//! install takes one.
 //!
-//! The applet has releases of its own, in [`REPO`], and every product's
-//! installer installs the newest one for its channel. It never installs an
-//! applet from the product's tarball. Two products install the same applet,
-//! so an install never replaces a newer one than it found: a stable install
-//! after a beta one would otherwise take the beta's applet back.
+//! The applet has releases of its own, in [`CosmicApplet::repo`], and the
+//! product's installer installs the newest one for its channel. It never
+//! installs an applet from the product's tarball. Products may share one
+//! applet, so an install never replaces a newer one than it found: a stable
+//! install after a beta one would otherwise take the beta's applet back.
 
 use std::path::Path;
 use std::time::Duration;
 
-use super_engine_protocol::SHARED_APPLET;
-use super_engine_spec::version::{parse_version, update_available};
+use super_engine_spec::version::parse_version;
 
-/// Where the applet's releases are published.
-pub const REPO: &str = "github.com/super-libre/super-cosmic-applet";
+/// A product's COSMIC applet.
+#[derive(Debug, Clone, Copy)]
+pub struct CosmicApplet {
+    /// Where its releases are published, e.g.
+    /// `github.com/super-libre/super-cosmic-applet`.
+    pub repo: &'static str,
+    /// Its binary's name, which its launcher entries and icon are named
+    /// after, and its release tarballs start with.
+    pub name: &'static str,
+}
 
 /// How long the installed applet gets to print its version. It prints it and
 /// exits before it touches the display, so this only bounds a hang.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The version of the applet installed under `prefix`, from its `--version`
+/// The version of `applet` installed under `prefix`, from its `--version`
 /// line (`super-cosmic-applet 0.1.0`).
 ///
 /// `None` when it isn't installed, fails to run, or prints something else.
 /// Every applet prints it, the ones products bundled before the applet had
 /// releases included, so no stamp file is needed beside it.
-pub async fn installed_version(prefix: &Path) -> Option<String> {
-    let bin = prefix.join("bin").join(SHARED_APPLET);
+pub async fn installed_version(prefix: &Path, applet: &CosmicApplet) -> Option<String> {
+    let bin = prefix.join("bin").join(applet.name);
     if !bin.is_file() {
         return None;
     }
@@ -54,22 +61,15 @@ fn version_from_output(output: &str) -> Option<String> {
     parse_version(word).map(|_| word.to_string())
 }
 
-/// Whether to install the release tagged `candidate` over the applet
-/// `installed`: when none is installed, or its version can't be read, or the
-/// release is newer. An equal version is left alone, which also spares the
-/// panel a restart.
-#[must_use]
-pub fn should_install(installed: Option<&str>, candidate: &str) -> bool {
-    match installed {
-        Some(have) if parse_version(have).is_some() => update_available(have, candidate),
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_dir::TestDir;
+
+    const APPLET: CosmicApplet = CosmicApplet {
+        repo: "github.com/example/super-test-cosmic-applet",
+        name: "super-test-shared-applet",
+    };
 
     #[test]
     fn the_version_is_the_last_word_of_the_line() {
@@ -90,34 +90,10 @@ mod tests {
         assert_eq!(version_from_output("error: unexpected argument"), None);
     }
 
-    #[test]
-    fn an_applet_that_is_missing_or_unreadable_is_installed() {
-        assert!(should_install(None, "v0.1.0"));
-        assert!(should_install(Some("garbage"), "v0.1.0"));
-    }
-
-    #[test]
-    fn a_newer_release_replaces_the_installed_applet() {
-        assert!(should_install(Some("0.1.0"), "v0.1.1"));
-        assert!(should_install(Some("0.2.0-beta.1"), "v0.2.0"));
-    }
-
-    #[test]
-    fn an_applet_as_new_as_the_release_is_left_alone() {
-        assert!(!should_install(Some("0.1.0"), "v0.1.0"));
-    }
-
-    /// A stable install after a beta one keeps the beta's newer applet.
-    #[test]
-    fn a_newer_installed_applet_is_never_replaced_by_an_older_release() {
-        assert!(!should_install(Some("0.2.0-beta.1"), "v0.1.0"));
-        assert!(!should_install(Some("0.3.0"), "v0.2.0"));
-    }
-
     #[tokio::test]
     async fn no_installed_applet_has_no_version() {
         let prefix = TestDir::new("super-engine-installer-applet-");
-        assert_eq!(installed_version(&prefix).await, None);
+        assert_eq!(installed_version(&prefix, &APPLET).await, None);
     }
 
     /// The version comes from running the installed binary.
@@ -126,7 +102,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let prefix = TestDir::new("super-engine-installer-applet-bin-");
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
-        let bin = prefix.join("bin").join(SHARED_APPLET);
+        let bin = prefix.join("bin").join(APPLET.name);
         std::fs::write(
             &bin,
             "#!/bin/sh\n[ \"$1\" = --version ] && echo 'super-cosmic-applet 0.4.2'\n",
@@ -137,7 +113,7 @@ mod tests {
         // another test thread's fork still holds it open: retry, not flake.
         let mut version = None;
         for _ in 0..20 {
-            version = installed_version(&prefix).await;
+            version = installed_version(&prefix, &APPLET).await;
             if version.is_some() {
                 break;
             }
