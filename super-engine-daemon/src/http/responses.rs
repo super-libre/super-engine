@@ -41,6 +41,11 @@ pub mod reason {
     /// not just the `/events` exe-watch's 30 s tick. The name says `exe`
     /// because that was the only grantee kind when it was written.
     pub const EXE_CHANGED: &str = "exe_changed";
+    /// An assistant key was presented by a caller other than the assistant
+    /// route it is for: over the Unix socket, or from a browser page. The key
+    /// is refused there but not revoked, so the assistant holding it keeps
+    /// working.
+    pub const WRONG_CALLER: &str = "wrong_caller";
 
     // auth_denied reasons
     pub const INVALID_BODY: &str = "invalid_body";
@@ -60,6 +65,16 @@ pub mod reason {
     /// [`UID_MISMATCH`]: on the Unix socket the kernel says who is calling, and
     /// here the allowlist is the only thing that does.
     pub const ORIGIN_NOT_ALLOWED: &str = "origin_not_allowed";
+    /// A request on an assistant route arrived over TCP with an `Origin`, so
+    /// it came from a browser page. Assistant routes are for programs that
+    /// present an assistant key, and a page is refused there whatever key it
+    /// holds.
+    pub const BROWSER_NOT_ALLOWED: &str = "browser_not_allowed";
+    /// A request on an assistant route arrived over TCP with a `Host` that is
+    /// not `127.0.0.1`, `localhost` or `[::1]`. The listener is on the
+    /// loopback interface, so any other host is a name pointed at it from
+    /// outside, as DNS rebinding does.
+    pub const HOST_NOT_ALLOWED: &str = "host_not_allowed";
 }
 
 #[must_use]

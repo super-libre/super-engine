@@ -7,10 +7,15 @@
 //! Every other route sits behind a guard ([`middleware`]) that checks the
 //! token, the caller presenting it, and the scope the route needs.
 //!
+//! An AI assistant is the exception. It calls over TCP with an assistant key
+//! ([`assistant_keys`]) the daemon minted when the user connected it, through
+//! [`Auth::mint_assistant_key`], and never sees the consent dialog.
+//!
 //! [`Auth`] holds all of it. A daemon builds one at startup, keeps it in its
 //! router state, and exposes it with `axum::extract::FromRef` so the guards
 //! and the auth routes can extract it.
 
+pub mod assistant_keys;
 pub mod consent;
 pub mod identity;
 pub mod middleware;
@@ -18,13 +23,14 @@ pub mod routes;
 pub mod tokens;
 
 use crate::resource_management::ResourceManager;
-use crate::secrets::Secrets;
+use crate::secrets::{Secrets, SecretsError};
 use consent::{ConsentDialog, ConsentLocks};
 use middleware::DenyCache;
 use std::sync::Arc;
 use super_engine_protocol::ProductSpec;
 use tokens::TokenStore;
 
+pub use assistant_keys::AssistantKey;
 pub use identity::{PeerIdentity, resolve_peer_identity};
 pub use middleware::AuthContext;
 
@@ -38,7 +44,7 @@ pub const AUTO_APPROVE: &str = "AUTO_APPROVE";
 pub struct AuthConfig {
     /// The consent dialog: the product it names, and what its scopes grant.
     pub dialog: ConsentDialog,
-    /// Where the session tokens persist: the daemon's one
+    /// Where the session tokens and assistant keys persist: the daemon's one
     /// [`Secrets`], shared with whatever else keeps secrets in it.
     pub secrets: Secrets,
     /// Counts each caller's connections and requests.
@@ -65,8 +71,8 @@ struct Inner {
 }
 
 impl Auth {
-    /// Load the persisted session tokens and set up an empty consent state.
-    /// See [`TokenStore::load_persisted`].
+    /// Load the persisted session tokens and assistant keys, and set up an
+    /// empty consent state. See [`TokenStore::load_persisted`].
     #[must_use]
     pub fn load(config: AuthConfig) -> Self {
         let tokens = TokenStore::load_persisted(config.secrets.clone());
@@ -102,6 +108,45 @@ impl Auth {
     #[must_use]
     pub fn resource_manager(&self) -> &Arc<ResourceManager> {
         &self.inner.resource_manager
+    }
+
+    /// Mint an assistant key for the assistant `name`, granting `scopes`: the
+    /// key's secret, to hand to the assistant, and the key.
+    ///
+    /// The product calls this when the user connects an assistant; nothing
+    /// else mints one, and there is no route for it here. The key is in the
+    /// secrets file before this returns. It never expires.
+    ///
+    /// # Errors
+    /// When the secrets file cannot be written. No key is minted then.
+    pub async fn mint_assistant_key(
+        &self,
+        name: &str,
+        scopes: &[String],
+    ) -> Result<(String, AssistantKey), SecretsError> {
+        self.tokens().mint_assistant_key(name, scopes).await
+    }
+
+    /// Every assistant key, oldest first, without its secret.
+    #[must_use]
+    pub fn assistant_keys(&self) -> Vec<AssistantKey> {
+        self.tokens().assistant_keys()
+    }
+
+    /// The secret of the assistant key `id`, or `None` when there is no such
+    /// key.
+    #[must_use]
+    pub fn assistant_key_secret(&self, id: &str) -> Option<String> {
+        self.tokens().assistant_key_secret(id)
+    }
+
+    /// Revoke the assistant key `id`, in memory and in the secrets file. It
+    /// stops working at once. `false` when there was no such key.
+    ///
+    /// # Errors
+    /// When the secrets file cannot be written. The key keeps working then.
+    pub async fn revoke_assistant_key(&self, id: &str) -> Result<bool, SecretsError> {
+        self.tokens().revoke_assistant_key(id).await
     }
 
     /// Whether the TCP listener admits a page from `origin`.

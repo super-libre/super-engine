@@ -4,10 +4,13 @@
 //!
 //! Every connection is admitted here before the daemon's router sees it. A
 //! caller on the Unix socket is named by the kernel (`SO_PEERCRED`); a caller
-//! on TCP stays anonymous until the origin gate
+//! on TCP stays anonymous until a gate names it: the origin gate
 //! ([`require_allowed_origin`](crate::auth::middleware::require_allowed_origin))
-//! checks its `Origin` against the user's allowlist. Either way the result is
-//! a [`PeerInfo`] on the request, which is all the auth layer reads.
+//! checks a page's `Origin` against the user's allowlist, and the assistant
+//! gate
+//! ([`require_assistant_caller`](crate::auth::middleware::require_assistant_caller))
+//! checks an assistant's key. Either way the result is a [`PeerInfo`] on the
+//! request, which is all the auth layer reads.
 
 use crate::http::PeerInfo;
 use crate::http::origins::admits_any_origin;
@@ -166,7 +169,8 @@ where
                         };
                         // No credentials to read: this peer stays anonymous
                         // until `require_allowed_origin` checks its `Origin`
-                        // against the user's list.
+                        // against the user's list, or, on an assistant route,
+                        // `require_assistant_caller` checks its key.
                         serve_connection(stream, PeerInfo::tcp(), &app, &resource_manager).await;
                     }
                 }

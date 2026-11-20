@@ -7,13 +7,15 @@ use std::path::PathBuf;
 
 /// Who the daemon believes is calling.
 ///
-/// The two variants are the two transports, and they are not the same kind of
-/// claim. [`Self::Native`] is what the kernel says about a peer on the Unix
-/// socket; [`Self::Web`] is what a browser says about the page it is running.
-/// Keeping them as separate variants rather than one struct with optional
-/// fields is what stops a check written for one from silently passing for the
-/// other — `is_official_client` reading an absent exe path as "not official"
-/// would be correct by accident, and one refactor away from not being.
+/// The variants are not the same kind of claim. [`Self::Native`] is what the
+/// kernel says about a peer on the Unix socket. [`Self::Web`] is what a browser
+/// says about the page it is running, on the TCP listener. [`Self::Assistant`]
+/// is a key the daemon minted itself, presented on the TCP listener by a
+/// program that is not a browser. Keeping them as separate variants rather
+/// than one struct with optional fields is what stops a check written for one
+/// from silently passing for another — `is_official_client` reading an absent
+/// exe path as "not official" would be correct by accident, and one refactor
+/// away from not being.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeerIdentity {
@@ -58,6 +60,23 @@ pub enum PeerIdentity {
         /// The full origin as the browser sent it: scheme, host and port.
         origin: String,
     },
+    /// An AI assistant on the TCP listener, identified by the assistant key it
+    /// presented.
+    ///
+    /// The daemon minted the key itself, when the user connected the assistant
+    /// in the product's settings, so there is no consent dialog to show for
+    /// one and no session to mint. This identity is only ever given by
+    /// [`require_assistant_caller`](crate::auth::middleware::require_assistant_caller),
+    /// once the key has checked out, so a key presented anywhere else is
+    /// presented by a different caller and refused.
+    ///
+    /// Never stored in a session: see
+    /// [`assistant_keys`](crate::auth::assistant_keys) for why the keys live
+    /// apart from them.
+    Assistant {
+        /// The key's id, which is not a secret.
+        key_id: String,
+    },
 }
 
 impl PeerIdentity {
@@ -78,8 +97,8 @@ impl PeerIdentity {
 
     /// One line naming the caller, for logs and the consent dialog. A
     /// sandboxed peer leads with its app id, since its path is not a path
-    /// anyone can go and look at; a web peer is named as a web peer, so a log
-    /// line can never be read as naming a binary.
+    /// anyone can go and look at. A web peer and an assistant are named as
+    /// what they are, so a log line can never be read as naming a binary.
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
@@ -89,6 +108,7 @@ impl PeerIdentity {
             } => format!("flatpak {id} ({})", exe_path.display()),
             Self::Native { exe_path, .. } => exe_path.display().to_string(),
             Self::Web { origin } => format!("web origin {origin}"),
+            Self::Assistant { key_id } => format!("assistant key {key_id}"),
         }
     }
 }
@@ -237,11 +257,13 @@ fn peer_exe_path(pid: u32, context: &str) -> Option<PathBuf> {
 /// life resolve the peer here: `auth_request` at mint time, and the
 /// per-request authorization check on every call after it.
 ///
-/// A peer that arrived over TCP has no kernel-attested identity at all, so it
-/// is resolved from its `Origin` instead — see [`PeerInfo::web_origin`]. That
-/// field is only ever set by the origin gate, which has already checked the
-/// value against the user's allowlist; nothing here re-derives it from a
-/// header, so there is exactly one place an origin can enter the system.
+/// A peer that arrived over TCP has no kernel-attested identity at all. It is
+/// resolved from the assistant key it presented, see
+/// [`PeerInfo::assistant_key_id`], or else from its `Origin`, see
+/// [`PeerInfo::web_origin`]. Each field is set by one gate only, which has
+/// already checked it: the key against the daemon's assistant keys, the origin
+/// against the user's allowlist. Nothing here re-derives either from a header,
+/// so there is exactly one place each can enter the system.
 ///
 /// The caller **must fail closed** on `None`: the consent model verifies a
 /// *binary*, so an unidentifiable peer must not be prompted for (a
@@ -256,6 +278,11 @@ pub fn resolve_peer_identity(peer: Option<&PeerInfo>, context: &str) -> Option<P
         );
         return None;
     };
+    if let Some(key_id) = &peer.assistant_key_id {
+        return Some(PeerIdentity::Assistant {
+            key_id: key_id.clone(),
+        });
+    }
     if let Some(origin) = &peer.web_origin {
         return Some(PeerIdentity::Web {
             origin: origin.clone(),

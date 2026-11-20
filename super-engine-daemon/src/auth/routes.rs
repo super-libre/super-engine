@@ -98,6 +98,10 @@ fn cached_deny_response(auth: &Auth, consent_key: &ConsentKey, context: &str) ->
 /// gate that stands in for this one on the TCP listener. The exemption keys off
 /// the request's *own* validated origin rather than a header, so a Unix peer
 /// cannot claim it by sending an `Origin`.
+///
+/// An assistant has no uid either, and no exemption: it is refused here. Its
+/// key is minted by the product when the user connects it, never by this
+/// route, so an assistant identity never ends up in a session.
 fn reject_foreign_uid(peer: Option<&PeerInfo>) -> Option<Response> {
     if peer.is_some_and(|p| p.web_origin.is_some()) {
         return None;

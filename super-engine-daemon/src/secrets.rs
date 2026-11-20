@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! The daemon's secrets file: the session tokens it has issued and every
-//! backend's API keys, in `<state>/<slug>/secrets.ron` with mode 0600.
+//! The daemon's secrets file: the session tokens and assistant keys it has
+//! issued and every backend's API keys, in `<state>/<slug>/secrets.ron` with
+//! mode 0600.
 //!
 //! Only the daemon reads or writes it, through one [`Secrets`] per process.
 //! Every change is made to a copy of what is in memory, the whole file is
@@ -14,6 +15,7 @@
 //! owns at 0600 keeps the secrets as the keyring did. Against the user's own
 //! processes, neither one does.
 
+use crate::auth::assistant_keys::AssistantKey;
 use crate::auth::tokens::TokenMeta;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,14 @@ struct Contents {
     sessions: HashMap<String, TokenMeta>,
     /// Backend API keys: by the backend's source, then by the secret's name.
     backend_secrets: BTreeMap<String, BTreeMap<String, String>>,
+    /// The assistant keys the daemon has minted, by secret.
+    ///
+    /// A field of its own, not a kind of session in `sessions`. A daemon from
+    /// before assistant keys skips a field it does not know, so going back to
+    /// one keeps everything else in the file. A session whose grantee is a
+    /// kind it does not know would fail the whole file instead, and the file
+    /// would be set aside with the backends' API keys in it.
+    assistant_keys: BTreeMap<String, AssistantKey>,
 }
 
 /// The daemon's secrets, in memory and in the file. Cheap to clone; clones
@@ -236,6 +246,19 @@ impl Secrets {
         self.update(|contents| contents.sessions = sessions)
     }
 
+    /// The assistant keys, by secret, as last written.
+    pub(crate) fn assistant_keys(&self) -> BTreeMap<String, AssistantKey> {
+        self.inner.contents.lock().unwrap().assistant_keys.clone()
+    }
+
+    /// Replace the assistant keys, and write the file. Blocking.
+    pub(crate) fn set_assistant_keys(
+        &self,
+        keys: BTreeMap<String, AssistantKey>,
+    ) -> Result<(), SecretsError> {
+        self.update(|contents| contents.assistant_keys = keys)
+    }
+
     /// Apply `change` to a copy of the contents, write the copy, then keep it.
     /// The lock is held throughout, so writes land in the order the changes
     /// were made, and what is in memory is never ahead of the file.
@@ -290,9 +313,10 @@ fn set_aside(path: &Path, reason: &ron::error::SpannedError) -> Result<(), Secre
 #[cfg(test)]
 mod tests {
     use super::{FILE_NAME, Secrets};
+    use crate::auth::assistant_keys::AssistantKey;
     use crate::auth::identity::PeerIdentity;
     use crate::auth::tokens::TokenMeta;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::os::unix::fs::PermissionsExt;
 
     fn token(grantee: PeerIdentity) -> TokenMeta {
@@ -349,6 +373,89 @@ mod tests {
             assert_eq!(meta.app_name, "secrets-test");
             assert_eq!(meta.grantee, grantee);
         }
+    }
+
+    fn assistant_key(id: &str) -> AssistantKey {
+        AssistantKey {
+            id: id.to_string(),
+            name: "Claude Code".to_string(),
+            scopes: vec!["tts".to_string()],
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// What the file holds for a daemon from before assistant keys: the same
+    /// fields as today, less that one.
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct ContentsBeforeAssistantKeys {
+        sessions: HashMap<String, TokenMeta>,
+        backend_secrets: BTreeMap<String, BTreeMap<String, String>>,
+    }
+
+    #[test]
+    fn assistant_keys_are_read_back_by_the_next_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let keys = BTreeMap::from([("sva_secret".to_string(), assistant_key("0a1b2c3d"))]);
+        Secrets::at(path.clone())
+            .unwrap()
+            .set_assistant_keys(keys.clone())
+            .unwrap();
+        assert_eq!(Secrets::at(path).unwrap().assistant_keys(), keys);
+    }
+
+    /// Going back to a daemon from before assistant keys must not cost the
+    /// user their sessions and backend API keys. That daemon skips the field
+    /// it does not know rather than failing the file, which it would set
+    /// aside.
+    #[test]
+    fn a_daemon_from_before_assistant_keys_still_reads_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let secrets = Secrets::at(path.clone()).unwrap();
+        secrets
+            .set_backend_secret("github.com/acme/openai", "OPENAI_API_KEY", "sk-1")
+            .unwrap();
+        secrets
+            .set_sessions(HashMap::from([(
+                "token-0".to_string(),
+                token(PeerIdentity::native("/usr/bin/super-test-app")),
+            )]))
+            .unwrap();
+        secrets
+            .set_assistant_keys(BTreeMap::from([(
+                "sva_secret".to_string(),
+                assistant_key("0a1b2c3d"),
+            )]))
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("assistant_keys"), "{text}");
+        let old: ContentsBeforeAssistantKeys =
+            ron::from_str(&text).expect("an older daemon parses the file");
+        assert_eq!(
+            old.backend_secrets["github.com/acme/openai"]["OPENAI_API_KEY"],
+            "sk-1"
+        );
+        assert!(old.sessions.contains_key("token-0"));
+    }
+
+    /// A file written before assistant keys loads with none, and is not set
+    /// aside.
+    #[test]
+    fn a_file_from_before_assistant_keys_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(
+            &path,
+            "(sessions: {}, backend_secrets: {\"src\": {\"KEY\": \"v\"}})\n",
+        )
+        .unwrap();
+        let secrets = Secrets::at(path.clone()).unwrap();
+        assert!(secrets.assistant_keys().is_empty());
+        assert!(secrets.has_backend_secret("src", "KEY"));
+        assert!(path.exists(), "the file parsed, so it was not set aside");
     }
 
     #[test]
