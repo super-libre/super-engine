@@ -353,9 +353,48 @@ fn retired_files(prefix: &Path, unit_dir: &Path, retired: &Retired) -> Vec<PathB
     for app in retired.apps {
         files.push(prefix.join(format!("share/applications/{app}.desktop")));
         files.push(prefix.join(format!("share/icons/hicolor/scalable/apps/{app}.svg")));
+        files.extend(
+            app_icon_paths(app)
+                .into_iter()
+                .map(|rel| prefix.join("share/icons/hicolor").join(rel)),
+        );
         files.push(prefix.join(format!("share/metainfo/{app}.metainfo.xml")));
     }
     files
+}
+
+/// The fixed sizes an app's PNG icon may come in beside its scalable SVG:
+/// the freedesktop hicolor sizes, up to the 512 px the spec allows.
+const APP_ICON_SIZES: &[u32] = &[16, 22, 24, 32, 48, 64, 128, 256, 512];
+
+/// The app's icons other than the scalable SVG, relative to a hicolor theme
+/// root: a PNG at each of [`APP_ICON_SIZES`], and the one-colour symbolic
+/// icon panels and trays recolour.
+fn app_icon_paths(app: &str) -> Vec<String> {
+    let mut paths: Vec<String> = APP_ICON_SIZES
+        .iter()
+        .map(|n| format!("{n}x{n}/apps/{app}.png"))
+        .collect();
+    paths.push(format!("symbolic/apps/{app}-symbolic.svg"));
+    paths
+}
+
+/// The entries for those of the app's [`app_icon_paths`] the release in
+/// `staging` carries under `resources/icons/hicolor`. None is required: a
+/// release from before they shipped still installs, with the SVG alone.
+fn optional_app_icons(staging: &Path, prefix: &Path, app: &str) -> Vec<ManifestEntry> {
+    let theme = staging.join("resources/icons/hicolor");
+    app_icon_paths(app)
+        .into_iter()
+        .filter_map(|rel| {
+            let source = theme.join(&rel);
+            source.is_file().then(|| ManifestEntry {
+                source,
+                dest: prefix.join("share/icons/hicolor").join(&rel),
+                mode: 0o644,
+            })
+        })
+        .collect()
 }
 
 /// What a product's own COSMIC applet installed under `prefix`: its binary,
@@ -521,6 +560,7 @@ pub fn build_manifest(
             prefix.join(format!("share/icons/hicolor/scalable/apps/{app}.svg")),
             0o644,
         )?);
+        entries.extend(optional_app_icons(staging, prefix, app));
         // Metainfo is optional upstream (older tarballs may not carry it):
         // skip the entry rather than fail if it's absent.
         let metainfo = staging.join(format!("resources/{app}.metainfo.xml"));
@@ -1427,6 +1467,60 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, crate::errors::InstallError::InstallFailed(_)));
+    }
+
+    /// The app's PNG sizes and symbolic icon install beside its SVG when the
+    /// release carries them, into the same hicolor theme, and are skipped
+    /// when it does not.
+    #[test]
+    fn manifest_installs_the_app_icon_sizes_the_release_carries() {
+        let components = Components {
+            daemon: false,
+            app: true,
+            applet: false,
+            extension: false,
+        };
+        let build = |staging: &Path| {
+            build_manifest(
+                staging,
+                None,
+                std::path::Path::new("/usr/local"),
+                std::path::Path::new("/usr/lib/systemd/user"),
+                &components,
+                std::path::Path::new("/proc/self/exe"),
+                &INSTALLER,
+                None,
+            )
+            .unwrap()
+        };
+        let icons = |m: &Manifest| -> Vec<String> {
+            m.entries
+                .iter()
+                .map(|e| e.dest.to_string_lossy().into_owned())
+                .filter(|d| d.contains("/share/icons/hicolor/") && !d.contains("/scalable/"))
+                .collect()
+        };
+
+        let staging = fake_staging();
+        assert!(icons(&build(&staging)).is_empty());
+
+        let theme = staging.join("resources/icons/hicolor");
+        for rel in [
+            "48x48/apps/super-test-app.png",
+            "symbolic/apps/super-test-app-symbolic.svg",
+        ] {
+            std::fs::create_dir_all(theme.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(theme.join(rel), b"").unwrap();
+        }
+        let mut got = icons(&build(&staging));
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "/usr/local/share/icons/hicolor/48x48/apps/super-test-app.png",
+                "/usr/local/share/icons/hicolor/symbolic/apps/super-test-app-symbolic.svg",
+            ]
+        );
     }
 
     #[test]
